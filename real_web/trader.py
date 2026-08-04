@@ -754,10 +754,21 @@ class MultiTrader:
         self._log_lock = (
             threading.Lock()
         )  # ecritures log concurrentes -> pas d'entrelacement
+        _state_file_existed = STATE_FILE.exists()
         self.state = self._load()
         self.state.setdefault("killswitch", dict(KILLSWITCH_DEFAULTS))
         self.state.setdefault("killswitch_triggered", None)  # {"reason":..., "ts":...} si declenche
         self.state.setdefault("latency_history", [])  # mesures CHRONO structurees, voir /api/latency
+        # RESTAURATION DEPUIS DB (Steven 04/08) : uniquement si le fichier
+        # local etait ABSENT (volume Railway perdu/non monte -- exactement ce
+        # qui vient d'arriver cette nuit). Si le fichier existe deja, il est
+        # prioritaire -- pas de raison d'ecraser un etat local valide.
+        if not _state_file_existed:
+            _db_cfg = self._db_load_config_state()
+            if _db_cfg:
+                self.state["floor_usd"] = _db_cfg["floor_usd"]
+                self.state["killswitch"] = _db_cfg["killswitch"]
+                self._log("♻️ [CONFIG] plancher + kill-switch restaures depuis Postgres (fichier local absent)")
         # ── FLUX WEBSOCKET TEMPS REEL (Steven 23/07) : demarre les connexions
         # Binance + Polymarket. Alimente le cache que _book_quote / _mm_tick /
         # l'arb lisent en <100ms au lieu du REST ~1s. Lecture seule, aucun ordre. ──
@@ -989,6 +1000,116 @@ class MultiTrader:
         except Exception as e:
             self._log(f"⚠️ [KILL-SWITCH] audit DB echoue (non bloquant) : {str(e)[:120]}")
 
+    # ── PERSISTANCE PARAMETRES (Steven 04/08, "on save nos params en DB") ──
+    # Uniquement plancher + seuils kill-switch : petit volume, ecritures
+    # rares, jamais dans le hot path. PAS le journal (ecrit a chaque tick,
+    # une DB synchrone ici ajouterait de la latence dans la boucle live) ni
+    # l'etat de trading complet (positions/trades, encore instable). Survit
+    # meme si le volume Railway est perdu (deja arrive cette nuit -> log
+    # entierement efface a un redemarrage).
+    def _db_save_config_state(self):
+        """Best-effort, TOUJOURS en arriere-plan (voir appelants via
+        self._pool.submit) -- une ecriture Postgres ratee ne doit jamais
+        empecher le changement de parametre de s'appliquer localement."""
+        dsn = os.environ.get("DATABASE_URL")
+        if not dsn:
+            return
+        ks = self.state.get("killswitch") or {}
+        try:
+            import psycopg2
+
+            conn = psycopg2.connect(dsn, connect_timeout=5)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO "mmtrade_config_state"
+                            (id, floor_usd, killswitch_enabled, killswitch_cash_floor_usd,
+                             killswitch_max_session_loss_usd, killswitch_max_global_consec_losses, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, now())
+                        ON CONFLICT (id) DO UPDATE SET
+                            floor_usd = EXCLUDED.floor_usd,
+                            killswitch_enabled = EXCLUDED.killswitch_enabled,
+                            killswitch_cash_floor_usd = EXCLUDED.killswitch_cash_floor_usd,
+                            killswitch_max_session_loss_usd = EXCLUDED.killswitch_max_session_loss_usd,
+                            killswitch_max_global_consec_losses = EXCLUDED.killswitch_max_global_consec_losses,
+                            updated_at = now()
+                        """,
+                        (
+                            "current",
+                            self.floor(),
+                            bool(ks.get("enabled", True)),
+                            float(ks.get("cash_floor_usd", 3.0)),
+                            float(ks.get("max_session_loss_usd", 15.0)),
+                            int(ks.get("max_global_consec_losses", 5)),
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            self._log(f"⚠️ [CONFIG] sauvegarde DB echouee (non bloquant) : {str(e)[:120]}")
+
+    def _db_log_config_event(self, kind: str, detail: str):
+        dsn = os.environ.get("DATABASE_URL")
+        if not dsn:
+            return
+        try:
+            import uuid
+
+            import psycopg2
+
+            conn = psycopg2.connect(dsn, connect_timeout=5)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        'INSERT INTO "mmtrade_config_events" (id, kind, detail) VALUES (%s, %s, %s)',
+                        (str(uuid.uuid4()), kind, detail),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            self._log(f"⚠️ [CONFIG] audit DB echoue (non bloquant) : {str(e)[:120]}")
+
+    def _db_load_config_state(self):
+        """Appele UNE FOIS au demarrage (__init__), avant que quoi que ce
+        soit d'autre tourne -- restaure floor/killswitch depuis Postgres si
+        le fichier local etait absent/perdu (volume Railway manquant ou mal
+        monte). Le fichier local reste prioritaire s'il existe deja avec des
+        valeurs (voir appel conditionnel dans __init__)."""
+        dsn = os.environ.get("DATABASE_URL")
+        if not dsn:
+            return None
+        try:
+            import psycopg2
+
+            conn = psycopg2.connect(dsn, connect_timeout=5)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        'SELECT floor_usd, killswitch_enabled, killswitch_cash_floor_usd, '
+                        'killswitch_max_session_loss_usd, killswitch_max_global_consec_losses '
+                        'FROM "mmtrade_config_state" WHERE id = %s',
+                        ("current",),
+                    )
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+            if not row:
+                return None
+            return {
+                "floor_usd": row[0],
+                "killswitch": {
+                    "enabled": row[1],
+                    "cash_floor_usd": row[2],
+                    "max_session_loss_usd": row[3],
+                    "max_global_consec_losses": row[4],
+                },
+            }
+        except Exception:
+            return None  # jamais fatal -- le bot demarre quand meme avec les defauts locaux
+
     def precheck(self):
         cash, msg = self._read_cash()
         if cash is None:
@@ -1006,9 +1127,14 @@ class MultiTrader:
 
     def set_mode(self, sym, mode):
         if sym in SYMBOLS and mode in ("real", "paper", "off"):
+            old = self.state["modes"].get(sym)
             self.state["modes"][sym] = mode
             self._save()
             self._log(f"⚙️ mode {sym} -> {mode}")
+            try:
+                self._pool.submit(self._db_log_config_event, "mode", f"{sym} {old} -> {mode}")
+            except Exception:
+                pass
             return {"ok": True}
         return {"ok": False, "message": "marche/mode invalide"}
 
@@ -1717,6 +1843,11 @@ class MultiTrader:
         self.state["floor_usd"] = v
         self._save()
         self._log(f"⚙️ plancher {old}$ -> {v}$")
+        try:
+            self._pool.submit(self._db_save_config_state)
+            self._pool.submit(self._db_log_config_event, "floor", f"{old}$ -> {v}$")
+        except Exception:
+            pass
         return {"ok": True, "floor": v}
 
     def arb_budget(self):

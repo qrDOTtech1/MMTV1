@@ -222,10 +222,18 @@ def killswitch():
     if request.method == "POST":
         body = request.get_json(silent=True) or {}
         ks = trader.state.setdefault("killswitch", {})
+        changed = []
         for k in ("enabled", "cash_floor_usd", "max_session_loss_usd", "max_global_consec_losses"):
             if k in body:
                 ks[k] = body[k]
+                changed.append(f"{k}={body[k]}")
         trader._save()
+        if changed:
+            try:
+                trader._pool.submit(trader._db_save_config_state)
+                trader._pool.submit(trader._db_log_config_event, "killswitch_config", ", ".join(changed))
+            except Exception:
+                pass
     return jsonify({
         "config": trader.state.get("killswitch"),
         "triggered": trader.state.get("killswitch_triggered"),
