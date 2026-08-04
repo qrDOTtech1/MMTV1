@@ -248,6 +248,7 @@ def latency():
             "count": sum(1 for v in vals if v is not None),
         }
 
+    _rust_flags = [h.get("rust_used") for h in hist if h.get("rust_used") is not None]
     return jsonify({
         "history": hist[-300:],
         "stats": {
@@ -255,8 +256,10 @@ def latency():
             "avant_post_ms": _stats("avant_post_ms"),
             "baseline_ms": _stats("baseline_ms"),
             "signature_ms": _stats("signature_ms"),
+            "rust_resign_ms": _stats("rust_resign_ms"),
             "post_orders_ms": _stats("post_orders_ms"),
         },
+        "rust_usage_pct": round(sum(1 for f in _rust_flags if f) / len(_rust_flags) * 100, 1) if _rust_flags else None,
     })
 
 

@@ -4236,6 +4236,7 @@ class MultiTrader:
                     f"{_avant_post_ms}ms | "
                     f"post_lui_meme={_post_ms}ms "
                     f"(baseline={_tim.get('baseline_ms','?')}ms signature={_tim.get('signature_ms','?')}ms "
+                    f"rust_resign={_tim.get('rust_resign_ms','?')}ms[{'RUST' if _tim.get('rust_used') else 'python'}] "
                     f"post_orders={_tim.get('post_orders_ms','?')}ms) | "
                     f"TOTAL={_total_ms}ms"
                 )
@@ -4250,6 +4251,8 @@ class MultiTrader:
                     "post_ms": _post_ms,
                     "baseline_ms": _tim.get("baseline_ms"),
                     "signature_ms": _tim.get("signature_ms"),
+                    "rust_resign_ms": _tim.get("rust_resign_ms"),
+                    "rust_used": _tim.get("rust_used", False),
                     "post_orders_ms": _tim.get("post_orders_ms"),
                     "total_ms": _total_ms,
                 })

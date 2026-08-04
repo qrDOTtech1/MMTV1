@@ -1038,6 +1038,60 @@ class PolyLive:
         on-chain). A appeler apres post_market_order, en parallele pour les 2 jambes."""
         return self._wait_for_fill(token_id, before, timeout=timeout)
 
+    def _resign_via_rust(self, order, exchange_address: str, chain_id: int = 137):
+        """Re-signe un ordre DEJA construit par Python (montants, tick size,
+        fees -- toute la logique metier -- restent 100% Python, zero risque
+        de dupliquer ce calcul) via le service Rust local (Steven 04/08,
+        "je veux tester ce que rust nous fait gagner"). Remplace UNIQUEMENT
+        order.signature si Rust repond a temps avec une signature valide.
+        Timeout court + tout echec => l'ordre garde la signature Python
+        (deja valide) -- ce n'est jamais un blocage, juste une tentative.
+        Verifie ce soir : signature Rust et Python BYTE-IDENTIQUES pour le
+        meme ordre (struct EIP-712 V2 exacte, meme cle) -- voir
+        enginebtb3_rust/BENCHMARK_RESULTS.md."""
+        # GARDE-FOU CRITIQUE (Steven 04/08, trouve en testant AVANT tout depot) :
+        # notre compte reel resout signatureType=3 (POLY_1271, wallet
+        # intelligent) et PAS 0 (EOA) -- confirme en inspectant un vrai ordre
+        # construit par c.create_order(). POLY_1271 utilise un schema de
+        # signature ENVELOPPEE completement different (contents_hash +
+        # TypedDataSign wrapper + concatenation, voir
+        # ExchangeOrderBuilderV2._build_poly_1271_order_signature en Python)
+        # que ce module Rust NE SAIT PAS FAIRE (EIP-712 simple seulement).
+        # Si on laissait passer, CHAQUE ordre reel recevrait une signature
+        # invalide des le premier depot. Rust ne s'active QUE pour EOA (0) --
+        # sur ce compte, ca veut dire qu'il ne s'activera jamais tant que
+        # POLY_1271 n'est pas implemente cote Rust (pas fait ce soir, cf.
+        # BENCHMARK_RESULTS.md).
+        if int(order.signatureType) != 0:
+            return order, None
+        url = os.environ.get("RUST_SIGN_URL", "http://127.0.0.1:9931/sign")
+        try:
+            payload = {
+                "maker": order.maker,
+                "signer": order.signer,
+                "token_id": str(order.tokenId),
+                "maker_amount": str(order.makerAmount),
+                "taker_amount": str(order.takerAmount),
+                "side": int(order.side),
+                "signature_type": int(order.signatureType),
+                "timestamp": str(order.timestamp),
+                "metadata": order.metadata,
+                "builder": order.builder,
+                "salt": str(order.salt),
+                "chain_id": chain_id,
+                "exchange": exchange_address,
+            }
+            r = requests.post(url, json=payload, timeout=0.3)
+            if r.status_code != 200:
+                return order, None
+            sig = r.json().get("signature")
+            if not sig:
+                return order, None
+            order.signature = sig
+            return order, r.json().get("sign_us")
+        except Exception:
+            return order, None  # jamais fatal -- Python a deja signe correctement
+
     def post_limit_pair_no_slippage(
         self, tid1: str, price1: float, size1: float, tid2: str, price2: float, size2: float
     ) -> dict:
@@ -1103,6 +1157,28 @@ class PolyLive:
                 o1 = _o1.result()
                 o2 = _o2.result()
             _tt2 = time.time()
+            # RE-SIGNATURE RUST (Steven 04/08, "je veux tester ce que rust nous
+            # fait gagner") : o1/o2 sont deja des ordres COMPLETS et VALIDES
+            # (Python a calcule montants/tick/fees et signe) -> on tente
+            # seulement de remplacer la signature par celle du service Rust
+            # local, EN PARALLELE pour ne pas serialiser les 2 jambes. Timeout
+            # 300ms, echec silencieux -> garde la signature Python (deja bonne).
+            from py_clob_client_v2.config import get_contract_config
+
+            _cfg = get_contract_config(137)
+            try:
+                _neg1 = c.get_neg_risk(tid1)
+                _neg2 = c.get_neg_risk(tid2)
+            except Exception:
+                _neg1 = _neg2 = False
+            _exch1 = _cfg.neg_risk_exchange_v2 if _neg1 else _cfg.exchange_v2
+            _exch2 = _cfg.neg_risk_exchange_v2 if _neg2 else _cfg.exchange_v2
+            with ThreadPoolExecutor(max_workers=2) as _ex3:
+                _r1 = _ex3.submit(self._resign_via_rust, o1, _exch1)
+                _r2 = _ex3.submit(self._resign_via_rust, o2, _exch2)
+                o1, _rust_us1 = _r1.result()
+                o2, _rust_us2 = _r2.result()
+            _tt2b = time.time()
             results = c.post_orders(
                 [
                     PostOrdersV2Args(order=o1, orderType=OrderType.GTC),
@@ -1113,7 +1189,9 @@ class PolyLive:
             _timing = {
                 "baseline_ms": round((_tt1 - _tt0) * 1000),
                 "signature_ms": round((_tt2 - _tt1) * 1000),
-                "post_orders_ms": round((_tt3 - _tt2) * 1000),
+                "rust_resign_ms": round((_tt2b - _tt2) * 1000),
+                "rust_used": bool(_rust_us1 and _rust_us2),
+                "post_orders_ms": round((_tt3 - _tt2b) * 1000),
             }
         except Exception as e:
             return {"success": False, "error": str(e)[:200], "legs": []}
