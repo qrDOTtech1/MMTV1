@@ -240,6 +240,22 @@ PAPER_START_BAL = 20.0  # solde papier de depart (par marche paper)
 KELLY_FRACTION = 0.25
 KELLY_ASSUMED_EDGE = 0.06  # edge de proba suppose au max de conviction, a recalibrer
 # avec plus de donnees reelles sur le WR par marche.
+
+# ── MULTIPLICATEUR EMPIRIQUE PAR PALIER DE PRIX (Steven 04/08) ──
+# Analyse on-chain de 221 jambes reelles (301$ engages) : ROI par tranche de
+# prix d'achat allait dans le sens INVERSE de ce que produit le Kelly ci-dessus
+# (edge fixe suppose) -- <0.30 : -24.4% ROI (19% win rate) ; 0.30-0.50 :
+# -18.2% (34%) ; 0.50-0.70 : -3.8% (54%) ; >0.70 : +9.1% ROI (77% win rate,
+# SEULE tranche rentable, la moins financee). Resserre l'allocation vers ce
+# qui a reellement marche -- voir _budget_usd(). A recalibrer avec plus de
+# donnees ; ce n'est pas un vrai recalibrage du modele de proba, juste un
+# correctif empirique en attendant.
+PRICE_TIER_BUDGET_MULT = {
+    "below_030": 0.15,
+    "p030_050": 0.35,
+    "p050_070": 1.0,
+    "above_070": 1.6,
+}
 # ── plancher de prix d'achat DEDIE par symbole (Steven 22/07) : SOL/DOGE plus
 # volatils -> n'achete que sur des favoris quasi-certains (>=0.94) PAR DEFAUT.
 # Le bouton "Opportunité" (par marche) permet de LEVER ce plancher pour laisser
@@ -1803,8 +1819,20 @@ class MultiTrader:
 
     def fetch_real_history(self):
         """Recupere l'historique reel depuis Polymarket data-api (public, lecture
-        seule) et le renvoie formate pour le dashboard."""
+        seule) et le renvoie formate pour le dashboard.
+
+        FIX CRITIQUE (Steven 04/08, "eth la par ex a fait bien + que 20c de
+        gain hein") : les evenements type=REDEEM (paiement quand une position
+        gardee jusqu'a resolution GAGNE) ont price=0 dans le flux Polymarket,
+        mais un champ usdcSize = le vrai montant paye. L'ancienne version
+        utilisait size*price pour TOUT (y compris REDEEM), ce qui comptait
+        chaque gain resolu par redemption comme 0$ -- sous-estimant fortement
+        les gains reels. Verifie : reconstruction manuelle sur 500 activites
+        a trouve +144.995$ de gains reels (89 jambes) contre -195.113$ de
+        pertes (134 jambes), net -50.118$ -- l'ancienne version aurait
+        entierement rate les +144.995$."""
         import requests as _rq
+        from collections import defaultdict
 
         funder = os.environ.get("POLY_FUNDER_ADDRESS", "")
         if not funder:
@@ -1812,7 +1840,7 @@ class MultiTrader:
         try:
             r = _rq.get(
                 "https://data-api.polymarket.com/activity",
-                params={"user": funder, "limit": "200"},
+                params={"user": funder, "limit": "500"},
                 timeout=12,
                 headers={"User-Agent": "GHOST/3"},
             )
@@ -1821,30 +1849,70 @@ class MultiTrader:
                 raw = []
         except Exception as e:
             return {"ok": False, "trades": [], "error": str(e)[:120]}
+
         trades = []
-        total_pnl = 0.0
+        groups = defaultdict(lambda: {"buy": 0.0, "sell": 0.0, "redeem": 0.0, "market": "", "outcome": ""})
         for t in raw:
-            side = t.get("side", "?")
-            size = float(t.get("size", 0))
-            price = float(t.get("price", 0))
-            cost = round(size * price, 4)
-            pnl_t = (
-                round(size - cost, 4)
-                if side.upper() == "BUY"
-                else round(cost - size, 4)
-            )
-            trades.append(
-                {
-                    "ts": t.get("timestamp"),
-                    "market": t.get("title", t.get("market", "?")),
-                    "side": side,
-                    "outcome": t.get("outcome", "?"),
-                    "size": size,
-                    "price": price,
-                    "cost": cost,
-                }
-            )
-        return {"ok": True, "trades": trades, "count": len(trades)}
+            etype = t.get("type", "TRADE")
+            side = t.get("side") or ("REDEEM" if etype == "REDEEM" else "?")
+            size = float(t.get("size") or 0)
+            price = float(t.get("price") or 0)
+            # usdcSize = montant USDC reel qui a bouge on-chain -- plus precis
+            # que size*price (qui vaut 0 pour un REDEEM) et evite l'arrondi
+            # de `price` (souvent tronque genre 0.7599999406).
+            usdc = float(t.get("usdcSize") or round(size * price, 4))
+            market = t.get("title", t.get("market", "?"))
+            outcome = t.get("outcome", "?")
+            trades.append({
+                "ts": t.get("timestamp"),
+                "market": market,
+                "side": side,
+                "type": etype,
+                "outcome": outcome,
+                "size": size,
+                "price": price,
+                "cost": round(usdc, 4),
+            })
+            g = groups[(t.get("slug"), outcome)]
+            g["market"], g["outcome"] = market, outcome
+            if etype == "REDEEM":
+                g["redeem"] += usdc
+            elif side.upper() == "BUY":
+                g["buy"] += usdc
+            elif side.upper() == "SELL":
+                g["sell"] += usdc
+
+        by_market = []
+        wins_sum = losses_sum = 0.0
+        wins_n = losses_n = 0
+        for (slug, outcome), g in groups.items():
+            net = round(g["sell"] + g["redeem"] - g["buy"], 4)
+            by_market.append({
+                "slug": slug, "market": g["market"], "outcome": outcome,
+                "buy": round(g["buy"], 4), "sell": round(g["sell"], 4),
+                "redeem": round(g["redeem"], 4), "net_pnl": net,
+            })
+            if net > 0.005:
+                wins_sum += net
+                wins_n += 1
+            elif net < -0.005:
+                losses_sum += net
+                losses_n += 1
+        by_market.sort(key=lambda r: r["net_pnl"])
+
+        return {
+            "ok": True,
+            "trades": trades,
+            "count": len(trades),
+            "net_pnl_by_market": by_market,
+            "summary": {
+                "net_total": round(wins_sum + losses_sum, 4),
+                "wins_count": wins_n,
+                "wins_sum": round(wins_sum, 4),
+                "losses_count": losses_n,
+                "losses_sum": round(losses_sum, 4),
+            },
+        }
 
     def floor(self):
         """Plancher de capital COURANT (reglable depuis le dashboard, persiste).
@@ -2095,6 +2163,26 @@ class MultiTrader:
         q = min(0.995, ask + KELLY_ASSUMED_EDGE * lean)  # proba de gain estimee
         f_star = max(0.0, (b * q - (1 - q)) / b) * KELLY_FRACTION
         budget = investable * f_star
+        # MULTIPLICATEUR PAR PALIER DE PRIX (Steven 04/08, "on aurait du miser
+        # plus sur la position la plus chere") : analyse de 221 jambes on-chain
+        # (301$ engages) a montre un ROI qui va dans le sens INVERSE de ce que
+        # ce Kelly (edge fixe suppose 6%) produit -- prix<0.30 : -24.4% ROI
+        # (19% win rate, 88.59$ engages) ; 0.30-0.50 : -18.2% (34%, 213.02$,
+        # la PLUS GROSSE part du capital engage) ; 0.50-0.70 : -3.8% (54%) ;
+        # >0.70 : +9.1% ROI (77% win rate, SEULE tranche rentable, mais
+        # seulement 63.01$ engages dessus). Ce multiplicateur EMPIRIQUE
+        # resserre l'allocation vers ce qui a reellement marche, en attendant
+        # un vrai recalibrage de la proba/edge suppose (KELLY_ASSUMED_EDGE
+        # n'a jamais ete recalibre depuis sa valeur initiale).
+        if ask < 0.30:
+            tier_mult = PRICE_TIER_BUDGET_MULT["below_030"]
+        elif ask < 0.50:
+            tier_mult = PRICE_TIER_BUDGET_MULT["p030_050"]
+        elif ask < 0.70:
+            tier_mult = PRICE_TIER_BUDGET_MULT["p050_070"]
+        else:
+            tier_mult = PRICE_TIER_BUDGET_MULT["above_070"]
+        budget *= tier_mult
         # le plancher de securite reste PRIORITAIRE : on ne depasse jamais
         # l'investissable (= solde - FLOOR_USD), ni le hard cap, ni MAX_FRACTION.
         return max(
@@ -2431,6 +2519,31 @@ class MultiTrader:
                     budget = round(REAL_VALIDATION_SHARES * ask, 2)
                 # SIZING ADAPTATIF (Steven 25/07) : reduit la taille si liquidite faible
                 budget = self._adaptive_size(sym, token_id, budget, max_entry)
+                # GARDE-FOU MINIMUM VENDABLE (Steven 04/08, analyse on-chain :
+                # 63 positions tenues jusqu'a resolution jamais vendues, -116.20$
+                # au total, prix d'entree moyen 0.408). Cause racine trouvee :
+                # l'ordre MARKET ci-dessous accepte des budgets jusqu'a 0.10$
+                # (voir commentaire plus bas), ce qui produit des positions SOUS
+                # le minimum vendable CLOB (5 parts) -> ni stop-loss ni take-
+                # profit ne peuvent JAMAIS s'executer dessus, quoi qu'il arrive.
+                # Ce n'est pas une strategie a risque assume (contrairement a la
+                # petite mise underdog du hedge, volontairement jetable) -- c'est
+                # une position normale qui devient un pari pile-ou-face force par
+                # accident. Soit on met assez pour pouvoir sortir, soit on
+                # n'entre pas du tout.
+                _min_sellable_budget = round(MIN_ORDER_SIZE_SHARES * ask, 2)
+                if budget < _min_sellable_budget:
+                    if investable >= _min_sellable_budget:
+                        budget = _min_sellable_budget
+                    else:
+                        self._reject(
+                            sym,
+                            slug,
+                            "below_sellable_min",
+                            f"budget={budget:.2f} < min_vendable={_min_sellable_budget:.2f} "
+                            f"(investable={investable:.2f}) -> position invendable evitee",
+                        )
+                        return
                 self._log(
                     f"🎯 [REEL] {sym} {slug} {sig['side']} ask={ask:.3f} budget={budget:.2f}$ "
                     f"buffer={sig['buffer']:+.1f}/{sig['margin']:.1f} danger={sig.get('danger', 0)} "
