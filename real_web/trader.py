@@ -254,7 +254,11 @@ PRICE_TIER_BUDGET_MULT = {
     "below_030": 0.15,
     "p030_050": 0.35,
     "p050_070": 1.0,
-    "above_070": 1.6,
+    # >0.70 releve a 2.5x le 04/08 (Steven, "une vraie diff de prix entre la
+    # pos chere qui rapporte bcp et la pos pas chere qui rapporte peu") --
+    # etait 1.6x. Toujours borne par HARD_CAP_USD/investable en aval, donc
+    # sans risque de depasser le capital ou le plafond dur meme agressif ici.
+    "above_070": 2.5,
 }
 # ── plancher de prix d'achat DEDIE par symbole (Steven 22/07) : SOL/DOGE plus
 # volatils -> n'achete que sur des favoris quasi-certains (>=0.94) PAR DEFAUT.
