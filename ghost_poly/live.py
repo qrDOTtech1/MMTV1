@@ -34,6 +34,7 @@ https://docs.polymarket.com/resources/contracts) :
 
 import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -109,6 +110,7 @@ class PolyLive:
         )  # wallet qui détient les fonds
         self._pk = private_key
         self._client = None
+        self._keepalive_started = False
 
     # ── état / prérequis ──
 
@@ -224,7 +226,44 @@ class PolyLive:
             creds = c.create_or_derive_api_key()
             c.set_api_creds(creds)
             self._client = c
+            self._start_keepalive()
         return self._client
+
+    def _start_keepalive(self):
+        """Ping GET /ok toutes les 2s (Steven 04/08, "set and forget, the
+        best or nothin' "). py_clob_client_v2 utilise un httpx.Client HTTP/2
+        UNIQUE et partage (module-level singleton), mais son keepalive_expiry
+        par defaut est 5s -- si 2 tentatives d'arb sont espacees de plus de
+        5s (frequent, marches 5min), la connexion TCP/TLS vers
+        clob.polymarket.com est fermee et DOIT etre rouverte au moment
+        precis ou la vitesse compte le plus. Ce ping garde la connexion
+        chaude en permanence, hors du chemin critique -- gain potentiel de
+        dizaines/centaines de ms sur le premier ordre d'une fenetre d'arb,
+        sans toucher a la logique de trading.
+
+        Auto-guerison : demarre des la creation du client (pas besoin d'un
+        premier trade), et si le thread meurt malgre le try/except (bug
+        imprevu), une thread "chien de garde" le relance -- zero intervention
+        manuelle requise, conforme a l'exigence set-and-forget."""
+        if self._keepalive_started:
+            return
+        self._keepalive_started = True
+
+        def _ping_loop():
+            while True:
+                try:
+                    self._client.get_ok()
+                except Exception:
+                    pass
+                time.sleep(2)
+
+        def _watchdog():
+            while True:
+                t = threading.Thread(target=_ping_loop, daemon=True, name="poly-keepalive")
+                t.start()
+                t.join()  # ne revient que si _ping_loop a crashe (imprevu) -> relance immediate
+
+        threading.Thread(target=_watchdog, daemon=True, name="poly-keepalive-watchdog").start()
 
     def ws_auth(self) -> dict:
         """Creds L2 (api_key/secret/passphrase) pour le canal WS "user" (Steven
