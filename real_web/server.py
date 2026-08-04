@@ -153,6 +153,67 @@ def snapshot():
     return jsonify(trader.snapshot())
 
 
+@app.route("/api/risk-config")
+def risk_config():
+    """Expose les seuils SL/TP/sizing (Steven 04/08, 'AUCUN SL TP ????') : ces
+    reglages tournent deja depuis longtemps cote bot mais n'etaient visibles
+    dans AUCUN dashboard, local ou web -- juste des constantes Python. Lecture
+    seule (pas de POST) : ce sont des constantes de code, pas un etat modifiable
+    a chaud comme le floor ou le kill-switch."""
+    import real_web.trader as _t
+    from real_web.trader import MultiTrader as _MT
+
+    return jsonify({
+        "tp": {
+            "fractions_par_palier": list(_t.PNL_TP_FRACTIONS),
+            "cibles_pnl_pct": list(_t.PNL_TP_TARGETS),
+            "trailing_activation_pct": _t.PNL_TRAIL_ACTIVATION,
+            "trailing_giveback_pct": _t.PNL_TRAIL_GIVEBACK,
+        },
+        "sl": {
+            "seuil_pct": _t.PNL_SL_PCT,
+            "secs_left_min": _t.PNL_SL_MIN_SECS_LEFT,
+            "poll_intervalle_s": _t.FAST_EXIT_POLL_S,
+            "multiplicateur_contextuel_par_symbole": getattr(_MT, "_CTX_SL_MULTIPLIER", {}),
+        },
+        "orphan": {
+            "tp_price": _t.ORPHAN_TP_PRICE,
+            "tp_min_profit": _t.ORPHAN_TP_MIN_PROFIT,
+            "tp_sell_fraction": _t.ORPHAN_TP_SELL_FRACTION,
+        },
+        "arb_sl": {
+            "secs_left_activation": _t.ARB_SL_SECS_LEFT,
+            "bid_threshold": _t.ARB_SL_BID_THRESHOLD,
+        },
+        "both_side_sl": {
+            "prix_seuil": _t.BOTH_SIDE_SL_PRICE,
+            "secs_left_min": _t.BOTH_SIDE_SL_MIN_SECS_LEFT,
+        },
+        "sizing_hedge": {
+            "underdog_bet_usd": _t.UNDERDOG_BET_USD,
+            "underdog_coverage_mult": _t.DOG_COVERAGE_MULT,
+            "favorite_bet_max_usd": _t.FAVORITE_BET_MAX_USD,
+            "favorite_target_net_usd": _t.FAV_TARGET_NET_USD,
+            "favorite_max_price": _t.FAV_MAX_PRICE,
+            "min_calibrated_prob": _t.MIN_CALIBRATED_PROB,
+        },
+        "kelly": {
+            "fraction": _t.KELLY_FRACTION,
+            "assumed_edge_fallback": _t.KELLY_ASSUMED_EDGE,
+        },
+        "binance_ws_sizing": {
+            "momentum_boost_mult": _t.BINANCE_MOMENTUM_BOOST,
+            "danger_reduce_mult": _t.BINANCE_DANGER_REDUCE,
+        },
+        "rl_exit": {
+            "enabled": _t.RL_EXIT_ENABLED,
+            "shadow_mode": _t.RL_EXIT_SHADOW,
+            "interval_s": _t.RL_EXIT_INTERVAL_S,
+            "min_secs_left": _t.RL_EXIT_MIN_SECS_LEFT,
+        },
+    })
+
+
 @app.route("/api/enginebtb3")
 def enginebtb3_status():
     """Statut du squelette ENGINEBTB3 (Steven 04/08) : import LOCAL et isole,
