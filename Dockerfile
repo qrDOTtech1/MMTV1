@@ -12,6 +12,10 @@ COPY core/ core/
 COPY ghost_poly/ ghost_poly/
 COPY real_control/ real_control/
 COPY real_web/ real_web/
+# paper_snipe.py est a la RACINE du repo (pas dans un sous-dossier), oublie
+# une 1ere fois -> le Dockerfile ne copiait que les sous-dossiers. Trouve
+# via le meme crash en boucle que market_maker.py (Steven 04/08).
+COPY paper_snipe.py .
 
 RUN mkdir -p /app/data
 
