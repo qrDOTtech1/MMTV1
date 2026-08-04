@@ -37,10 +37,10 @@ reader = ReadApi()  # read-only : courbes, backfill, horloge, log
 # exposee publiquement sur Railway, n'importe qui avec l'URL pourrait lire
 # tout l'historique de trades OU declencher /api/start /api/stop sur de
 # l'argent reel. Verification par token partage (header Authorization:
-# Bearer <GHOST_API_TOKEN>), comparaison a temps constant (pas de timing
-# attack). Si GHOST_API_TOKEN n'est pas configure au deploiement, l'API
+# Bearer <MMTRADE_API_TOKEN>), comparaison a temps constant (pas de timing
+# attack). Si MMTRADE_API_TOKEN n'est pas configure au deploiement, l'API
 # refuse TOUT (fail-closed) plutot que de tourner grande ouverte par defaut.
-_API_TOKEN = os.environ.get("GHOST_API_TOKEN", "")
+_API_TOKEN = os.environ.get("MMTRADE_API_TOKEN", "")
 
 
 @app.before_request
@@ -48,7 +48,7 @@ def _check_auth():
     if request.path in ("/", "/api/precheck") or request.path.startswith("/static"):
         return None  # healthcheck Railway + page statique : pas de secret expose
     if not _API_TOKEN:
-        return jsonify({"error": "GHOST_API_TOKEN non configure -> API verrouillee"}), 503
+        return jsonify({"error": "MMTRADE_API_TOKEN non configure -> API verrouillee"}), 503
     got = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
     if not hmac.compare_digest(got, _API_TOKEN):
         return jsonify({"error": "unauthorized"}), 401
@@ -579,7 +579,7 @@ if __name__ == "__main__":
     # DetailDesk) : joignable via le RESEAU PRIVE Railway (hostname interne
     # type mmtv1.railway.internal), jamais expose publiquement tant qu'aucun
     # domaine public n'est genere pour ce service -> pas besoin d'exposer un
-    # domaine public du tout. GHOST_API_TOKEN reste actif en defense en
+    # domaine public du tout. MMTRADE_API_TOKEN reste actif en defense en
     # profondeur (voir before_request plus haut) meme sur le reseau prive.
     import os as _os
     app.run(host="0.0.0.0", port=int(_os.environ.get("PORT", 8787)), threaded=True, debug=False)
