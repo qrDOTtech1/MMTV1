@@ -153,6 +153,47 @@ def snapshot():
     return jsonify(trader.snapshot())
 
 
+@app.route("/api/latency")
+def latency():
+    """Historique structure des mesures CHRONO + percentiles (Steven 04/08,
+    'onglet dedie calcul latence historique'). p50/p95/p99 sur chaque etape
+    (pas juste la mediane -- les pics rares sont ceux qui coutent le plus cher
+    sur un marche qui bouge en quelques secondes)."""
+    hist = trader.state.get("latency_history", [])
+
+    def _pctl(vals, p):
+        vals = sorted(v for v in vals if v is not None)
+        if not vals:
+            return None
+        k = (len(vals) - 1) * (p / 100)
+        f, c = int(k), min(int(k) + 1, len(vals) - 1)
+        if f == c:
+            return vals[f]
+        return round(vals[f] + (vals[c] - vals[f]) * (k - f), 1)
+
+    def _stats(key):
+        vals = [h.get(key) for h in hist]
+        return {
+            "p50": _pctl(vals, 50),
+            "p95": _pctl(vals, 95),
+            "p99": _pctl(vals, 99),
+            "min": min((v for v in vals if v is not None), default=None),
+            "max": max((v for v in vals if v is not None), default=None),
+            "count": sum(1 for v in vals if v is not None),
+        }
+
+    return jsonify({
+        "history": hist[-300:],
+        "stats": {
+            "total_ms": _stats("total_ms"),
+            "avant_post_ms": _stats("avant_post_ms"),
+            "baseline_ms": _stats("baseline_ms"),
+            "signature_ms": _stats("signature_ms"),
+            "post_orders_ms": _stats("post_orders_ms"),
+        },
+    })
+
+
 @app.route("/api/killswitch", methods=["GET", "POST"])
 def killswitch():
     """Seuils du kill-switch global, reglables a chaud (Steven 04/08) : pas

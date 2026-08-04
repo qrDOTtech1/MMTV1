@@ -757,6 +757,7 @@ class MultiTrader:
         self.state = self._load()
         self.state.setdefault("killswitch", dict(KILLSWITCH_DEFAULTS))
         self.state.setdefault("killswitch_triggered", None)  # {"reason":..., "ts":...} si declenche
+        self.state.setdefault("latency_history", [])  # mesures CHRONO structurees, voir /api/latency
         # ── FLUX WEBSOCKET TEMPS REEL (Steven 23/07) : demarre les connexions
         # Binance + Polymarket. Alimente le cache que _book_quote / _mm_tick /
         # l'arb lisent en <100ms au lieu du REST ~1s. Lecture seule, aucun ordre. ──
@@ -4054,14 +4055,33 @@ class MultiTrader:
                 )
                 _t["apres_post"] = time.time()
                 _tim = _pair_res.get("timing") or {}
+                _avant_post_ms = round((_t["avant_post"] - _t["t0"]) * 1000)
+                _post_ms = round((_t["apres_post"] - _t["avant_post"]) * 1000)
+                _total_ms = round((_t["apres_post"] - _t["t0"]) * 1000)
                 self._log(
                     f"⏱️ [CHRONO] {sym} {slug} entree_fonction->avant_post="
-                    f"{round((_t['avant_post']-_t['t0'])*1000)}ms | "
-                    f"post_lui_meme={round((_t['apres_post']-_t['avant_post'])*1000)}ms "
+                    f"{_avant_post_ms}ms | "
+                    f"post_lui_meme={_post_ms}ms "
                     f"(baseline={_tim.get('baseline_ms','?')}ms signature={_tim.get('signature_ms','?')}ms "
                     f"post_orders={_tim.get('post_orders_ms','?')}ms) | "
-                    f"TOTAL={round((_t['apres_post']-_t['t0'])*1000)}ms"
+                    f"TOTAL={_total_ms}ms"
                 )
+                # HISTORIQUE STRUCTURE (Steven 04/08, "onglet dedie latence
+                # historique") : le texte de log seul ne permet pas de calculer
+                # des percentiles fiables. Liste bornee en memoire + persistee,
+                # exposee via /api/latency.
+                self.state.setdefault("latency_history", []).append({
+                    "ts": _t["t0"],
+                    "symbol": sym,
+                    "avant_post_ms": _avant_post_ms,
+                    "post_ms": _post_ms,
+                    "baseline_ms": _tim.get("baseline_ms"),
+                    "signature_ms": _tim.get("signature_ms"),
+                    "post_orders_ms": _tim.get("post_orders_ms"),
+                    "total_ms": _total_ms,
+                })
+                if len(self.state["latency_history"]) > 1000:
+                    del self.state["latency_history"][: len(self.state["latency_history"]) - 1000]
                 if _pair_res.get("success") and len(_pair_res.get("legs", [])) == 2:
                     _l1, _l2 = _pair_res["legs"]
                     h1 = {"posted": _l1["success"], "before": _l1["before"],
