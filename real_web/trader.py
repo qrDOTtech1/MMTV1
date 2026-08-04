@@ -156,9 +156,10 @@ FAV_MAX_PRICE = 0.97  # au-dela, la mise requise explose pour 0.30$ -> skip hedg
 HEDGE_VALIDATION_MODE = True
 HEDGE_FAV_MAX_USD_VALIDATION = 1.6
 HEDGE_DOG_MAX_USD_VALIDATION = 1.6
-# ── FAVORITE BUDGET MULT (Steven 28/07) : la jambe favorite recoit plus de budget
-# que l'underdog. FACTOR = 1.6 -> favorite $1.60 vs underdog $1.00.
-FAVORITE_BUDGET_MULT = 1.6
+# ── FAVORITE BUDGET MULT (Steven 28/07, releve 1.6->2.5 le 04/08) : la jambe
+# favorite recoit plus de budget que l'underdog. FACTOR = 2.5 -> favorite
+# $2.50 vs underdog $1.00, meme ratio que PRICE_TIER_BUDGET_MULT["above_070"].
+FAVORITE_BUDGET_MULT = 2.5
 
 # ── ARB-ONLY (Steven 22/07 : "quasi 100% WR au global") : True = on ne prend QUE
 # les arbs GARANTIS (crypto both-side + ULTRAPOLY). Le hedge favori+dog est COUPE :
