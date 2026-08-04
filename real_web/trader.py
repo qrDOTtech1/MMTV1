@@ -315,16 +315,16 @@ BOTH_SIDE_PAIR_BUDGET_REAL = (
 # MEME en milieu de fenetre (pas juste en fin de course). Le cap +0.02 fixe
 # etait donc systematiquement trop serre -> quasi 100% d'echec en reel alors
 # que le paper (meme logique, sans latence reseau) gagne +94$.
-PREFLIGHT_DISABLED = True  # (Steven 04/08, "revenons a l'achat parallele ou on
-# forcait achat comb_ask<0.98 en achetant le favori d'abord") : choix assume
-# apres avoir vu les DEUX regimes en reel cette nuit.
-#   - preflight ON  : ~0 trade (9 detections -> 0 passee), capital intact
-#   - preflight OFF : du volume, mais -22.40$ net mesures on-chain
-# Le compromis retenu : on execute, et si une seule jambe se remplit, on veut
-# que ce soit le FAVORI (celui que le marche donne gagnant) plutot qu'un cote
-# au hasard -> un orphelin favori gagne plus souvent qu'il ne perd, la ou un
-# orphelin underdog est perdant par construction. Voir tri favori-d'abord
-# dans _try_both_side.
+PREFLIGHT_DISABLED = False  # (Steven 04/08, "pret a mettre des $", avant un
+# nouveau depot) : REACTIVE. Bilan chiffre de la session avec ce flag a True :
+# 141 marches, 70 mono-jambe (50%!) a seulement 20% de reussite = -35.12$,
+# c'etait le vrai trou noir (l'arb propre a parts egales, lui, etait legerement
+# positif : +1.87$, 54%). Le preflight + reevaluation au combine FRAIS
+# (PREFLIGHT-REEVAL, code deja en place plus bas) n'a JAMAIS tourne en
+# conditions reelles cette nuit (0 occurrence en log) -- premiere vraie mesure
+# a faire avec ce redemarrage. Si ca retombe a ~0 trade comme le test precedent
+# (preflight strict SANS reeval), le reeval n'aura pas suffi et il faudra
+# retravailler la marge de tolerance plutot que redesactiver aveuglement.
 _PREFLIGHT_FORCE_BOTHSIDE_HISTORIQUE = False  # (Steven 04/08, "il faut forcer both side pour
 # vraiment etre risk free") : REACTIVE apres preuve chiffree. Sur la session
 # 22:32->01:19 UTC, donnees REELLES Polymarket : 198.08$ d'achats (119 ordres)
