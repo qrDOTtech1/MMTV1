@@ -5258,7 +5258,12 @@ class MultiTrader:
                 # Vente IMMÉDIATE au marché (pas de orphan manager, pas d'attente)
                 emergency_px = round(max(0.01, fav_px - EMERGENCY_SELL_SLIPPAGE_PCT), 2)
                 try:
-                    sell_result = self._live.sell_position(fav_tid, ff, emergency_px)
+                    # FIX CRITIQUE (Steven 04/08) : ordre (token, PRIX, parts) --
+                    # ff/emergency_px etaient inverses (ff=parts, emergency_px=prix
+                    # dans sell_position(token_id, price, size)), ce qui envoyait un
+                    # "prix" de plusieurs parts (invalide, >1$) -> vente TOUJOURS
+                    # rejetee silencieusement sur ce chemin d'urgence.
+                    sell_result = self._live.sell_position(fav_tid, emergency_px, ff)
                     sell_shares = (
                         sell_result.get("filled_shares", 0)
                         if isinstance(sell_result, dict)
@@ -6387,8 +6392,15 @@ class MultiTrader:
                                         f"(perte ~{(sell_info.get('entry_price', 0) - sell_price) * sell_shares:.2f}$)"
                                     )
                                     try:
+                                        # FIX CRITIQUE (Steven 04/08, trouve via le
+                                        # screenshot "31.9 positions" jamais liquidees) :
+                                        # ordre (token, PRIX, parts) -- sell_shares et
+                                        # sell_price etaient inverses, envoyant un
+                                        # "prix" de plusieurs parts (invalide, >1$) ->
+                                        # cette vente d'urgence echouait TOUJOURS
+                                        # silencieusement, expliquant l'accumulation.
                                         self._live.sell_position(
-                                            sell_token, sell_shares, sell_price
+                                            sell_token, sell_price, sell_shares
                                         )
                                     except Exception as e:
                                         self._log(f"⚠️ [FORCE-PAIR] vente echouee: {e}")
@@ -6507,10 +6519,14 @@ class MultiTrader:
                                             .get("token_id")
                                         )
                                         if token_own:
+                                            # FIX CRITIQUE (Steven 04/08) : ordre
+                                            # (token, PRIX, parts) -- meme inversion
+                                            # que les 2 autres chemins d'urgence,
+                                            # meme consequence (vente jamais executee).
                                             self._live.sell_position(
                                                 token_own,
-                                                sell_shares_orph,
                                                 sell_price_orph,
+                                                sell_shares_orph,
                                             )
                                     except Exception as e:
                                         self._log(f"⚠️ [ORPHAN] vente echouee: {e}")
