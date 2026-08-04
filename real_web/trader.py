@@ -513,8 +513,18 @@ SIZING_REDUCTION_FACTOR = 0.5  # facteur de réduction de taille si liquidité f
 # liquidite (pas le prix/probabilite, deja traite dans _budget_usd) -- "gagnant"
 # ici = carnet profond + spread serre (conditions d'execution favorables),
 # "perdant" = carnet fin + spread large (deja gere par la reduction existante).
-SIZING_BOOST_MAX_SPREAD_BPS = 40  # spread tres serre (< ce seuil) pour booster
-SIZING_BOOST_MIN_DEPTH_RATIO = 3.0  # profondeur tres large (> ce seuil) pour booster
+# RECALIBRE (Steven 05/08, "adaptatif sizing pas assez visible... regarde
+# log") : verifie sur 28 mesures reelles de la nuit, TOUJOURS des reductions
+# (0 boost), et pour cause -- les spreads reels observes vont de 200 a
+# 976bps, tous largement au-dessus de l'ancien seuil de 40bps qui n'avait
+# donc AUCUNE chance de se declencher. Attention honnete : ces 28 mesures
+# sont uniquement les cas REDUITS (la fonction ne loggue que reduce/boost,
+# jamais le cas neutre) -> pas de vraie distribution du "bon" carnet
+# dispo pour calibrer precisement. Nouveaux seuils volontairement moins
+# extremes que les valeurs devinees au depart (150bps/1.5x reste nettement
+# mieux que la moyenne des cas reduits ~260bps, sans etre hors d'atteinte).
+SIZING_BOOST_MAX_SPREAD_BPS = 150  # spread serre (< ce seuil) pour booster
+SIZING_BOOST_MIN_DEPTH_RATIO = 1.5  # profondeur large (> ce seuil) pour booster
 SIZING_BOOST_FACTOR = 1.25  # facteur d'augmentation si liquidite excellente
 
 # ── EDGE TIERS pour sizing adaptatif a l'edge (Steven 25/07) ──
@@ -1446,6 +1456,15 @@ class MultiTrader:
                     every=30.0,
                 )
                 return boosted
+            # CAS NEUTRE (Steven 05/08) : loggue aussi, throttle large -- avant,
+            # seuls reduce/boost etaient visibles, donc aucune donnee sur la
+            # distribution reelle du carnet pour recalibrer plus tard. Sert
+            # uniquement a batir un historique, n'affecte jamais le sizing.
+            self._tlog(
+                f"sizing_neutral_{sym}",
+                f"➖ [SIZING] {sym} neutre: spread={spread_bps:.0f}bps depth_ratio={depth_ratio:.2f}",
+                every=60.0,
+            )
         except Exception:
             pass
         return base_budget_usd
