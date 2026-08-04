@@ -858,8 +858,19 @@ class MultiTrader:
         line = f"[{_now()}] {msg}"
         with self._log_lock:  # threads concurrents -> lignes non entrelacees
             print(line, flush=True)
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            # try/except (Steven 04/08) : trouve en testant un deploiement --
+            # cette ecriture etait SANS PROTECTION, et un _log() appele depuis
+            # un handler d'exception (ex: RL init qui echoue proprement et
+            # essaie de LOGUER l'echec) plantait le process ENTIER si le
+            # dossier data/ n'existait pas encore/plus (ex: volume pas encore
+            # monte au tout premier demarrage). print() ci-dessus reste le
+            # filet minimal (stdout capture par Railway) meme si le fichier
+            # echoue -> jamais silencieux, jamais fatal.
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception as e:
+                print(f"[{_now()}] ⚠️ [LOG] ecriture fichier echouee : {e}", flush=True)
 
     def _tlog(self, key, msg, every=15.0):
         """Log THROTTLE : au plus 1 fois toutes les `every` secondes par cle.
