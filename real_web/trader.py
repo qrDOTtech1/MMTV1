@@ -669,6 +669,13 @@ PNL_SL_PCT = 0.20  # stop loss (Steven 29/07, resserre de -30% -> -20% : perte
 # un seuil "-30%"), le prix crashe plus vite que le check ne l'attrape. Coupe
 # plus tot -> perte moyenne plus petite, meme avec le check rapide (1.5s).
 PNL_SL_MIN_SECS_LEFT = 20  # trop peu de temps = pas de SL
+# ESCALADE TP (Steven 05/08, "on voit l'argent filer entre nos doigts") :
+# apres ce nombre d'echecs consecutifs a vendre la fraction du palier vise,
+# on vend TOUT ce qui reste au lieu de continuer a retenter la meme petite
+# fraction indefiniment. Observe en reel : 6 echecs consecutifs sur 2.5min
+# (0 part vendue a chaque fois) sur une position SOL pendant que le marche
+# continuait de bouger -- ce plafond coupe court bien avant.
+PNL_TP_ESCALATE_AFTER = 3
 
 # FAST EXIT LOOP (Steven 28/07) : le SL/TP tournait au rythme du scan complet
 # (~7-12s/symbole, trop lent pour un marche 5min) -> thread dedie, rythme WS.
@@ -7217,8 +7224,21 @@ class MultiTrader:
             if stage < len(PNL_TP_TARGETS):
                 target_pct = PNL_TP_TARGETS[stage]
                 if pnl_pct >= target_pct:
-                    # Vend 25% de la taille INITIALE
-                    sell_target = round(init_shares * PNL_TP_FRACTIONS[stage], 2)
+                    # ESCALADE APRES ECHECS REPETES (Steven 05/08, "on voit
+                    # l'argent filer entre nos doigts") : avant, un fill rate
+                    # entre pos["filled_shares"] et le palier vise reessayait
+                    # la MEME petite fraction chaque cycle, indefiniment, si le
+                    # carnet ne suivait pas (observe : 6 echecs consecutifs sur
+                    # 2.5min, 0 part vendue, pendant que le marche continuait
+                    # de bouger). Des PNL_TP_ESCALATE_AFTER echecs de suite sur
+                    # CETTE position -> on vend TOUT ce qui reste au lieu de
+                    # ne retenter que la fraction du palier -- sortir en
+                    # entier vaut mieux que continuer a esperer un fill
+                    # partiel qui ne vient pas.
+                    _fail_streak = pos.get("tp_fail_streak", 0)
+                    _escalate = _fail_streak >= PNL_TP_ESCALATE_AFTER
+                    # Vend 25% de la taille INITIALE (ou tout, si escalade)
+                    sell_target = shares if _escalate else round(init_shares * PNL_TP_FRACTIONS[stage], 2)
                     sell_shares = min(sell_target, shares)
                     if sell_shares < MIN_ORDER_SIZE_SHARES:
                         sell_shares = shares  # vend tout si trop petit
@@ -7226,13 +7246,18 @@ class MultiTrader:
                     if exit_price is None:
                         continue
                     if pos["mode"] == "real":
+                        _tag_tp = f" {sym} {slug} {pos['side']} PNL-TP{stage + 1}"
+                        if _escalate:
+                            _tag_tp += f" ESCALADE(x{_fail_streak})"
                         sold = self._sell_orphan(
                             pos["token_id"],
                             sell_shares,
-                            f" {sym} {slug} {pos['side']} PNL-TP{stage + 1}",
+                            _tag_tp,
                         )
                         if sold <= 0:
+                            pos["tp_fail_streak"] = _fail_streak + 1
                             continue
+                        pos["tp_fail_streak"] = 0
                         sell_shares = sold
                     realized = round(sell_shares * (exit_price - entry), 3)
                     pos["realized_pnl"] = round(
