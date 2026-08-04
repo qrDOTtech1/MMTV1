@@ -145,6 +145,11 @@ UNDERDOG_BET_USD = 0.20
 # Revers assume (these Steven, le paper juge) : si flip, on perd F - payout_dog
 # (~-7$ a 0.96). Rentable ssi flips < ~4-6% des fenetres.
 FAV_TARGET_NET_USD = 0.30  # gain net vise quand le favori gagne (dog deja deduit)
+# RETRY FORCE-PAIR (Steven 05/08) : nombre d'essais pour completer la 2e jambe
+# avant d'abandonner et revendre la 1ere -- toujours au meme plafond de prix
+# (max_payable), jamais surpaye pour forcer la paire.
+FORCE_PAIR_MAX_RETRIES = 3
+FORCE_PAIR_RETRY_SLEEP_S = 0.4
 FAVORITE_BET_MAX_USD = 12.0  # plafond dur de mise favori (post-validation)
 FAV_MAX_PRICE = 0.97  # au-dela, la mise requise explose pour 0.30$ -> skip hedge
 # ── VALIDATION HEDGE (Steven 23/07, "uniquement des mises en $, max 1$/pos en
@@ -6334,17 +6339,31 @@ class MultiTrader:
                 else:
                     max_payable = 0.50
                 tag_force = f"[FORCE-PAIR {secs_left:.0f}s]"
-                ok2, _ = self._open_leg(
-                    sym,
-                    mode,
-                    m,
-                    p,
-                    side,
-                    token_id,
-                    max_payable,
-                    tag_force,
-                    budget_usd=fav_budget if side == fav_side else leg_budget,
-                )
+                # RETRY BORNE (Steven 05/08, "il aurait du persister sur Down") :
+                # avant, un seul essai -> le moindre echec (liquidite eclair, ordre
+                # concurrent) faisait abandonner tout de suite et revendre la jambe
+                # deja tenue. On retente maintenant jusqu'a FORCE_PAIR_MAX_RETRIES
+                # fois, TOUJOURS au meme plafond de prix max_payable (jamais
+                # surpaye pour forcer la paire -> une paire trop chere garantit
+                # une perte, ce n'est pas le but). Court delai entre essais pour
+                # laisser une chance a un carnet qui bouge vite.
+                ok2 = False
+                for _fp_try in range(FORCE_PAIR_MAX_RETRIES):
+                    ok2, _ = self._open_leg(
+                        sym,
+                        mode,
+                        m,
+                        p,
+                        side,
+                        token_id,
+                        max_payable,
+                        tag_force,
+                        budget_usd=fav_budget if side == fav_side else leg_budget,
+                    )
+                    if ok2:
+                        break
+                    if _fp_try < FORCE_PAIR_MAX_RETRIES - 1:
+                        time.sleep(FORCE_PAIR_RETRY_SLEEP_S)
                 if ok2:
                     self._log(
                         f"🔗 [BOTHSIDE] {sym} {slug} {side} FORCE-PAIR apres echec "
