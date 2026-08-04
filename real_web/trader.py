@@ -491,10 +491,21 @@ FILL_RATE_WINDOW = 20  # nombre de tentatives récentes à surveiller
 FILL_RATE_MAX_FAILS = 3  # max échecs 2e jambe / fenêtre avant cooldown
 FILL_RATE_COOLDOWN_S = 300  # 5 min pause sur ce symbole/marché
 
-# ── SIZING ADAPTATIF (Steven 25/07) ──
+# ── SIZING ADAPTATIF (Steven 25/07, boost symetrique ajoute 04/08) ──
 SIZING_MIN_DEPTH_RATIO = 0.5  # ratio profondeur/taille visée pour réduire la taille
 SIZING_MAX_SPREAD_BPS = 200  # spread max (bps) au-delà duquel on réduit la taille
 SIZING_REDUCTION_FACTOR = 0.5  # facteur de réduction de taille si liquidité faible
+# BOOST (Steven 04/08, "mise + sur le gagnant, - sur le perdant") : jusqu'ici
+# _adaptive_size ne savait QUE reduire (mauvaise liquidite -> taille /2), jamais
+# augmenter meme quand le carnet est excellent -> asymetrie qui allait dans le
+# meme sens que le probleme corrige sur _budget_usd (jamais assez agressif sur
+# les conditions favorables). Le seul signal que possede CETTE fonction est la
+# liquidite (pas le prix/probabilite, deja traite dans _budget_usd) -- "gagnant"
+# ici = carnet profond + spread serre (conditions d'execution favorables),
+# "perdant" = carnet fin + spread large (deja gere par la reduction existante).
+SIZING_BOOST_MAX_SPREAD_BPS = 40  # spread tres serre (< ce seuil) pour booster
+SIZING_BOOST_MIN_DEPTH_RATIO = 3.0  # profondeur tres large (> ce seuil) pour booster
+SIZING_BOOST_FACTOR = 1.25  # facteur d'augmentation si liquidite excellente
 
 # ── EDGE TIERS pour sizing adaptatif a l'edge (Steven 25/07) ──
 # Confirme par Steven : BOLD>=12%, NORMAL 8-12%, REDUCED 4-8%, SKIP<4%
@@ -1409,6 +1420,22 @@ class MultiTrader:
                     every=30.0,
                 )
                 return reduced
+            # Augmenter si liquidite EXCELLENTE (spread tres serre + carnet
+            # tres profond) -- symetrique a la reduction ci-dessus, jamais fait
+            # avant ce soir. Reste borne par HARD_CAP_USD/MAX_FRACTION plus
+            # loin dans la chaine d'appel (_budget_usd), donc sans risque de
+            # depasser les gardes-fous existants.
+            if (
+                spread_bps < SIZING_BOOST_MAX_SPREAD_BPS
+                and depth_ratio > SIZING_BOOST_MIN_DEPTH_RATIO
+            ):
+                boosted = base_budget_usd * SIZING_BOOST_FACTOR
+                self._tlog(
+                    f"sizing_{sym}",
+                    f"📈 [SIZING] {sym} booste: spread={spread_bps:.0f}bps depth_ratio={depth_ratio:.2f} -> {boosted:.2f}$",
+                    every=30.0,
+                )
+                return boosted
         except Exception:
             pass
         return base_budget_usd
@@ -2517,8 +2544,14 @@ class MultiTrader:
                 # pour de tout petits premiers achats reels.
                 if REAL_VALIDATION_MODE:
                     budget = round(REAL_VALIDATION_SHARES * ask, 2)
-                # SIZING ADAPTATIF (Steven 25/07) : reduit la taille si liquidite faible
+                # SIZING ADAPTATIF (Steven 25/07, boost symetrique 04/08) : reduit
+                # la taille si liquidite faible, l'augmente si excellente.
                 budget = self._adaptive_size(sym, token_id, budget, max_entry)
+                # REPLAFONNEMENT POST-BOOST (Steven 04/08) : le boost peut depasser
+                # ce que _budget_usd avait deja borne (HARD_CAP_USD/investable) --
+                # jamais engager plus que le capital reellement disponible, meme
+                # sur un carnet excellent.
+                budget = min(budget, HARD_CAP_USD, investable)
                 # GARDE-FOU MINIMUM VENDABLE (Steven 04/08, analyse on-chain :
                 # 63 positions tenues jusqu'a resolution jamais vendues, -116.20$
                 # au total, prix d'entree moyen 0.408). Cause racine trouvee :
@@ -2724,8 +2757,12 @@ class MultiTrader:
                     )
                 # PLANCHER ARB (Steven 23/07) : chaque jambe au minimum arb_budget
                 budget = max(self.arb_budget(), min(budget, investable * 0.9))
-                # SIZING ADAPTATIF (Steven 25/07) : reduit la taille si liquidite faible
+                # SIZING ADAPTATIF (Steven 25/07, boost symetrique 04/08) : reduit
+                # la taille si liquidite faible, l'augmente si excellente.
                 budget = self._adaptive_size(sym, token_id, budget, max_entry)
+                # REPLAFONNEMENT POST-BOOST (Steven 04/08) : meme garde-fou que
+                # plus haut -- jamais depasser le capital reellement disponible.
+                budget = min(budget, HARD_CAP_USD, investable)
                 if no_slippage:
                     _shares = target_shares if target_shares is not None else round(budget / ask, 2)
                     res = self._live.snipe_buy_limit_exact(token_id, ask, _shares)
