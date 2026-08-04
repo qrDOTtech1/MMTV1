@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from flask import Flask, Response, jsonify, request, send_from_directory  # noqa: E402
 
-from real_web.trader import MultiTrader  # noqa: E402
+from real_web.trader import MultiTrader, SYMBOLS  # noqa: E402
 from real_control.api import Api as ReadApi  # noqa: E402 (courbes/horloge/log en lecture seule)
 
 ROOT = Path(__file__).parent
@@ -183,16 +183,38 @@ def execution_quality():
     total = len(hist)
     filled = sum(1 for h in hist if h.get("filled"))
     ev_vals = [h.get("ev_net_fees_pct") for h in hist if h.get("ev_net_fees_pct") is not None]
+    ev_slip_vals = [h.get("ev_net_slippage_pct") for h in hist if h.get("ev_net_slippage_pct") is not None]
     age_vals = [h.get("feed_age_ms") for h in hist if h.get("feed_age_ms") is not None]
+    fillpct_vals = [h.get("fill_pct") for h in hist if h.get("fill_pct") is not None]
+    partial = sum(1 for v in fillpct_vals if 0 < v < 100)
+
+    ae_vals, fe_vals = [], []
+    for sym in SYMBOLS:
+        for t in trader.state["markets"][sym].get("trades", []):
+            entry = t.get("entry_price")
+            pts = t.get("price_log") or []
+            if not entry or not pts:
+                continue
+            prices = [p.get("price") for p in pts if p.get("price") is not None]
+            if not prices:
+                continue
+            ae_vals.append(round((min(prices) - entry) / entry * 100, 2))
+            fe_vals.append(round((max(prices) - entry) / entry * 100, 2))
+
     return jsonify({
         "history": hist[-300:],
         "stats": {
             "attempted": total,
             "filled": filled,
             "fill_ratio_pct": round(filled / total * 100, 1) if total else None,
+            "partial_fill_count": partial,
+            "partial_fill_rate_pct": round(partial / len(fillpct_vals) * 100, 1) if fillpct_vals else None,
             "avg_ev_net_fees_pct": round(sum(ev_vals) / len(ev_vals), 2) if ev_vals else None,
+            "avg_ev_net_slippage_pct": round(sum(ev_slip_vals) / len(ev_slip_vals), 2) if ev_slip_vals else None,
             "avg_feed_age_ms": round(sum(age_vals) / len(age_vals), 1) if age_vals else None,
             "max_feed_age_ms": max(age_vals) if age_vals else None,
+            "avg_adverse_excursion_pct": round(sum(ae_vals) / len(ae_vals), 2) if ae_vals else None,
+            "avg_favorable_excursion_pct": round(sum(fe_vals) / len(fe_vals), 2) if fe_vals else None,
         },
     })
 

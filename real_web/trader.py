@@ -939,19 +939,23 @@ class MultiTrader:
             return self._last_good_cash, "cache (lecture live instable)"
         return None, "lecture solde echouee"
 
-    def _record_execution_quality(self, sym, slug, edge_pct, ev_net_fees_pct, feed_age_ms, filled: bool):
-        """Fill ratio / EV net de fees / fraicheur des donnees (Steven 04/08,
-        3 des '5 metriques prioritaires' -- les 2 autres existent deja :
-        decision-to-submit = avant_post_ms, p95/p99 par etape = /api/latency).
-        Purement de la capture, jamais dans le chemin de decision."""
+    def _record_execution_quality(
+        self, sym, slug, edge_pct, ev_net_fees_pct, feed_age_ms, filled: bool,
+        ev_net_slippage_pct=None, fill_pct=None,
+    ):
+        """Fill ratio / EV net de fees+slippage / fraicheur des donnees /
+        partial-fill (Steven 04/08). Purement de la capture, jamais dans le
+        chemin de decision."""
         self.state.setdefault("execution_quality_history", []).append({
             "ts": time.time(),
             "symbol": sym,
             "slug": slug,
             "edge_pct": edge_pct,
             "ev_net_fees_pct": ev_net_fees_pct,
+            "ev_net_slippage_pct": ev_net_slippage_pct,
             "feed_age_ms": feed_age_ms,
             "filled": filled,
+            "fill_pct": fill_pct,
         })
         if len(self.state["execution_quality_history"]) > 1000:
             del self.state["execution_quality_history"][: len(self.state["execution_quality_history"]) - 1000]
@@ -4073,6 +4077,10 @@ class MultiTrader:
         # l'edge detecte survit en profit reel garanti, quoi que fassent
         # MIN/MAX ci-dessus.
         slip_total = min(slip_total, edge * 0.9)
+        # EV net de fees ET slippage (Steven 04/08, "5+ metriques") : ce qui
+        # resterait si TOUT le budget slippage etait consomme -- le pire cas
+        # realiste, pas l'optimiste _ev_net_fees_pct seul.
+        _ev_net_slippage_pct = round((edge - COMB_ASK_FEE_ESTIMATE - slip_total) * 100, 2)
         slip_each = round(slip_total / 2, 3)
         cap1 = min(BOTH_SIDE_LEG_MAX, round(px1 + slip_each, 2))
         cap2 = min(BOTH_SIDE_LEG_MAX, round(px2 + slip_each, 2))
@@ -4498,7 +4506,11 @@ class MultiTrader:
                         f"(vente non confirmee a temps) -> trackees pour gestion/retry"
                     )
             self._log(f"↩️ [BOTHSIDE][REEL] {sym} {slug} pair KO (f1={f1} f2={f2})")
-            self._record_execution_quality(sym, slug, _edge_pct, _ev_net_fees_pct, _feed_age_ms, filled=False)
+            _fill_pct = round(min(f1, f2) / target_shares * 100, 1) if target_shares else 0.0
+            self._record_execution_quality(
+                sym, slug, _edge_pct, _ev_net_fees_pct, _feed_age_ms, filled=False,
+                ev_net_slippage_pct=_ev_net_slippage_pct, fill_pct=_fill_pct,
+            )
             self._reject(
                 sym,
                 slug,
@@ -4595,7 +4607,11 @@ class MultiTrader:
             f"✅ [BOTHSIDE][REEL] {sym} {slug} PAIRE parallele [{tier_label}] {round(M, 2)} parts/cote "
             f"(f1={f1} f2={f2}) comb={combined:.3f} -> arb +{M * (1 - combined):.2f}$"
         )
-        self._record_execution_quality(sym, slug, _edge_pct, _ev_net_fees_pct, _feed_age_ms, filled=True)
+        _fill_pct = round(M / target_shares * 100, 1) if target_shares else 100.0
+        self._record_execution_quality(
+            sym, slug, _edge_pct, _ev_net_fees_pct, _feed_age_ms, filled=True,
+            ev_net_slippage_pct=_ev_net_slippage_pct, fill_pct=_fill_pct,
+        )
         return True
 
     def _open_hedge_pair(self, sym, mode, m, p, legs, combined):
