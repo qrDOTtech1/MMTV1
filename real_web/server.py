@@ -153,6 +153,26 @@ def snapshot():
     return jsonify(trader.snapshot())
 
 
+@app.route("/api/enginebtb3")
+def enginebtb3_status():
+    """Statut du squelette ENGINEBTB3 (Steven 04/08) : import LOCAL et isole,
+    jamais au niveau module -- si ce package casse un jour, ca ne doit jamais
+    empecher le bot reel de demarrer. Rien de reel derriere pour l'instant,
+    voir enginebtb3/__init__.py et ENGINEBTB3_SPEC.txt."""
+    try:
+        import enginebtb3
+        from enginebtb3 import config as _btb3_config
+
+        return jsonify({
+            "status": enginebtb3.STATUS,
+            "active": enginebtb3.ACTIVE,
+            "markets": _btb3_config.MARKETS,
+            "weather_markets": _btb3_config.WEATHER_MARKETS,
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "active": False, "error": str(e)[:200]})
+
+
 @app.route("/api/latency")
 def latency():
     """Historique structure des mesures CHRONO + percentiles (Steven 04/08,
@@ -617,10 +637,6 @@ def stream():
 
 if __name__ == "__main__":
     # 0.0.0.0 + $PORT (Steven 04/08, service Railway dedie MMTV1, separe de
-    # DetailDesk) : joignable via le RESEAU PRIVE Railway (hostname interne
-    # type mmtv1.railway.internal), jamais expose publiquement tant qu'aucun
-    # domaine public n'est genere pour ce service -> pas besoin d'exposer un
-    # domaine public du tout. MMTRADE_API_TOKEN reste actif en defense en
-    # profondeur (voir before_request plus haut) meme sur le reseau prive.
-    import os as _os
-    app.run(host="0.0.0.0", port=int(_os.environ.get("PORT", 8787)), threaded=True, debug=False)
+    # DetailDesk) : joignable via le domaine public Railway, jamais en
+    # 127.0.0.1 (injoignable de l'exterieur du conteneur).
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8787)), threaded=True, debug=False)

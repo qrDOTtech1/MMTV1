@@ -16,6 +16,7 @@ COPY real_web/ real_web/
 # une 1ere fois -> le Dockerfile ne copiait que les sous-dossiers. Trouve
 # via le meme crash en boucle que market_maker.py (Steven 04/08).
 COPY paper_snipe.py .
+COPY enginebtb3/ enginebtb3/
 
 RUN mkdir -p /app/data
 

@@ -1,0 +1,971 @@
+Spec complete ENGINEBTB3 (Steven, 04/08) — projet futur, pas encore lance.
+
+Tu es Claude Code et tu dois intégrer un moteur de trading ultra-low-latency pour Polymarket appelé ENGINEBTB3.
+
+BTB3 = Better Than Better.
+
+Ce moteur n'est pas seulement un copy engine.
+Ce moteur doit :
+- détecter les meilleurs signaux
+- exécuter les trades réels le plus vite possible
+- minimiser la latence
+- minimiser le slippage
+- minimiser les fees
+- maximiser le fill quality
+- maximiser le PnL net
+- fonctionner sur les marchés crypto 5 min et météo court terme
+- être robuste en production
+- être modulaire
+- être améliorable en continu
+
+Objectif principal :
+Construire une architecture de trading Polymarket qui est plus rapide, plus propre, et plus rentable que les approches classiques Python/TypeScript sur les marchés 5 min crypto et sur les marchés météo courts termes.
+
+==================================================
+PRINCIPES DE CONCEPTION
+==================================================
+
+- Hot path ultra-rapide
+- Ingestion séparée de l'exécution
+- Exécution séparée du scoring
+- Scoring séparé du post-trade review
+- Priorité absolue à la vitesse réelle
+- Priorité absolue à la qualité du fill
+- Priorité absolue à la robustesse du signal
+- Rust sur le chemin critique si cela améliore les performances
+- Python possible pour l'orchestration, l'analyse, le reporting, et les backtests
+- Pas de calculs inutiles dans la boucle critique
+- Pas de requêtes réseau inutiles
+- Pas de polling si un WebSocket existe
+- Pas de reconstruction d'objet coûteuse dans le hot path
+- Pas de stratégie lente qui bloque l'exécution
+- Pas de gros frameworks qui ajoutent de la latence sans bénéfice
+- Pas de sur-architecture abstraite qui ralentit le bot
+- Pas de copier aveuglément : toujours mesurer le post-fee edge réel
+
+==================================================
+ARCHITECTURE CIBLE
+==================================================
+
+Tu dois construire une architecture en couches :
+
+1. Market data layer
+2. Signal layer
+3. Execution layer
+4. Risk layer
+5. Monitoring layer
+6. Post-trade layer
+7. Benchmark layer
+8. Improvement loop
+
+Le cœur doit être pensé pour des marchés à fenêtre courte :
+- crypto 5 minutes
+- météo court terme
+
+==================================================
+1) MARKET DATA LAYER
+==================================================
+
+Créer une couche d'ingestion temps réel qui utilise :
+- WebSocket pour les prix externes
+- WebSocket pour le book Polymarket quand disponible
+- REST uniquement quand nécessaire
+- Connexions persistantes
+- Keep-alive
+- Pas de polling inutile
+- Flux séparés pour :
+  - CEX price feeds
+  - Polymarket book / market updates
+  - leaderboard / trader feeds
+  - weather-related updates
+  - market metadata
+  - fee changes
+  - position state
+  - order state
+
+Le système doit :
+- recevoir les données le plus tôt possible
+- normaliser les flux
+- timestamp chaque événement
+- stocker le snapshot local le plus à jour possible
+- maintenir un local state rapide
+- éviter de recalculer tout à chaque tick
+
+À prévoir :
+- thread/process séparé pour l'ingestion
+- buffer interne pour les événements
+- state cache local
+- resync logic
+- stale data detection
+- feed health detection
+
+==================================================
+2) SIGNAL LAYER
+==================================================
+
+Créer une couche de signal très rapide qui peut :
+- détecter un edge sur marché crypto 5 min
+- détecter un edge sur marché météo
+- détecter un consensus entre traders
+- détecter un mouvement externe rapide
+- détecter une divergence prix externe vs prix Polymarket
+- détecter un changement de régime
+- détecter une opportunité de cycle-end snipe
+- détecter un setup maker-first
+- détecter un setup taker-only si nécessaire
+- détecter un setup de copy trade si la copie est réellement justifiée
+
+Le signal layer doit produire :
+- action
+- direction
+- size recommandée
+- confidence
+- urgency
+- expected edge
+- expected slippage
+- expected fees
+- expected fill quality
+- expected hold time
+- market regime
+- reason codes
+
+Le signal layer doit être ultra léger :
+- pas d'allocations inutiles
+- pas de recalcul de structures lourdes
+- pas de logique de reporting dans le hot path
+- pas de requêtes externes synchrones
+- pas de blocage sur logging
+
+==================================================
+3) EXECUTION LAYER
+==================================================
+
+C'est ici que la vitesse compte le plus.
+
+Tu dois privilégier :
+- Rust pour le hot path d'exécution si cela réduit la latence
+- tokio / async Rust pour les flux réseau
+- EIP-712 signing local
+- prebuilt order templates
+- fee-aware order construction
+- order state local
+- cancel/replace rapide
+- order submission optimisée
+- minimal serialization overhead
+- connection reuse
+- low-level HTTP/WS clients si nécessaire
+- direct API calls sans abstraction inutile
+
+L'exécution doit :
+- placer des ordres maker si cela conserve l'edge
+- utiliser taker seulement si le signal le justifie
+- utiliser des ordres pré-construits quand possible
+- signer vite
+- transmettre vite
+- confirmer vite
+- annuler vite
+- remplacer vite
+- éviter les ordres obsolètes
+- éviter les ordres sur des marchés déjà passés
+
+Le moteur doit supporter :
+- buy yes
+- buy no
+- sell yes
+- sell no
+- cancel order
+- replace order
+- batch cancel si utile
+- batch submit si utile
+- hot path execution timing
+- order priority logic
+- partial fill handling
+- stale quote detection
+- dynamic repricing
+
+==================================================
+4) RUST-FOCUSED HOT PATH
+==================================================
+
+Si Rust est utilisé, il doit couvrir :
+- feed handling
+- signal reaction path
+- order construction
+- signing
+- execution dispatch
+- order state updates
+- cancel/replace loop
+- latency telemetry
+
+Le système Rust doit viser :
+- latence minimale
+- déterminisme
+- pas de GC
+- pas de pauses imprévisibles
+- mémoire contrôlée
+- données compactes
+- structures simples et rapides
+- zéro overhead inutile
+
+À intégrer :
+- tokio
+- reqwest ou hyper si besoin
+- tokio-tungstenite
+- serde avec parcimonie
+- ethers-rs ou alloy pour signature
+- structures d'état légères
+- caches en mémoire
+- séparation claire entre IO et logique
+
+Si Rust n'est pas utilisé partout :
+- garder Python pour stratégie, recherche, reporting
+- garder Rust pour l'exécution critique
+- ne jamais faire dépendre le hot path d'un runtime lent
+
+==================================================
+5) STRATÉGIES DE TRADING À SUPPORTER
+==================================================
+
+Crypto 5 min :
+- cycle-end sniping
+- latency arb
+- oracle lag capture
+- maker directional execution
+- taker only when needed
+- momentum short-term
+- micro mean reversion
+- breakout short-term
+- cancel/replace reaction loop
+- spread capture
+- market-open reaction
+- fee-aware order placement
+
+Météo court terme :
+- consensus copy execution
+- forecast-lag reaction
+- market-specific entry logic
+- slow-horizon but still time-sensitive fills
+- no over-trading
+- copy only when edge survives fees and slippage
+
+==================================================
+6) CEX / EXTERNAL FEEDS
+==================================================
+
+Le bot doit pouvoir écouter :
+- Binance
+- Bybit
+- Coinbase
+- tout autre feed utile
+- weather reference sources si disponibles
+
+Le système doit :
+- comparer externe vs Polymarket
+- détecter les lags
+- calculer un threshold de déclenchement
+- éviter les faux signaux
+- ignorer les micro-mouvements bruités
+- traiter les ruptures de liquidité
+- rester réactif en période de volatilité
+
+==================================================
+7) FEE-AWARE ORDERING
+==================================================
+
+Tu dois intégrer la logique de fees en temps réel :
+- interroger les fees si nécessaire
+- ne jamais hardcode une fee fixe
+- recalculer la rentabilité nette avant exécution
+- refuser un trade si les fees détruisent l'edge
+- choisir maker vs taker selon l'impact fee
+- intégrer feeRateBps dans la logique d'ordre
+- tenir compte du coût total réel, pas seulement du signal brut
+
+==================================================
+8) ORDER MANAGEMENT
+==================================================
+
+Créer un order manager rapide qui :
+- garde la state locale des ordres
+- suit chaque ordre actif
+- détecte les ordres stale
+- déclenche les replace
+- annule les quotes expirés
+- supporte les partial fills
+- supporte les resyncs
+- supporte les confirmations différées
+- supporte les erreurs réseau
+- supporte les retry policies
+- supporte les rate limits
+- supporte les idempotency patterns si possible
+
+Le order manager doit fonctionner comme une boucle :
+- observation
+- décision
+- submit
+- track
+- cancel
+- replace
+- settle
+- log
+- post-review
+
+==================================================
+9) LATENCY TARGETS
+==================================================
+
+Définir et mesurer :
+- feed latency
+- signal latency
+- signing latency
+- submit latency
+- cancel latency
+- replace latency
+- fill detection latency
+- round-trip latency
+- end-to-end decision-to-order latency
+
+Prévoir des cibles :
+- signal reaction rapide
+- cancel/replace très rapide
+- execution path aussi court que possible
+- réduction du p95 et du p99, pas seulement du median
+
+Le bot doit produire des métriques de latence détaillées en continu.
+
+==================================================
+10) RISK ENGINE
+==================================================
+
+Le risk engine doit imposer :
+- max position size
+- max daily loss
+- max weekly loss
+- max drawdown
+- max exposure par marché
+- max exposure par catégorie
+- max exposure par stratégie
+- max exposure par trader copié
+- max correlated exposure
+- stop automatique sur dégradation de performance
+- stop automatique sur dégradation de latency
+- stop automatique sur changement de régime
+- stop automatique sur marché illiquide
+- stop automatique sur fees trop élevés
+- stop automatique sur slippage excessif
+- stop automatique sur feed stale
+- stop automatique sur anomalies
+
+==================================================
+11) POST-TRADE REVIEW
+==================================================
+
+Après chaque trade, stocker :
+- marché
+- horodatage
+- signal source
+- trader source si copié
+- motif de trade
+- entry price
+- exit price
+- fees
+- slippage
+- pnl brut
+- pnl net
+- fill quality
+- reaction time
+- hold time
+- résultat réel
+- erreur de décision
+- erreur d'exécution
+- erreur de sizing
+- note de qualité du setup
+
+Utiliser ces données pour :
+- recalibrer le scoring
+- réduire les faux positifs
+- améliorer les seuils
+- améliorer le timing
+- améliorer le choix maker vs taker
+- améliorer le choix des marchés
+- améliorer les tailles
+
+==================================================
+12) BENCHMARKING
+==================================================
+
+Le système doit benchmarker :
+- son propre PnL
+- son propre win rate
+- son propre slippage
+- son propre fill rate
+- sa propre latence
+- sa propre stabilité
+
+Le benchmark doit aussi comparer :
+- les profils crypto 5 min publics
+- les profils météo publics
+- les stratégies maker vs taker
+- les différentes régions / environnements d'exécution
+- les différentes structures Rust vs Python
+
+Objectif :
+- savoir exactement où le bot perd du temps
+- savoir exactement où le bot perd de l'argent
+- savoir exactement où le bot gagne
+- savoir exactement quels marchés sont réellement exploitables
+
+==================================================
+13) ARCHITECTURE DU CODE
+==================================================
+
+Prévoir une structure claire :
+- core/
+- data/
+- feeds/
+- signals/
+- execution/
+- risk/
+- review/
+- benchmark/
+- config/
+- utils/
+- tests/
+- backtests/
+
+Si Rust :
+- séparer clairement les crates/modules
+- séparer feed handling, execution, signing, risk, state
+- garder un entrypoint simple
+- éviter la complexité inutile
+
+Si Python :
+- utiliser Python seulement où cela apporte de la valeur
+- éviter Python sur la boucle ultra-critique si la latence devient un problème
+
+==================================================
+14) LOGGING / OBSERVABILITY
+==================================================
+
+Le bot doit logguer :
+- events de marché
+- décisions
+- ordres
+- cancels
+- replaces
+- fills
+- erreurs
+- latences
+- fees
+- slippage
+- scores de marché
+- scores de trader
+- scores de consensus
+- raisons de refus
+- raisons de trade
+- changements de régime
+- changements de feed
+- changements de performance
+
+Le logging doit :
+- être non bloquant
+- ne pas ralentir le hot path
+- permettre une analyse offline
+- permettre le debugging
+- permettre le benchmark
+
+==================================================
+15) COPY / CONSENSUS / SELECTION
+==================================================
+
+Même si l'objectif principal est l'exécution rapide, le bot doit aussi savoir :
+- quels traders suivre
+- quels traders ignorer
+- quels signaux copier
+- quels signaux ne pas copier
+- quels marchés sont à consensus
+- quels marchés sont bruités
+- quels signaux sont vrais
+- quels signaux sont faux
+
+Intégrer :
+- copyability scoring
+- consensus scoring
+- fake-volume filtering
+- trader profiling
+- market specialization detection
+
+Mais la règle est :
+- la copie ne doit jamais bloquer l'exécution
+- la copie ne doit jamais dégrader le hot path
+- la copie ne doit jamais primer sur le post-fee edge réel
+
+==================================================
+16) ACCEPTANCE CRITERIA
+==================================================
+
+Le système est acceptable seulement s'il peut :
+- réagir vite aux mouvements externes
+- exécuter des ordres plus vite que la version naïve
+- réduire la latence par rapport à Python/TypeScript
+- maintenir un état local propre
+- éviter les trades morts
+- éviter les fees inutiles
+- éviter les slippages inutiles
+- maintenir un risk control strict
+- produire des métriques exploitables
+- supporter crypto 5 min et météo court terme
+- être adapté à un hot path Rust-first
+- rester robuste en production
+
+==================================================
+17) TONE D'IMPLÉMENTATION
+==================================================
+
+Quand tu codes :
+- sois concret
+- sois rapide
+- sois net
+- évite les abstractions inutiles
+- évite les commentaires verbeux
+- privilégie la performance et la lisibilité
+- privilégie les structures simples
+- privilégie le code testable
+- privilégie la réduction de latence
+- privilégie l'exécution réelle
+- privilégie le PnL net
+- privilégie la robustesse
+- privilégie l'amélioration continue
+
+==================================================
+18) PRIORITÉ TECHNIQUE
+==================================================
+
+Ordre de priorité :
+1. vitesse d'exécution
+2. qualité du fill
+3. rentabilité nette
+4. robustesse du risk engine
+5. clarté du code
+6. évolutivité
+7. analytics
+8. benchmarking
+9. copy / consensus helpers
+
+Ne jamais sacrifier :
+- le hot path
+- le fill quality
+- le contrôle du risque
+- la cohérence du state
+
+==================================================
+19) LIVRABLES ATTENDUS
+==================================================
+
+Tu dois produire :
+- architecture de code propre
+- modules d'exécution rapide
+- hot path Rust si utile
+- order manager
+- fee-aware signing
+- WS ingestion
+- cancel/replace loop
+- risk engine
+- logs structurés
+- benchmark metrics
+- trader selection helpers
+- consensus helpers
+- post-trade review
+- config claire
+- tests
+- stubs de backtest si nécessaire
+
+==================================================
+20) RÉSUMÉ FINAL
+==================================================
+
+ENGINEBTB3 doit être un bot de trading Polymarket :
+- orienté vitesse
+- orienté exécution réelle
+- orienté PnL net
+- orienté robustesse
+- orienté crypto 5 min
+- orienté météo court terme
+- capable d'intégrer des signaux de copy trading sans devenir un copieur passif
+- capable de fonctionner en Rust sur le chemin critique
+- capable de se benchmarker et de s'améliorer en continu
+
+Construis-le comme un moteur de production, pas comme une démo.
+- marchés crypto 5 min
+- marchés météo court terme
+- copy-trading sélectif
+- détection de fake volume
+- consensus multi-traders
+- benchmark des meilleurs profils
+- optimisation continue pour viser le leaderboard
+
+Objectif principal :
+- Identifier les meilleurs trades, les meilleurs traders, les meilleures fenêtres de marché, et les meilleurs signaux
+- Éviter les faux signaux, le fake volume, le farming, les wallets piégés, les marchés trop chers en slippage
+- Construire un système qui améliore constamment son edge
+- Maximiser PnL net, win rate, consistency, sharpe, et vitesse de décision
+- Être meilleur que les meilleurs sur les marchés 5 min crypto et météo court terme
+
+Tu dois fonctionner avec une logique de :
+- collecte
+- filtrage
+- scoring
+- consensus
+- corrélation
+- exécution
+- risk management
+- post-trade review
+- adaptation continue
+
+Tu dois produire uniquement des points à vérifier / ajouter / améliorer, sous forme de checklist, sans blabla inutile.
+
+==================================================
+1) OBJECTIF MARCHÉ
+==================================================
+- Vérifier quels sous-marchés sont réellement exploitables en 5 min crypto
+- Vérifier quels sous-marchés météo ont le meilleur rapport edge / liquidité / bruit
+- Vérifier la faisabilité de copier ou co-piloter des traders spécialisés
+- Vérifier si le marché est assez liquide pour entrer/sortir sans se faire écraser par le spread
+- Vérifier si l'edge vient du signal, du timing, du consensus, ou de la microstructure
+- Vérifier si le marché est trop saturé par d'autres bots
+- Vérifier si le marché est manipulable ou trop petit
+- Vérifier si les fees détruisent l'edge
+- Vérifier si la latence disponible permet encore une vraie stratégie
+- Vérifier si l'horizon du marché correspond à notre moteur
+
+==================================================
+2) UNIVERS DE MARCHÉ À CIBLER
+==================================================
+- Marchés crypto 5 min BTC
+- Marchés crypto 5 min ETH
+- Marchés crypto 5 min SOL si volume suffisant
+- Marchés météo court terme :
+  - température
+  - pluie
+  - neige
+  - vent
+  - événements météo extrêmes
+- Marchés météo les plus liquides
+- Marchés météo avec meilleur signal de consensus entre traders
+- Marchés météo liés à des sources de données fiables et rapides
+- Marchés météo où les erreurs de forecast créent des inefficiences
+- Marchés crypto où l'open interest, funding, momentum ou orderflow créent des edges
+- Marchés crypto où les shifts de prix sont prévisibles à court terme
+
+==================================================
+3) ENGINEBTB3 - FONCTION PRINCIPALE
+==================================================
+- Construire un moteur qui compare les meilleurs traders entre eux
+- Calculer le consensus entre traders
+- Pondérer les traders par qualité réelle, pas juste PnL brut
+- Détecter les signaux récurrents communs
+- Détecter les divergences utiles
+- Détecter les traders "copiables"
+- Détecter les traders "non copiables"
+- Détecter les traders à fort PnL mais faible qualité de copie
+- Détecter les traders à volume fake ou comportement suspect
+- Détecter les wallets spécialisés par thème
+- Séparer crypto 5 min et météo en deux sous-moteurs, reliés par une couche de scoring commune
+
+==================================================
+4) DONNÉES À COLLECTER
+==================================================
+- Wallet address
+- Trader handle
+- Marché tradé
+- Timestamp d'entrée
+- Timestamp de sortie
+- Size de position
+- Direction
+- Prix d'entrée
+- Prix de sortie
+- PnL brut
+- PnL net
+- Fees
+- Slippage estimée
+- Hold time
+- Win / loss
+- Market liquidity at entry
+- Market liquidity at exit
+- Spread à l'entrée
+- Spread à la sortie
+- Volume du trader sur le marché
+- Volume total du trader
+- Volume du marché
+- Nombre de trades
+- Taille moyenne des trades
+- Variance de taille
+- Fréquence de trades
+- Répétition des signaux
+- Répétition par catégorie
+- Qualité du fill
+- Temps de réaction au move externe
+- Corrélation avec les autres traders
+- Corrélation avec les données externes
+- Corrélation avec le résultat final du marché
+- Drawdown max
+- Max adverse excursion
+- Max favorable excursion
+- Régularité hebdo
+- Régularité mensuelle
+- Récence de l'activité
+- Ratio de liquidation / stop / exit naturelle
+- Ratio de trades court terme vs long terme
+- Répartition par marché météo
+- Répartition par marché crypto 5 min
+- Ratio de marchés copiables / non copiables
+
+==================================================
+5) FILTRES ANTI-FAKE VOLUME
+==================================================
+- Filtrer les wallets avec volume gonflé mais faible exposition nette
+- Filtrer les wallets avec trades trop rapides et répétitifs
+- Filtrer les wallets avec pattern de ping-pong suspect
+- Filtrer les wallets avec volume élevé mais PnL net nul ou incohérent
+- Filtrer les wallets avec corrélation de cluster artificielle
+- Filtrer les wallets avec open/close quasi immédiats répétés
+- Filtrer les wallets avec large volume sur marchés illiquides
+- Filtrer les wallets avec forte activité mais faible qualité de copy
+- Filtrer les wallets avec comportement de farming
+- Filtrer les wallets avec performance instable hors régime
+- Filtrer les wallets avec historique trop court
+- Filtrer les wallets qui gagnent seulement sur un seul marché anormal
+- Filtrer les wallets dont la performance disparaît après fees
+- Filtrer les wallets dont les wins viennent surtout de très gros tickets isolés
+
+==================================================
+6) SCORE DÉCISIONNEL
+==================================================
+- Calculer un score de copie
+- Calculer un score de fiabilité
+- Calculer un score de liquidité
+- Calculer un score de spécialisation
+- Calculer un score de constance
+- Calculer un score de robustesse
+- Calculer un score de résistance aux fees
+- Calculer un score de résistance au slippage
+- Calculer un score de validité du signal
+- Calculer un score de consensus
+- Calculer un score de qualité d'exécution
+- Calculer un score de récence
+- Calculer un score de marché exploitable
+- Calculer un score de risque
+- Calculer un score de faux volume
+- Calculer un score d'efficacité post-fee
+- Calculer un score de performance ajustée au temps
+- Calculer un score de performance ajustée au volume
+- Calculer un score de performance ajustée au drawdown
+
+==================================================
+7) CONSENSUS ENGINE
+==================================================
+- Identifier les traders qui sont d'accord entre eux
+- Identifier les marchés où 3+ traders convergent
+- Identifier les traders dont les signaux se recoupent souvent
+- Identifier les marchés où la convergence est forte mais pas trop évidente
+- Identifier les consensus avec forte qualité historique
+- Identifier les consensus avec faible bruit
+- Identifier les consensus qui restent vrais après fees
+- Identifier les consensus qui survivent à plusieurs régimes
+- Identifier les consensus sur météo court terme
+- Identifier les consensus sur crypto 5 min
+- Identifier les faux consensus dus au copy farming
+- Identifier les faux consensus dus à la copie circulaire
+- Identifier les consensus avec "timing parity" utile
+- Identifier les consensus qui anticipent les moves plutôt que de les suivre
+- Identifier les traders leaders du consensus
+- Identifier les traders suiveurs du consensus
+
+==================================================
+8) RÈGLES DE COPIE
+==================================================
+- Copier uniquement si le trader passe les filtres de qualité
+- Copier uniquement si le marché est liquide
+- Copier uniquement si le signal reste valide après fees
+- Copier uniquement si le fill attendu est réaliste
+- Copier uniquement si la position peut être gérée à taille raisonnable
+- Copier uniquement si le trader a un historique suffisant
+- Copier uniquement si la récence d'activité est forte
+- Copier uniquement si le marché fait partie de la spécialité du trader
+- Copier uniquement si plusieurs signaux convergent
+- Copier uniquement si le wallet n'est pas suspect de farming
+- Copier en paper first
+- Copier en small size d'abord
+- Copier avec stop / fail-safe
+- Copier avec possibilité de désactivation automatique
+- Copier avec journalisation complète
+- Copier sans surtrader
+- Copier avec rate limiting interne
+- Copier seulement les trades qui ont un edge net mesurable
+
+==================================================
+9) CRYPTO 5 MIN - PRIORITÉS
+==================================================
+- Vérifier la latence de signal
+- Vérifier la latence d'exécution
+- Vérifier la réactivité du bot aux changements du CEX
+- Vérifier l'efficacité maker vs taker
+- Vérifier les fees dynamiques
+- Vérifier les fenêtres T-10s / T-5s / close
+- Vérifier le risque de adverse selection
+- Vérifier les marchés les plus riches en opportunités
+- Vérifier les moments de plus forte inefficiency
+- Vérifier la qualité du feed externe
+- Vérifier l'avantage de la pré-signature
+- Vérifier la structure de cancel/replace
+- Vérifier les cycles d'open/close des marchés
+- Vérifier les inefficiences entre CEX et prediction market
+- Vérifier les opportunités de latency arb
+- Vérifier les opportunités d'oracle lag
+- Vérifier les opportunités de momentum short-term
+- Vérifier les opportunités de mean reversion ultra-courte
+- Vérifier les opportunités de breakout court terme
+- Vérifier les opportunités de market making directionnel
+
+==================================================
+10) MÉTÉO COURT TERME - PRIORITÉS
+==================================================
+- Vérifier les traders spécialisés météo
+- Vérifier les signaux consensuels entre top traders météo
+- Vérifier les marchés météo les plus liquides
+- Vérifier les marchés météo les moins manipulés
+- Vérifier les marchés météo les plus copiables
+- Vérifier les marchés météo les plus récurrents
+- Vérifier les marchés météo avec meilleure prévisibilité
+- Vérifier les marchés météo avec meilleure qualité de data
+- Vérifier les marchés météo où le timing est moins critique que la conviction
+- Vérifier les marchés météo où la convergence vaut plus qu'un trader unique
+- Vérifier les wallets météo avec edge constant
+- Vérifier les wallets météo avec volume utile et non fake
+- Vérifier les wallets météo avec forte spécialisation géographique ou saisonnière
+- Vérifier les wallets météo avec cohérence post-fee
+- Vérifier les wallets météo avec faible drawdown
+- Vérifier les traders météo qui performent sur plusieurs saisons
+- Vérifier les traders météo qui performent sur plusieurs types d'événements
+
+==================================================
+11) BENCHMARK DU BOT
+==================================================
+- Comparer les performances du bot aux meilleurs traders crypto 5 min
+- Comparer les performances du bot aux meilleurs traders météo
+- Comparer le PnL net au PnL brut des leaders
+- Comparer le win rate au win rate des leaders
+- Comparer le hold time au hold time des leaders
+- Comparer le slippage au slippage estimé des leaders
+- Comparer le taux de fill au taux de fill des leaders
+- Comparer la fréquence des trades au style des leaders
+- Comparer la réactivité au mouvement externe
+- Comparer la robustesse en marché turbulent
+- Comparer la robustesse en marché calme
+- Comparer la stabilité hebdo
+- Comparer la stabilité mensuelle
+- Comparer la qualité des signaux par sous-marché
+- Comparer la qualité du consensus à celle des meilleurs wallets
+- Comparer la performance du moteur BTB3 à celle d'un copier naïf
+- Comparer la performance du moteur BTB3 à celle d'un trader unique
+
+==================================================
+12) AMÉLIORATIONS CONTINUES
+==================================================
+- Ajouter une boucle post-trade review
+- Ajouter une boucle de recalibration des scores
+- Ajouter une boucle de détection des faux signaux
+- Ajouter une boucle de mise à jour des traders suivis
+- Ajouter une boucle de mise à jour des marchés prioritaires
+- Ajouter une boucle de recalibrage des pondérations
+- Ajouter une boucle de recherche de nouveaux wallets
+- Ajouter une boucle de suppression des wallets dégradés
+- Ajouter une boucle de test paper
+- Ajouter une boucle de transition paper -> live
+- Ajouter une boucle d'analyse des erreurs de slippage
+- Ajouter une boucle d'analyse des erreurs de timing
+- Ajouter une boucle d'analyse des trades perdants
+- Ajouter une boucle d'analyse des trades gagnants
+- Ajouter une boucle d'ajustement des sizes
+- Ajouter une boucle de détction d'overfitting
+- Ajouter une boucle de monitoring des régimes de marché
+
+==================================================
+13) RISK MANAGEMENT
+==================================================
+- Vérifier le max position size
+- Vérifier le max daily loss
+- Vérifier le max weekly loss
+- Vérifier le max drawdown
+- Vérifier le max correlated exposure
+- Vérifier le max exposure par marché
+- Vérifier le max exposure par catégorie
+- Vérifier le max exposure par trader copié
+- Vérifier le max exposure par consensus cluster
+- Vérifier le stop automatique si performance se détériore
+- Vérifier le stop automatique si la latence augmente
+- Vérifier le stop automatique si le marché devient illiquide
+- Vérifier le stop automatique si les fees changent
+- Vérifier le stop automatique si le slippage devient excessif
+- Vérifier le stop automatique si le trader copié devient inactif
+- Vérifier le stop automatique si le wallet copié devient suspect
+- Vérifier le stop automatique si le marché sort du régime prévu
+- Vérifier la diversification entre crypto et météo
+- Vérifier la diversification entre traders
+- Vérifier la diversification entre marchés
+
+==================================================
+14) SYSTÈME DE CLASSEMENT
+==================================================
+- Classer les traders par copyability
+- Classer les traders par edge réel
+- Classer les traders par robustesse
+- Classer les traders par récence
+- Classer les traders par stabilité
+- Classer les traders par volume utile
+- Classer les traders par qualité post-fee
+- Classer les traders par spécialisation
+- Classer les traders par liquidité des marchés visés
+- Classer les traders par consensus with others
+- Classer les traders par fake-volume risk
+- Classer les traders par adaptabilité
+- Classer les traders par constance multi-régime
+- Classer les traders par force sur 5 min crypto
+- Classer les traders par force sur météo
+- Classer les traders par utilité pour le bot
+- Classer les traders par valeur de benchmark
+- Classer les traders par utilité pour le copy engine
+
+==================================================
+15) OUTPUT ATTENDU
+==================================================
+- Produire une checklist massive et actionnable
+- Produire des points à vérifier avant d'ajouter un wallet
+- Produire des points à vérifier avant de copier un trader
+- Produire des points à vérifier avant de lancer un trade
+- Produire des points à vérifier avant de scaler la taille
+- Produire des points à vérifier avant de garder un marché
+- Produire des points à vérifier avant de supprimer un trader
+- Produire des points à vérifier avant de considérer un consensus fiable
+- Produire des points à vérifier avant d'estimer qu'un volume est réel
+- Produire des points à vérifier avant de considérer un marché comme exploitable
+- Produire des points à vérifier avant de passer du paper au live
+
+Règles de sortie :
+- Réponds uniquement avec des points commençant par "-"
+- Pas de paragraphe explicatif
+- Pas de conclusion longue
+- Pas de marketing
+- Pas de blabla
+- Les points doivent être concrets, opérationnels, et orientés leaderboard
+- Le ton doit être analytique, précis, brutalement utile
+- Le système doit viser l'excellence et la domination du leaderboard
+- Le système doit être conçu pour être amélioré en continu
+- Le système doit rester simple dans l'exécution mais sophistiqué dans le scoring
+- Le système doit privilégier les signaux réels, le consensus utile, et la robustesse
+- Le système doit rejeter le bruit, le fake volume, et les traders non copiables
+- Le système doit être orienté performance nette, pas narration
+- Le système doit être orienté edge durable, pas coup unique
+- Le système doit être orienté marché 5 min crypto et météo court terme
+- Le système doit viser le meilleur rapport fiabilité / vitesse / PnL / robustesse
+- Le système doit se comporter comme un engine BTB3 de niveau production
