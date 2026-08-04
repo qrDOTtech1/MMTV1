@@ -1046,23 +1046,17 @@ class PolyLive:
         order.signature si Rust repond a temps avec une signature valide.
         Timeout court + tout echec => l'ordre garde la signature Python
         (deja valide) -- ce n'est jamais un blocage, juste une tentative.
-        Verifie ce soir : signature Rust et Python BYTE-IDENTIQUES pour le
-        meme ordre (struct EIP-712 V2 exacte, meme cle) -- voir
-        enginebtb3_rust/BENCHMARK_RESULTS.md."""
-        # GARDE-FOU CRITIQUE (Steven 04/08, trouve en testant AVANT tout depot) :
-        # notre compte reel resout signatureType=3 (POLY_1271, wallet
-        # intelligent) et PAS 0 (EOA) -- confirme en inspectant un vrai ordre
-        # construit par c.create_order(). POLY_1271 utilise un schema de
-        # signature ENVELOPPEE completement different (contents_hash +
-        # TypedDataSign wrapper + concatenation, voir
-        # ExchangeOrderBuilderV2._build_poly_1271_order_signature en Python)
-        # que ce module Rust NE SAIT PAS FAIRE (EIP-712 simple seulement).
-        # Si on laissait passer, CHAQUE ordre reel recevrait une signature
-        # invalide des le premier depot. Rust ne s'active QUE pour EOA (0) --
-        # sur ce compte, ca veut dire qu'il ne s'activera jamais tant que
-        # POLY_1271 n'est pas implemente cote Rust (pas fait ce soir, cf.
-        # BENCHMARK_RESULTS.md).
-        if int(order.signatureType) != 0:
+        Verifie : signature Rust et Python BYTE-IDENTIQUES pour le meme
+        ordre, EOA (struct V2 simple) ET POLY_1271 (wrapper TypedDataSign) --
+        voir enginebtb3_rust/BENCHMARK_RESULTS.md.
+        GARDE-FOU : ce compte reel resout signatureType=3 (POLY_1271, wallet
+        intelligent), pas 0 (EOA) -- confirme en inspectant un vrai ordre
+        construit par c.create_order(). Les deux schemas (0=EOA, 3=POLY_1271)
+        sont maintenant implementes cote Rust (poly1271.rs, traduction mot
+        pour mot de ExchangeOrderBuilderV2._build_poly_1271_order_signature).
+        Tout autre type (1=proxy, 2=gnosis-safe) n'est PAS couvert -> no-op,
+        fallback Python automatique, comme pour tout echec du service Rust."""
+        if int(order.signatureType) not in (0, 3):
             return order, None
         url = os.environ.get("RUST_SIGN_URL", "http://127.0.0.1:9931/sign")
         try:

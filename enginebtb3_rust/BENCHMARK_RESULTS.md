@@ -36,3 +36,37 @@ notre position actuelle), qui elle agit directement sur les 334-357ms de RTT.
 Ce composant Rust reste dans le repo comme preuve mesuree, reutilisable si
 une raison NON liee a la latence justifie Rust plus tard (acces a une lib
 specifique, preference, etc.).
+
+## Mise a jour 04/08 (soir) : sidecar de signature branche en reel
+
+Steven a explicitement demande le branchement reel ("JAI DIT RUST !").
+`enginebtb3_rust serve` expose maintenant `POST /sign` en localhost, appele
+par `live.py::_resign_via_rust()` juste avant `post_orders()`. La logique
+metier (montants, tick size, fees, neg_risk) reste 100% Python -- Rust ne
+fait QUE re-signer un ordre deja construit, avec fallback automatique sur
+la signature Python en cas d'echec/timeout (0.3s).
+
+**Decouverte critique en testant AVANT tout depot** : ce compte reel resout
+`signatureType=3` (POLY_1271, wallet intelligent), pas `0` (EOA). POLY_1271
+utilise un schema de signature ENVELOPPE completement different (contents_hash
++ wrapper TypedDataSign + concatenation signature/domaine/type), implemente
+dans `py_clob_client_v2::ExchangeOrderBuilderV2._build_poly_1271_order_signature`.
+La 1ere version du sidecar Rust ne geraient QUE le EOA -- un garde-fou
+(`signatureType not in (0,3) -> no-op`) empechait toute signature invalide de
+partir, mais rendait Rust inerte sur ce compte.
+
+**POLY_1271 est maintenant implemente en Rust** (`src/poly1271.rs`), traduction
+mot pour mot de la fonction Python de reference (memes type-strings, meme
+ordre d'encodage ABI, meme wrapper Solady TypedDataSign). Verifie de deux
+facons :
+1. Cle de test fixe, valeurs figees -> signature Rust byte-identique a la
+   sortie Python de `_build_poly_1271_order_signature`.
+2. **Test end-to-end avec la VRAIE cle et un VRAI ordre** construit par
+   `c.create_order()` sur un token actif reel (marche "xi-jinping-out-before-2027")
+   -> signature Rust **byte-identique** a la signature Python produite pour
+   le meme ordre (meme salt/timestamp/maker/signer, meme sortie 261 octets).
+
+Le sidecar est donc maintenant fonctionnel pour ce compte (signatureType 0
+ET 3). Gain de vitesse attendu : negligeable au vu de la conclusion ci-dessus
+(reseau domine a >99%) -- ce travail repond a la demande explicite de tester
+Rust en conditions reelles, pas a un besoin de performance mesure.

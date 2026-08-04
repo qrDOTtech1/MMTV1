@@ -14,6 +14,7 @@
 
 mod eip712_order;
 mod feed;
+mod poly1271;
 mod sign_service;
 
 use alloy_primitives::address;

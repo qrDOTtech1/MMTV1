@@ -15,6 +15,7 @@ use std::time::Instant;
 use tokio::net::TcpListener;
 
 use crate::eip712_order::Order;
+use crate::poly1271::{self, Poly1271Order};
 
 #[derive(Deserialize)]
 struct SignRequest {
@@ -59,6 +60,30 @@ fn parse_bytes32(s: &str) -> FixedBytes<32> {
 
 async fn handle_sign(signer: Arc<PrivateKeySigner>, req: SignRequest) -> SignResponse {
     let t0 = Instant::now();
+
+    // signatureType==3 (POLY_1271, smart wallet) = ce que CE compte utilise
+    // en reel -- schema de signature different (voir poly1271.rs), traduit
+    // mot pour mot depuis exchange_order_builder_v2.py. Toute autre valeur
+    // (0=EOA, 1/2=proxy/gnosis-safe non couverts) suit le chemin standard.
+    if req.signature_type == 3 {
+        let order = Poly1271Order {
+            salt: parse_u256(&req.salt),
+            maker: parse_addr(&req.maker),
+            signer: parse_addr(&req.signer),
+            token_id: parse_u256(&req.token_id),
+            maker_amount: parse_u256(&req.maker_amount),
+            taker_amount: parse_u256(&req.taker_amount),
+            side: req.side,
+            signature_type: req.signature_type,
+            timestamp: parse_u256(&req.timestamp),
+            metadata: parse_bytes32(&req.metadata),
+            builder: parse_bytes32(&req.builder),
+        };
+        let exchange = parse_addr(&req.exchange);
+        let signature = poly1271::sign(&signer, req.chain_id, exchange, &order).await;
+        let sign_us = t0.elapsed().as_micros();
+        return SignResponse { signature, sign_us };
+    }
 
     let order = Order {
         salt: parse_u256(&req.salt),
