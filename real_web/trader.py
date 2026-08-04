@@ -5751,25 +5751,43 @@ class MultiTrader:
                         del slot[old]
             return bool(ok)
 
-        # ── FAVORITE DETECTION (Steven 28/07) : determine la jambe favorite
-        # via Binance spot vs strike, AVANT tout achat. Utilisee pour :
-        #   - FIRST-LEG : acheter la favorite en 1er (pas la moins chere)
-        #   - FAVORITE-BUDGET : mettre 1.6x sur la favorite
-        #   - max_entry : la favorite peut etre achetee a n'importe quel prix
+        # ── FAVORITE DETECTION (Steven 28/07, refonte 05/08) : Binance N'ETAIT
+        # utilise QUE comme signal principal, Polymarket seulement en repli si
+        # Binance echouait -> Steven : "on regarde les prix poly autant que
+        # binance ... bien les 2 en meme temps". Desormais les DEUX signaux
+        # sont TOUJOURS calcules, et le favori n'est retenu QUE s'ils sont
+        # D'ACCORD (meme cote favori). S'ils se contredisent (Binance dit Up
+        # mais Polymarket cote Down plus cher, ou l'inverse), on ne privilegie
+        # AUCUN cote -> pas de FAVORITE_BUDGET_MULT applique ce cycle, plutot
+        # que de trancher a l'aveugle entre 2 signaux qui divergent. Utilise
+        # pour : FIRST-LEG (achat favori en 1er), FAVORITE-BUDGET (mise 2.5x),
+        # max_entry (favori achetable a tout prix).
         from core.btc_updown import _binance_price as _bp
-        fav_side = None
+        _fav_binance = None
         try:
             spot = self._ws.spot_price(p["pair"]) or _bp(p["pair"])
             if spot is not None and strike is not None:
-                fav_side = "Up" if spot > strike else "Down"
+                _fav_binance = "Up" if spot > strike else "Down"
         except Exception:
             pass
-        # FALLBACK (Steven 28/07) : si Binance API echoue, on utilise le prix
-        # comme proxy. La jambe la plus CHERE = favorite (le marche vote avec son $).
-        if fav_side is None:
-            _fav_prices = [(s, a) for s, (_, a, _) in zip(outcomes, [quotes.get(s, (None, None, None)) for s in outcomes]) if a is not None]
-            if len(_fav_prices) == 2:
-                fav_side = max(_fav_prices, key=lambda x: x[1])[0]
+        _fav_poly = None
+        _fav_prices = [(s, a) for s, (_, a, _) in zip(outcomes, [quotes.get(s, (None, None, None)) for s in outcomes]) if a is not None]
+        if len(_fav_prices) == 2:
+            _fav_poly = max(_fav_prices, key=lambda x: x[1])[0]
+        if _fav_binance is not None and _fav_poly is not None:
+            fav_side = _fav_binance if _fav_binance == _fav_poly else None
+            if fav_side is None:
+                self._tlog(
+                    f"fav_disagree_{sym}",
+                    f"⚖️ [FAVORI-DESACCORD] {sym} {slug} Binance={_fav_binance} "
+                    f"vs Polymarket={_fav_poly} -> pas de favori ce cycle, "
+                    f"budget neutre sur les 2 jambes",
+                    every=10.0,
+                )
+        else:
+            # un seul signal dispo (l'autre API/donnee indisponible) -> on le
+            # prend quand meme plutot que de rester totalement aveugle.
+            fav_side = _fav_binance if _fav_binance is not None else _fav_poly
         # ── mode INDEPENDANT (legacy) ──
         combined = None  # V3.1 : init pour eviter UnboundLocalError
         force_hedge = legs_held == 1 and secs_left <= BOTH_SIDE_FORCE_HEDGE_SECS_LEFT
