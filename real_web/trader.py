@@ -759,6 +759,7 @@ class MultiTrader:
         self.state.setdefault("killswitch", dict(KILLSWITCH_DEFAULTS))
         self.state.setdefault("killswitch_triggered", None)  # {"reason":..., "ts":...} si declenche
         self.state.setdefault("latency_history", [])  # mesures CHRONO structurees, voir /api/latency
+        self.state.setdefault("execution_quality_history", [])  # fill ratio / EV / freshness, voir /api/execution-quality
         # RESTAURATION DEPUIS DB (Steven 04/08) : uniquement si le fichier
         # local etait ABSENT (volume Railway perdu/non monte -- exactement ce
         # qui vient d'arriver cette nuit). Si le fichier existe deja, il est
@@ -937,6 +938,23 @@ class MultiTrader:
         if self._last_good_cash is not None:
             return self._last_good_cash, "cache (lecture live instable)"
         return None, "lecture solde echouee"
+
+    def _record_execution_quality(self, sym, slug, edge_pct, ev_net_fees_pct, feed_age_ms, filled: bool):
+        """Fill ratio / EV net de fees / fraicheur des donnees (Steven 04/08,
+        3 des '5 metriques prioritaires' -- les 2 autres existent deja :
+        decision-to-submit = avant_post_ms, p95/p99 par etape = /api/latency).
+        Purement de la capture, jamais dans le chemin de decision."""
+        self.state.setdefault("execution_quality_history", []).append({
+            "ts": time.time(),
+            "symbol": sym,
+            "slug": slug,
+            "edge_pct": edge_pct,
+            "ev_net_fees_pct": ev_net_fees_pct,
+            "feed_age_ms": feed_age_ms,
+            "filled": filled,
+        })
+        if len(self.state["execution_quality_history"]) > 1000:
+            del self.state["execution_quality_history"][: len(self.state["execution_quality_history"]) - 1000]
 
     def _check_global_killswitch(self, cash: float):
         """Coupe TOUS les symboles reels si un seuil global est franchi
@@ -4021,6 +4039,22 @@ class MultiTrader:
         mk = self.state["markets"][sym]
         slug = m.get("slug")
         (side1, tid1, px1), (side2, tid2, px2) = legs
+        # QUALITE DE DECISION (Steven 04/08, "5 metriques prioritaires") :
+        # capture SEULE de variables deja calculees + une lecture memoire
+        # deja en cache (book_depth ne fait aucun appel reseau) -> aucun
+        # changement de logique, aucune latence ajoutee. try/except partout,
+        # jamais fatal si une source manque.
+        _feed_age_ms = None
+        try:
+            _bd1 = self._ws.book_depth(tid1)
+            _bd2 = self._ws.book_depth(tid2)
+            _ages = [time.time() - bd[4] for bd in (_bd1, _bd2) if bd]
+            if _ages:
+                _feed_age_ms = round(max(_ages) * 1000)
+        except Exception:
+            pass
+        _edge_pct = round((1.0 - combined) * 100, 2)
+        _ev_net_fees_pct = round((1.0 - combined - COMB_ASK_FEE_ESTIMATE) * 100, 2)
         # CAP ANTI-SLIPPAGE DYNAMIQUE (Steven 23/07) : proportionnel a l'edge reel
         # (1-combined) plutot qu'un +0.02 fixe -> un arb a grosse marge tolere plus
         # de mouvement (aligne avec la volatilite REELLEMENT observee), un arb a
@@ -4464,6 +4498,7 @@ class MultiTrader:
                         f"(vente non confirmee a temps) -> trackees pour gestion/retry"
                     )
             self._log(f"↩️ [BOTHSIDE][REEL] {sym} {slug} pair KO (f1={f1} f2={f2})")
+            self._record_execution_quality(sym, slug, _edge_pct, _ev_net_fees_pct, _feed_age_ms, filled=False)
             self._reject(
                 sym,
                 slug,
@@ -4560,6 +4595,7 @@ class MultiTrader:
             f"✅ [BOTHSIDE][REEL] {sym} {slug} PAIRE parallele [{tier_label}] {round(M, 2)} parts/cote "
             f"(f1={f1} f2={f2}) comb={combined:.3f} -> arb +{M * (1 - combined):.2f}$"
         )
+        self._record_execution_quality(sym, slug, _edge_pct, _ev_net_fees_pct, _feed_age_ms, filled=True)
         return True
 
     def _open_hedge_pair(self, sym, mode, m, p, legs, combined):

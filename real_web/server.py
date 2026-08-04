@@ -173,6 +173,30 @@ def enginebtb3_status():
         return jsonify({"status": "error", "active": False, "error": str(e)[:200]})
 
 
+@app.route("/api/execution-quality")
+def execution_quality():
+    """Fill ratio / EV net de fees / fraicheur des donnees (Steven 04/08,
+    '5 metriques prioritaires'). Agrege l'historique capture par
+    _record_execution_quality() -- pure lecture, rien ici n'influence le
+    trading en cours."""
+    hist = trader.state.get("execution_quality_history", [])
+    total = len(hist)
+    filled = sum(1 for h in hist if h.get("filled"))
+    ev_vals = [h.get("ev_net_fees_pct") for h in hist if h.get("ev_net_fees_pct") is not None]
+    age_vals = [h.get("feed_age_ms") for h in hist if h.get("feed_age_ms") is not None]
+    return jsonify({
+        "history": hist[-300:],
+        "stats": {
+            "attempted": total,
+            "filled": filled,
+            "fill_ratio_pct": round(filled / total * 100, 1) if total else None,
+            "avg_ev_net_fees_pct": round(sum(ev_vals) / len(ev_vals), 2) if ev_vals else None,
+            "avg_feed_age_ms": round(sum(age_vals) / len(age_vals), 1) if age_vals else None,
+            "max_feed_age_ms": max(age_vals) if age_vals else None,
+        },
+    })
+
+
 @app.route("/api/latency")
 def latency():
     """Historique structure des mesures CHRONO + percentiles (Steven 04/08,
