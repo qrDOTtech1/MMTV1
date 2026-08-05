@@ -3430,6 +3430,16 @@ class MultiTrader:
         for key, pos in list(mk["open"].items()):
             if pos.get("strat") != "bothside" or pos.get("mode") != "real":
                 continue
+            # RISK-FREE : NE JAMAIS COUPER UNE SEULE JAMBE (Steven 05/08, meme
+            # classe de bug que celle deja trouvee le 29/07 et corrigee dans
+            # _manage_pnl_tier_exits via is_risk_free -- cette fonction-ci
+            # avait le meme trou, jamais colmate. Couper la jambe "perdante"
+            # d'une paire VRAIMENT couplee (combined<1, profit garanti quel
+            # que soit le resultat) transforme un gain garanti en resultat
+            # incertain -- l'inverse de l'effet protecteur recherche ici pour
+            # un hedge normal.
+            if pos.get("is_risk_free"):
+                continue
             secs_left = pos["end_ts"] - now
             _arb_sl_secs = bothside_params.get("arb_sl_secs_left", ARB_SL_SECS_LEFT)
             _arb_sl_bid = bothside_params.get(
