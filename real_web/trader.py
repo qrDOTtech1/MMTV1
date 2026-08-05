@@ -4474,6 +4474,13 @@ class MultiTrader:
                         )
                 post_futs = None
             else:
+                # CHRONO (Steven 05/08, "l'onglet latence ne se rempli pas...
+                # malgre les nombreux trades") : trouve que latency_history
+                # n'etait alimente QUE par la branche no_slippage (GTC prix
+                # fige), jamais par CETTE branche (ordre MARKET), qui est
+                # pourtant celle qui execute reellement les trades ce soir --
+                # onglet vide malgre l'activite, pas un manque d'activite.
+                _t["avant_post"] = time.time()
                 post_futs = {
                     side1: self._pool.submit(
                         self._live.post_market_order,
@@ -4491,6 +4498,25 @@ class MultiTrader:
             if post_futs is not None:
                 h1 = post_futs[side1].result()
                 h2 = post_futs[side2].result()
+                if "avant_post" in _t:
+                    _t["apres_post"] = time.time()
+                    _avant_post_ms = round((_t["avant_post"] - _t["t0"]) * 1000)
+                    _post_ms = round((_t["apres_post"] - _t["avant_post"]) * 1000)
+                    _total_ms = round((_t["apres_post"] - _t["t0"]) * 1000)
+                    self.state.setdefault("latency_history", []).append({
+                        "ts": _t["t0"],
+                        "symbol": sym,
+                        "avant_post_ms": _avant_post_ms,
+                        "post_ms": _post_ms,
+                        "baseline_ms": None,
+                        "signature_ms": None,
+                        "rust_resign_ms": None,
+                        "rust_used": False,
+                        "post_orders_ms": _post_ms,
+                        "total_ms": _total_ms,
+                    })
+                    if len(self.state["latency_history"]) > 1000:
+                        del self.state["latency_history"][: len(self.state["latency_history"]) - 1000]
         # ECHECS DE POST EXPLICITES (Steven 22/07) : plus d'echec muet (deja
         # loggue au-dessus pour la voie no_slippage/batch -> pas de doublon)
         if not no_slippage:
