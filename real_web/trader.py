@@ -77,6 +77,15 @@ SETTLE_DELAY = 45  # attendre la settlement Polymarket apres fin de fenetre
 # Repasser a False quand valide -> restaure le sizing Kelly/arb normal.
 REAL_VALIDATION_MODE = True
 REAL_VALIDATION_SHARES = 5.0  # = MIN_ORDER_SIZE_SHARES (plancher Polymarket)
+# ── PLANCHER DE VENTE (Steven 05/08, "je peux vendre 25/50/75/100% quand je
+# veux") : MIN_ORDER_SIZE_SHARES (5) est un plancher d'ACHAT, pas de vente --
+# verifie on-chain sur ce wallet, 8 ventes sous 5 parts sont passees, la plus
+# petite a 1.37 part. Avant ce constat, tout palier de TP calcule sous 5 parts
+# etait converti en "vend TOUT", ce qui supprimait purement et simplement la
+# sortie en paliers sur les positions normales (une position de 6 parts vendait
+# 100% des le premier palier au lieu de 25%). On garde juste un plancher
+# anti-poussiere, cale sur la plus petite vente reellement observee.
+MIN_SELL_SHARES = 1.0
 # ── CAP $ STRICT (Steven 23/07, "je veux QUE des trades a max 1$") : pour les
 # ordres MARKET (arb crypto + ULTRAPOLY, pas de plancher de parts contrairement
 # au GTC limite), la notional par jambe est plafonnee a ce montant, quel que
@@ -2957,8 +2966,10 @@ class MultiTrader:
         """Revend `shares` parts au meilleur bid et VERIFIE ON-CHAIN que la vente
         est reellement passee (Steven 22/07 : plus jamais de vente supposee).
         Retourne le nombre de parts effectivement vendues. Log explicite.
-        NB : le CLOB refuse les ordres < 5 parts -> l'appelant doit gerer ce cas
-        (hold force + log), on ne poste pas un ordre voue au rejet.
+        NB (corrige Steven 05/08) : contrairement a ce qui etait suppose ici,
+        le CLOB ACCEPTE les ventes sous 5 parts -- verifie on-chain, 8 ventes
+        sous le plancher passees dont une de 1.37 part. Le minimum de 5 parts
+        ne s'applique qu'a l'ACHAT. Aucun appelant n'a donc a "gerer" ce cas.
         `entry_price`/`symbol`/`slug`/`side` (Steven 30/07, "solde a 13.04 mais
         pnl dit +4.85 ?!") : quand fournis, ENREGISTRE le trade (mode=real,
         pnl reel achat->vente) dans mk['trades'] -> sans ca, decouvert que
@@ -2968,37 +2979,16 @@ class MultiTrader:
         mentait par omission, ecart de plusieurs dollars invisible."""
         if shares < 0.01:
             return 0.0
-        if shares < MIN_ORDER_SIZE_SHARES:
-            # TOP-UP (Steven 30/07, "pas de demi-mesure") : avant, un reste
-            # sous le plancher CLOB (5 parts) restait INVENDABLE -> tenu de
-            # force jusqu'a resolution, nue et exposee (observe : -97% de
-            # marque avant un retournement in extremis qui a sauve la mise,
-            # mais ca viole "jamais de jambe nue" des que la chance tourne
-            # mal). Fix : on ACHETE agressivement le complement pour ATTEINDRE
-            # le plancher vendable, puis on revend le tout d'un coup -> cout
-            # marginal (quelques cents de plus), mais sortie garantie au lieu
-            # de tenir un pari directionnel nu par accident de sizing.
-            shortfall = round(MIN_ORDER_SIZE_SHARES - shares + 0.05, 2)
-            book0 = self._live.get_book_sync(token_id)
-            ask0 = book0["asks"][0][0] if book0 and book0.get("asks") else None
-            if ask0 is not None:
-                topup_usd = round(shortfall * ask0 * 1.05, 2)  # +5% buffer prix
-                res = self._live.snipe_buy_market(token_id, round(ask0 + 0.05, 2), topup_usd)
-                filled = res.get("filled_shares", 0.0)
-                self._log(
-                    f"➕ [TOP-UP]{tag} {round(shares, 2)} parts sous le plancher "
-                    f"CLOB -> achat complement {shortfall} parts tente, "
-                    f"{filled} parts obtenues (@ ~{ask0:.3f})"
-                )
-                if filled > 0:
-                    shares = round(shares + filled, 2)
-            if shares < MIN_ORDER_SIZE_SHARES:
-                self._log(
-                    f"🚫 [VENTE]{tag} {round(shares, 2)} parts toujours < minimum "
-                    f"CLOB (5) apres tentative de complement -> INVENDABLE, "
-                    f"position a tenir jusqu'a resolution"
-                )
-                return 0.0
+        # TOP-UP DESACTIVE (Steven 05/08) : ce bloc partait du principe que le
+        # CLOB refuse les ventes < 5 parts, et ACHETAIT donc le complement
+        # d'une position DEJA perdante juste pour pouvoir la solder. C'est
+        # faux : verifie sur data-api.polymarket.com/activity, 8 ventes sous
+        # 5 parts sont passees sur ce wallet, la plus petite a 1.37 part
+        # (sol-updown-5m-1785819600). Le plancher de 5 parts est une regle
+        # d'ACHAT, pas de vente. Le top-up ne servait donc a rien et coutait
+        # de l'argent : observe on-chain sur btc-updown-5m-1785900300, achat
+        # de 8.30 parts a 0.20 (1.75$) immediatement revendues a 0.13 (1.01$)
+        # = -0.74$ jetes pour "pouvoir vendre" ce qui etait deja vendable.
         book = self._live.get_book_sync(token_id)
         bid = book["bids"][0][0] if book and book.get("bids") else None
         if bid is None:
@@ -3280,8 +3270,11 @@ class MultiTrader:
                     and (bid - pos["entry_price"]) >= _tp_min_profit
                 ):
                     sell_n = round(shares * _tp_fraction, 2)
-                    if shares - sell_n < MIN_ORDER_SIZE_SHARES:
-                        sell_n = shares  # evite un reliquat invendable (<5 parts)
+                    # Palier respecte (Steven 05/08) : on ne bascule sur "vend
+                    # tout" que si le palier lui-meme ou le reliquat tombe sous
+                    # le plancher anti-poussiere reel (1 part), pas sous 5.
+                    if sell_n < MIN_SELL_SHARES or shares - sell_n < MIN_SELL_SHARES:
+                        sell_n = shares
                     sold = self._sell_orphan(
                         pos["token_id"],
                         sell_n,
@@ -6096,8 +6089,9 @@ class MultiTrader:
                             _pos1 = mk["open"].get(_key1)
                             if _pos1:
                                 if mode == "real":
-                                    self._sell_orphan(
-                                        _pos1["token_id"], _pos1["filled_shares"],
+                                    _held = _pos1["filled_shares"]
+                                    _sold_uw = self._sell_orphan(
+                                        _pos1["token_id"], _held,
                                         f" {sym} {slug} {_pos1['side']} ARB-BYPASS-UNWIND",
                                         entry_price=_pos1["entry_price"], symbol=sym,
                                         slug=slug, side=_pos1["side"],
@@ -6107,7 +6101,44 @@ class MultiTrader:
                                     # apres l'avoir revendue -> position
                                     # "fantome" qui restait affichee comme
                                     # ouverte alors qu'elle etait deja soldee.
-                                    del mk["open"][_key1]
+                                    #
+                                    # FIX CRITIQUE (Steven 05/08, boucle de
+                                    # churn trouvee on-chain) : le del etait
+                                    # INCONDITIONNEL, meme quand la vente
+                                    # ECHOUAIT (sold=0 : carnet sans bid, ordre
+                                    # rejete...). Consequences en cascade :
+                                    #  1) la position restait detenue on-chain
+                                    #     mais disparaissait de l'etat du bot
+                                    #     -> plus aucun TP/SL/suivi dessus ;
+                                    #  2) _sell_orphan n'enregistre le trade que
+                                    #     si sold>0 -> slug|side absent de
+                                    #     mk["trades"] ET de mk["open"] -> la
+                                    #     garde anti-doublon de _open_leg ne
+                                    #     bloquait plus rien -> RE-ACHAT immediat
+                                    #     de la meme jambe, re-echec, re-vente...
+                                    # Observe on-chain sur btc-updown-5m-1785900300 :
+                                    # 5 achats / 4 ventes sur la MEME jambe Up en
+                                    # ~45s, prix qui s'effondre de 0.35 a 0.13,
+                                    # 8.56$ achetes contre 4.94$ revendus (-3.62$)
+                                    # + 5.74 parts fantomes invendues (= exactement
+                                    # 29.04-23.30, verifie via data-api).
+                                    # On ne supprime donc QUE ce qui est reellement
+                                    # solde ; le reste reste gere.
+                                    if _sold_uw >= _held - 0.01:
+                                        del mk["open"][_key1]
+                                    else:
+                                        _rest = round(_held - _sold_uw, 2)
+                                        _pos1["filled_shares"] = _rest
+                                        _pos1["strat"] = "orphan"
+                                        self._log(
+                                            f"⚠️ [UNWIND-PARTIEL] {sym} {slug} {_pos1['side']} "
+                                            f"{_sold_uw}/{_held} parts vendues -> {_rest} parts "
+                                            f"CONSERVEES en gestion (jamais supprimees a l'aveugle)"
+                                        )
+                                    # Cooldown du slug : empeche le re-achat
+                                    # immediat de la meme fenetre apres un
+                                    # unwind (moteur de la boucle de churn).
+                                    self._set_slug_cooldown(sym, slug, mk)
                                 else:
                                     _exit_px = self._live_price(_pos1["token_id"], m, _pos1["side"]) or _pos1["entry_price"]
                                     _pnl1 = round(_pos1["filled_shares"] * (_exit_px - _pos1["entry_price"]), 3)
@@ -6349,13 +6380,29 @@ class MultiTrader:
                         _pos1p = mk["open"].get(_key1p)
                         if _pos1p:
                             if mode == "real":
-                                self._sell_orphan(
-                                    _pos1p["token_id"], _pos1p["filled_shares"],
+                                # Meme fix critique qu'ARB-BYPASS-UNWIND
+                                # (Steven 05/08) : ne jamais supprimer une
+                                # position dont la vente a echoue -> sinon
+                                # jambe fantome on-chain + garde anti-doublon
+                                # contournee -> boucle de re-achat/re-vente.
+                                _heldp = _pos1p["filled_shares"]
+                                _sold_p = self._sell_orphan(
+                                    _pos1p["token_id"], _heldp,
                                     f" {sym} {slug} {_pos1p['side']} ARB-PARALLEL-UNWIND",
                                     entry_price=_pos1p["entry_price"], symbol=sym,
                                     slug=slug, side=_pos1p["side"],
                                 )
-                                del mk["open"][_key1p]
+                                if _sold_p >= _heldp - 0.01:
+                                    del mk["open"][_key1p]
+                                else:
+                                    _restp = round(_heldp - _sold_p, 2)
+                                    _pos1p["filled_shares"] = _restp
+                                    _pos1p["strat"] = "orphan"
+                                    self._log(
+                                        f"⚠️ [UNWIND-PARTIEL] {sym} {slug} {_pos1p['side']} "
+                                        f"{_sold_p}/{_heldp} parts vendues -> {_restp} parts CONSERVEES"
+                                    )
+                                self._set_slug_cooldown(sym, slug, mk)
                             else:
                                 _exp1 = self._live_price(_pos1p["token_id"], m, _pos1p["side"]) or _pos1p["entry_price"]
                                 _pn1 = round(_pos1p["filled_shares"] * (_exp1 - _pos1p["entry_price"]), 3)
@@ -7002,9 +7049,13 @@ class MultiTrader:
                 continue
             remaining = pos["filled_shares"]
             sell_shares = round(remaining * frac, 2)
-            if pos["mode"] == "real" and sell_shares < MIN_ORDER_SIZE_SHARES:
-                # trop petit pour un ordre LIMIT reel -> vend tout d'un coup
-                # plutot que de forcer un palier impossible a executer
+            # Plancher de vente reel = MIN_SELL_SHARES (1 part), pas 5 : voir
+            # le commentaire de MIN_SELL_SHARES. Avant, tout palier sous 5
+            # parts se transformait en vente totale -> plus aucun etagement.
+            if pos["mode"] == "real" and (
+                sell_shares < MIN_SELL_SHARES
+                or remaining - sell_shares < MIN_SELL_SHARES
+            ):
                 sell_shares = remaining
                 frac = 1.0
             if pos["mode"] == "real":
@@ -7363,8 +7414,12 @@ class MultiTrader:
                     # Vend 25% de la taille INITIALE (ou tout, si escalade)
                     sell_target = shares if _escalate else round(init_shares * PNL_TP_FRACTIONS[stage], 2)
                     sell_shares = min(sell_target, shares)
-                    if sell_shares < MIN_ORDER_SIZE_SHARES:
-                        sell_shares = shares  # vend tout si trop petit
+                    # Palier 25/50/75 respecte meme sur petites positions
+                    # (Steven 05/08) : bascule "vend tout" seulement sous le
+                    # plancher anti-poussiere reel, pas sous les 5 parts
+                    # d'achat -- c'est ce qui empechait tout etagement.
+                    if sell_shares < MIN_SELL_SHARES or shares - sell_shares < MIN_SELL_SHARES:
+                        sell_shares = shares
                     exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
                     if exit_price is None:
                         continue
@@ -7490,8 +7545,9 @@ class MultiTrader:
             }
             frac = frac_map[action]
             sell_shares = max(RL_EXIT_MIN_SHARES, min(shares, shares * frac))
-            if sell_shares < MIN_ORDER_SIZE_SHARES:
-                sell_shares = shares  # vend tout si trop petit
+            # Idem RL exit manager (Steven 05/08) : plancher de vente reel.
+            if sell_shares < MIN_SELL_SHARES or shares - sell_shares < MIN_SELL_SHARES:
+                sell_shares = shares
             exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
             if exit_price is None:
                 return
