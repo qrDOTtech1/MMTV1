@@ -865,8 +865,44 @@ COPY_TRADE_BUDGET_USD = 1.5        # mise FIXE, jamais proportionnelle au trade 
 COPY_TRADE_MAX_STALE_SECS = 15     # au-dela : le prix a trop bouge, on ignore
 COPY_TRADE_MAX_PRICE_DRIFT = 0.05  # notre ask ne doit pas depasser prix_source + 5c
 COPY_TRADE_MIN_SECS_LEFT = 20      # pas assez de temps pour qu'un SL serve a qqch
-COPY_TRADE_MAX_WALLETS = 5         # petit nombre, suivi manuel assume
+COPY_TRADE_MAX_WALLETS = 5         # petit nombre, meme en selection automatique
 COPY_TRADE_SEEN_CAP = 400          # purge simple de la dedup, pas de fuite memoire
+
+# ── SELECTION AUTOMATIQUE DES WALLETS A SUIVRE (Steven 05/08, "selection
+# doit etre automatique reflechis ; on a bien fait engine btb txt qui
+# expliquait sa et faut aussi identifier ceux a ne pas suivre").
+#
+# Le spec ENGINEBTB3 (section 14 "SYSTEME DE CLASSEMENT") demande de classer
+# les traders par edge reel, robustesse, recence, stabilite, volume utile,
+# specialisation, fake-volume risk. Ce qui suit en est une implementation
+# PRATIQUE et mesurable sur les seules donnees on-chain publiques
+# disponibles (pas de "consensus with others" ni "force sur meteo" -- ces
+# dimensions du spec demanderaient des donnees qu'on n'a pas).
+#
+# EXCLUSION (n'importe laquelle disqualifie, cf. _score_trader) :
+#   - echantillon trop petit (< 20$ engages) -> impossible a juger ;
+#   - pas assez recent (< 1 jour d'activite) -> pas de robustesse prouvee ;
+#   - ROI global <= 0 ;
+#   - edge CONCENTRE sur une seule bande de prix avec trop peu de trades
+#     dedans (>60% du capital dans une bande a n<5) -> pas un edge repetable,
+#     un coup de chance qui domine la moyenne ;
+#   - pattern "billet de loterie" : plus de 40% du capital sur des jambes
+#     sous 0.30 (la bande la plus perdante mesuree sur NOTRE propre
+#     historique, -28% de ROI) -> le trader source prend des risques qu'on
+#     ne veut pas copier, meme si son ROI global est positif par ailleurs.
+#
+# SCORE (traders eligibles seulement) : ROI pondere par la confiance dans
+# l'echantillon (plus de trades = plus de confiance, plafonne a 1.0 au-dela
+# de 60 evenements) + un bonus pour l'usage de l'arb (proxy de discipline :
+# un trader qui verrouille des paires plutot que parier a plus de chances
+# d'avoir un edge repetable qu'un directionnel chanceux).
+COPY_AUTOSELECT_ENABLED = True
+COPY_AUTOSELECT_INTERVAL_S = 1800   # 30min : le classement bouge lentement
+COPY_AUTOSELECT_MIN_COST_USD = 20
+COPY_AUTOSELECT_MIN_DAYS = 1.0
+COPY_AUTOSELECT_MAX_LOTTERY_SHARE = 0.40
+COPY_AUTOSELECT_MAX_CONCENTRATION = 0.60
+COPY_AUTOSELECT_MIN_BAND_N_FOR_CONCENTRATION = 5
 
 NEARCERT_ENABLED = True
 NEARCERT_MIN_PRICE = 0.95
@@ -2604,8 +2640,10 @@ class MultiTrader:
         return {
             "ok": True,
             "enabled": bool(ct.get("enabled")),
+            "autoselect_enabled": COPY_AUTOSELECT_ENABLED,
             "wallets": ct.get("wallets", {}),
             "recent": ct.get("recent", [])[-30:],
+            "watchlist": ct.get("watchlist"),
             "budget_usd": COPY_TRADE_BUDGET_USD,
             "max_wallets": COPY_TRADE_MAX_WALLETS,
         }
@@ -2637,6 +2675,237 @@ class MultiTrader:
             self._log(f"👥 [COPY] wallet retire : {wallet}")
         return {"ok": True, "wallets": ct["wallets"]}
 
+    # ── SELECTION AUTOMATIQUE (Steven 05/08) ────────────────────────────
+    @staticmethod
+    def _ct_band_of(px):
+        for lo, hi, name in (
+            (0.0, 0.30, "0.00-0.30"), (0.30, 0.50, "0.30-0.50"),
+            (0.50, 0.70, "0.50-0.70"), (0.70, 0.85, "0.70-0.85"),
+            (0.85, 0.90, "0.85-0.90"), (0.90, 0.95, "0.90-0.95"),
+            (0.95, 0.98, "0.95-0.98"), (0.98, 1.01, "0.98-1.00"),
+        ):
+            if lo <= px < hi:
+                return name
+        return None
+
+    def _ct_fetch_wallet_events(self, wallet, requests_mod, max_pages=3):
+        """Meme methode que _fetch_updown5m_events cote server.py (dupliquee
+        volontairement -- trader.py et server.py sont deux modules distincts,
+        et le thread d'auto-selection doit rester autonome, sans dependre du
+        process Flask)."""
+        headers = {"User-Agent": "Mozilla/5.0"}
+        events = []
+        seen = set()
+        for off in range(0, max_pages * 500, 500):
+            try:
+                r = requests_mod.get(
+                    "https://data-api.polymarket.com/activity",
+                    params={"user": wallet, "limit": 500, "offset": off},
+                    headers=headers, timeout=15,
+                )
+                batch = r.json()
+            except Exception:
+                break
+            if not isinstance(batch, list) or not batch:
+                break
+            new = 0
+            for a in batch:
+                if "updown-5m" not in (a.get("slug") or ""):
+                    continue
+                k = (a.get("transactionHash"), a.get("slug"), a.get("outcome"), a.get("timestamp"), a.get("size"), a.get("type"))
+                if k in seen:
+                    continue
+                seen.add(k)
+                events.append(a)
+                new += 1
+            if new == 0 and len(batch) < 500:
+                break
+        return events
+
+    def _ct_analyze(self, updown):
+        """Version compacte de _analyze_updown5m (server.py) : memes bandes de
+        prix, meme comptage sans biais de survie (tous les achats, pas
+        seulement ceux qui ont un redeem), plus le detail par bande necessaire
+        au score de concentration (_score_trader)."""
+        legs = {}
+        sides_by_slug = {}
+        redeem_by_slug = {}
+        for a in updown:
+            slug = a.get("slug")
+            if a.get("type") == "REDEEM":
+                redeem_by_slug[slug] = redeem_by_slug.get(slug, 0.0) + (a.get("usdcSize") or 0.0)
+                continue
+            if a.get("type") != "TRADE":
+                continue
+            k = (slug, a.get("outcome"))
+            e = legs.setdefault(k, {"buy_usd": 0.0, "buy_sh": 0.0, "sell_usd": 0.0})
+            if a.get("side") == "BUY":
+                e["buy_usd"] += a.get("usdcSize") or 0.0
+                e["buy_sh"] += a.get("size") or 0.0
+                sides_by_slug.setdefault(slug, set()).add(a.get("outcome"))
+            else:
+                e["sell_usd"] += a.get("usdcSize") or 0.0
+
+        bands = {}
+        n_paired = n_solo = 0
+        total_cost = total_return = 0.0
+        ts_all = [a["timestamp"] for a in updown if a.get("timestamp")]
+        for (slug, outcome), e in legs.items():
+            if e["buy_sh"] <= 0.05 or e["buy_usd"] <= 0:
+                continue
+            avg_px = e["buy_usd"] / e["buy_sh"]
+            if not (0.01 < avg_px < 0.99):
+                continue
+            redeem = redeem_by_slug.get(slug, 0.0)
+            won = redeem > 0 and abs(redeem - e["buy_sh"]) < max(0.6, 0.3 * e["buy_sh"])
+            ret = e["sell_usd"] + (e["buy_sh"] if won else 0.0)
+            total_cost += e["buy_usd"]
+            total_return += ret
+            if len(sides_by_slug.get(slug, set())) == 2:
+                n_paired += 1
+            else:
+                n_solo += 1
+            bname = self._ct_band_of(avg_px)
+            if bname is None:
+                continue
+            b = bands.setdefault(bname, {"n": 0, "cost": 0.0, "ret": 0.0})
+            b["n"] += 1
+            b["cost"] += e["buy_usd"]
+            b["ret"] += ret
+
+        total_legs = n_paired + n_solo
+        return {
+            "days_active": round((max(ts_all) - min(ts_all)) / 86400, 2) if ts_all else 0,
+            "total_cost_usd": round(total_cost, 2),
+            "overall_roi_pct": round(100 * (total_return - total_cost) / total_cost, 1) if total_cost else None,
+            "arb_usage_pct": round(100 * n_paired / total_legs, 1) if total_legs else None,
+            "n_total": total_legs,
+            "bands": bands,
+        }
+
+    def _score_trader(self, an):
+        """Retourne (eligible: bool, score: float, reasons: list[str]).
+        reasons contient TOUJOURS au moins une ligne -- soit ce qui disqualifie,
+        soit ce qui justifie le score -- pour que le dashboard puisse montrer
+        POURQUOI un wallet est suivi ou exclu (demande explicite de Steven :
+        "faut aussi identifier ceux a ne pas suivre")."""
+        reasons = []
+        if an["total_cost_usd"] < COPY_AUTOSELECT_MIN_COST_USD:
+            reasons.append(f"echantillon trop petit ({an['total_cost_usd']}$ < {COPY_AUTOSELECT_MIN_COST_USD}$)")
+        if an["days_active"] < COPY_AUTOSELECT_MIN_DAYS:
+            reasons.append(f"pas assez recent ({an['days_active']}j < {COPY_AUTOSELECT_MIN_DAYS}j d'activite)")
+        if an["overall_roi_pct"] is None or an["overall_roi_pct"] <= 0:
+            reasons.append(f"ROI global <= 0 ({an['overall_roi_pct']}%)")
+        if an["total_cost_usd"] > 0:
+            top_band = max(an["bands"].items(), key=lambda kv: kv[1]["cost"], default=(None, {"cost": 0, "n": 0}))
+            if top_band[0] and top_band[1]["cost"] / an["total_cost_usd"] > COPY_AUTOSELECT_MAX_CONCENTRATION and top_band[1]["n"] < COPY_AUTOSELECT_MIN_BAND_N_FOR_CONCENTRATION:
+                reasons.append(
+                    f"edge concentre sur une seule bande ({top_band[0]}, "
+                    f"{round(100 * top_band[1]['cost'] / an['total_cost_usd'])}% du capital, "
+                    f"seulement {top_band[1]['n']} trades dedans -- pas repetable)"
+                )
+            lottery_cost = sum(b["cost"] for name, b in an["bands"].items() if name == "0.00-0.30")
+            if lottery_cost / an["total_cost_usd"] > COPY_AUTOSELECT_MAX_LOTTERY_SHARE:
+                reasons.append(
+                    f"pattern billet de loterie ({round(100 * lottery_cost / an['total_cost_usd'])}% du capital "
+                    f"sous 0.30 -- la bande la plus perdante sur notre propre historique, -28% de ROI)"
+                )
+        if reasons:
+            return False, -999.0, reasons
+        confidence = min(1.0, an["n_total"] / 60.0)
+        arb_bonus = (an["arb_usage_pct"] or 0) / 100.0 * 5.0
+        score = round(an["overall_roi_pct"] * confidence + arb_bonus, 2)
+        reasons.append(
+            f"ROI {an['overall_roi_pct']:+.1f}% (confiance {confidence:.0%} sur {an['n_total']} jambes), "
+            f"arb {an['arb_usage_pct']}%, {an['days_active']}j actif -> score {score}"
+        )
+        return True, score, reasons
+
+    def _ct_scan_active_wallets(self, requests_mod):
+        """Scan LEGER (3 symboles x 2 fenetres, contre 5x3 cote
+        /api/copy-discover manuel) : l'auto-selection tourne toutes les 30min
+        en tache de fond, pas besoin du meme niveau de couverture qu'un scan
+        a la demande."""
+        headers = {"User-Agent": "Mozilla/5.0"}
+        base = int(time.time() // 300) * 300
+        freq = {}
+        for sym in ("btc", "eth", "sol"):
+            for off in (-300, -600):
+                slug = f"{sym}-updown-5m-{base + off}"
+                try:
+                    m = requests_mod.get(
+                        "https://gamma-api.polymarket.com/markets",
+                        params={"slug": slug}, headers=headers, timeout=12,
+                    ).json()
+                except Exception:
+                    continue
+                mk = m[0] if isinstance(m, list) and m else None
+                cid = mk.get("conditionId") if mk else None
+                if not cid:
+                    continue
+                try:
+                    trs = requests_mod.get(
+                        "https://data-api.polymarket.com/trades",
+                        params={"market": cid, "limit": 150}, headers=headers, timeout=12,
+                    ).json()
+                except Exception:
+                    continue
+                if not isinstance(trs, list):
+                    continue
+                for t in trs:
+                    w = t.get("proxyWallet")
+                    if w:
+                        freq[w] = freq.get(w, 0) + 1
+        return sorted(freq.items(), key=lambda kv: -kv[1])[:15]
+
+    def _copy_autoselect(self):
+        """Coeur de la selection automatique : scanne, analyse, score, puis
+        suit/retire des wallets SANS intervention manuelle -- Steven controle
+        toujours le toggle general (self.state["copy_trade"]["enabled"]),
+        mais plus le choix de CHAQUE wallet individuel."""
+        import requests
+
+        ct = self._copy_trade_state()
+        candidates = self._ct_scan_active_wallets(requests)
+        evaluated = []
+        for wallet, freq in candidates:
+            events = self._ct_fetch_wallet_events(wallet, requests, max_pages=2)
+            if not events:
+                continue
+            an = self._ct_analyze(events)
+            eligible, score, reasons = self._score_trader(an)
+            evaluated.append({"wallet": wallet, "eligible": eligible, "score": score, "reasons": reasons, **an})
+
+        eligible_sorted = sorted([e for e in evaluated if e["eligible"]], key=lambda e: -e["score"])
+        excluded = [e for e in evaluated if not e["eligible"]]
+
+        # RE-EVALUE d'abord les wallets DEJA suivis : un edge peut se degrader
+        # (c'est tout le sens de "identifier ceux a ne pas suivre" applique en
+        # continu, pas juste a l'ajout).
+        for wallet in list(ct["wallets"].keys()):
+            match = next((e for e in evaluated if e["wallet"] == wallet), None)
+            if match and not match["eligible"]:
+                self._log(f"👥 [COPY-AUTO] retire {wallet[:10]} : {'; '.join(match['reasons'])}")
+                ct["wallets"].pop(wallet, None)
+
+        # AJOUTE les meilleurs eligibles non deja suivis, jusqu'au plafond.
+        for e in eligible_sorted:
+            if len(ct["wallets"]) >= COPY_TRADE_MAX_WALLETS:
+                break
+            if e["wallet"] in ct["wallets"]:
+                continue
+            ct["wallets"][e["wallet"]] = {
+                "label": f"auto (score {e['score']})", "added_ts": time.time(), "auto": True,
+            }
+            self._log(f"👥 [COPY-AUTO] suit {e['wallet'][:10]} : {'; '.join(e['reasons'])}")
+
+        ct["watchlist"] = {
+            "ts": time.time(),
+            "eligible": [{"wallet": e["wallet"], "score": e["score"], "reasons": e["reasons"]} for e in eligible_sorted],
+            "excluded": [{"wallet": e["wallet"], "reasons": e["reasons"]} for e in excluded],
+        }
+        self._save()
+
     def _copy_trade_loop(self):
         """Sonde l'activite on-chain des wallets suivis toutes les
         COPY_TRADE_POLL_S secondes et repond aux NOUVEAUX achats sur les
@@ -2651,8 +2920,21 @@ class MultiTrader:
             try:
                 if COPY_TRADE_ENABLED:
                     ct = self._copy_trade_state()
-                    if ct.get("enabled") and ct.get("wallets"):
-                        for wallet in list(ct["wallets"].keys()):
+                    if ct.get("enabled"):
+                        # SELECTION AUTOMATIQUE (Steven 05/08) : plus besoin de
+                        # cliquer "Suivre" wallet par wallet. Tourne toutes les
+                        # COPY_AUTOSELECT_INTERVAL_S, immediatement au premier
+                        # cycle apres activation (last_autoselect_ts absent).
+                        if COPY_AUTOSELECT_ENABLED:
+                            last = ct.get("last_autoselect_ts", 0)
+                            if time.time() - last >= COPY_AUTOSELECT_INTERVAL_S:
+                                ct["last_autoselect_ts"] = time.time()
+                                self._save()
+                                try:
+                                    self._copy_autoselect()
+                                except Exception as e:
+                                    self._log(f"💥 [COPY-AUTO] erreur de selection: {e}")
+                        for wallet in list(ct.get("wallets", {}).keys()):
                             try:
                                 self._copy_trade_poll_wallet(wallet, requests)
                             except Exception as e:
