@@ -678,6 +678,26 @@ INSTANT_ARB_MAX_COMBINED = 0.99  # au-dela : pas assez de marge garantie
 # vrai arb suivant. On complete donc UNIQUEMENT si ca verrouille vraiment ;
 # sinon la jambe part en must_close (cf. "zero jambe nue").
 PAIR_COMPLETION_MAX_COMBINED = 0.99
+# ── ZONE DE COUVERTURE TOLEREE (Steven 05/08, decision explicite) ──────
+# Cas reel qui a motive ce palier : 13:20:47 achat Up 4.976 @ 0.410, puis
+# 6 SECONDES plus tard achat Down 4.919 @ 0.620 -> combine 1.030. Le prix
+# de la 2e jambe avait derive entre les deux ordres, et son plafond etait
+# fixe (0.99 pour la jambe favorite) au lieu de dependre de ce qu'avait
+# reellement coute la jambe 1.
+# Politique retenue, en deux temps :
+#   combine < 0.99  -> VRAI verrou, profit garanti (cible)
+#   0.99 a 1.03     -> pas un arb, mais une couverture : perte bornee a
+#                      ~3%, et surtout le TP/SL reste ACTIF dessus (la
+#                      paire n'est pas taggee risk_free) -- verifie en
+#                      production : sur cette paire a 1.030, le palier a
+#                      vendu 25% (1.230 parts) a 0.780 ce qui avait ete
+#                      achete a 0.620, soit +26% sur la tranche.
+#   > 1.03          -> refus, et la jambe 1 part en must_close.
+# Ce seuil coupe la queue catastrophique mesuree la veille (36 paires
+# perdantes au-dessus de 1.20) tout en gardant la bande que le TP/SL sait
+# reellement gerer (seulement 6 des 55 paires perdantes etaient en 1.00-1.05,
+# et elles l'ont ete SANS TP/SL fonctionnel, faussement taggees risk-free).
+PAIR_COMPLETION_HEDGE_MAX = 1.03
 # GROSSE MISE SUR RISK-FREE (Steven 29/07, "je veux grosse mise sur les arb
 # risk free") : contrairement au directionnel, l'arb garanti (2 jambes achetees
 # EN MEME TEMPS, profit fige quel que soit le resultat) n'expose PAS a un
@@ -6654,11 +6674,19 @@ class MultiTrader:
         # Le code affichait donc "edge=0.0%" et achetait quand meme. Les
         # plafonds poses plus tot ne couvraient que les chemins de COMPLETION
         # (FORCE-PAIR, ORPHAN-PAIR, HEDGE-NEAR), pas cette entree initiale.
-        if mode == "real" and _comb_sequential >= PAIR_COMPLETION_MAX_COMBINED:
+        # PALIER (Steven 05/08) : une paire NEUVE doit etre un vrai verrou
+        # (< 0.99). En revanche, si une jambe est DEJA tenue, la couvrir reste
+        # preferable a la laisser nue jusqu'a PAIR_COMPLETION_HEDGE_MAX (1.03) :
+        # perte bornee, et le TP/SL reste actif dessus. Au-dela, on refuse.
+        _seq_cap = (
+            PAIR_COMPLETION_HEDGE_MAX if filled_legs else PAIR_COMPLETION_MAX_COMBINED
+        )
+        if mode == "real" and _comb_sequential >= _seq_cap:
             self._tlog(
                 f"seqcomb_{sym}",
                 f"⛔ [BOTHSIDE-SEQ] {sym} {slug} comb={_comb_sequential:.3f} >= "
-                f"{PAIR_COMPLETION_MAX_COMBINED} -> perte garantie, aucune jambe ouverte",
+                f"{_seq_cap} ({'couverture' if filled_legs else 'entree neuve'}) "
+                f"-> perte garantie, aucune jambe ouverte",
             )
             # Si UNE seule jambe est deja tenue, elle ne pourra plus etre
             # couverte a profit sur cette fenetre -> on la ferme (zero jambe
@@ -6694,6 +6722,54 @@ class MultiTrader:
             # reelles [0.01, 0.99] -> la jambe favorite echouait a 100%, TOUJOURS,
             # empechant tout le mecanisme FAVORITE_BUDGET_MULT de jamais s'executer).
             _max_entry = 0.99 if side == fav_side else max_entry
+            # ── PLAFOND DE LA 2e JAMBE ADOSSE AU PRIX REEL DE LA 1re ──────
+            # (Steven 05/08) Le plafond etait FIXE (0.99 sur la jambe favorite,
+            # max_entry sinon) et ne dependait PAS de ce qu'avait coute la
+            # jambe 1. Les deux ordres etant separes de plusieurs secondes, le
+            # prix derive entre-temps et la paire se referme au-dessus de 1.00
+            # sans que rien ne s'y oppose. Cas reel : Up @ 0.410 puis, 6s plus
+            # tard, Down @ 0.620 = 1.030, alors que le plafond de Down etait
+            # 0.99 -- il passait donc largement.
+            # Desormais le plafond de la 2e jambe = HEDGE_MAX - prix paye pour
+            # la 1re : la paire ne peut plus depasser 1.03 par construction,
+            # quelle que soit la derive. Et parts EGALES (le payout vaut 1$
+            # par part : c'est min(parts) qui compte, pas les montants).
+            _fp_shares = None
+            if filled_legs:
+                _l1 = mk["open"].get(f"{slug}|{filled_legs[0][0]}")
+                _l1_px = _l1.get("entry_price") if _l1 else None
+                _fp_shares = _l1.get("filled_shares") if _l1 else None
+                if _l1_px:
+                    _pair_cap = round(PAIR_COMPLETION_HEDGE_MAX - _l1_px, 3)
+                    if _pair_cap < BOTH_SIDE_LEG_MIN:
+                        # Jambe 1 trop chere : aucune 2e jambe ne peut ramener
+                        # la paire sous le plafond -> on ne double pas la mise,
+                        # on ferme la jambe nue.
+                        _l1["strat"] = "orphan"
+                        _l1["must_close"] = True
+                        self._log(
+                            f"⛔ [PAIRE-IMPOSSIBLE] {sym} {slug} jambe1 @ {_l1_px:.3f} "
+                            f"-> plafond jambe2 {_pair_cap:.3f} < {BOTH_SIDE_LEG_MIN} : "
+                            f"aucune couverture possible, jambe1 marquee A FERMER"
+                        )
+                        failed_legs.append((side, token_id))
+                        continue
+                    if _pair_cap < _max_entry:
+                        self._log(
+                            f"🔗 [PAIRE-CAP] {sym} {slug} {side} plafond {_max_entry:.3f} "
+                            f"-> {_pair_cap:.3f} (jambe1 @ {_l1_px:.3f}, "
+                            f"combine borne a {PAIR_COMPLETION_HEDGE_MAX})"
+                        )
+                        _max_entry = _pair_cap
+            # Parts EGALES sur la 2e jambe (Steven 05/08) : c'est min(parts)
+            # qui determine le payout du pire cas, donc des mises egales en $
+            # sur des prix differents ne verrouillent rien. Cas reel : 4.976
+            # parts Up contre 4.919 Down, pour 2.12$ et 3.13$.
+            _leg_kwargs = (
+                {"target_shares": round(_fp_shares, 2)}
+                if _fp_shares
+                else {"budget_usd": fav_budget if side == fav_side else leg_budget}
+            )
             ok, _ = self._open_leg(
                 sym,
                 mode,
@@ -6703,7 +6779,7 @@ class MultiTrader:
                 token_id,
                 _max_entry,
                 tag,
-                budget_usd=fav_budget if side == fav_side else leg_budget,
+                **_leg_kwargs,
             )
             if ok:
                 filled_legs.append((side, token_id))
