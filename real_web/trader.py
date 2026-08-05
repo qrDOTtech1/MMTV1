@@ -747,6 +747,27 @@ REINFORCE_BINANCE_MARGIN = 0.001  # ecart spot/strike mini (0.1%) = hors bruit
 # gerable au TP/SL. On ferme donc les orphelines bon marche au lieu de les
 # tenir en esperant un retournement, et on garde/gere les cheres.
 ORPHAN_KEEP_MIN_PRICE = 0.50
+
+# ── MARGE DE CONFIRMATION BINANCE (Steven 05/08, "faut pas l'inventer") ──
+# Question de Steven : a-t-on le VRAI target de Polymarket ? Verifie : NON.
+# Le champ officiel n'existe pas -- eventMetadata est null sur tous les
+# marches 5min, aucun priceToBeat, aucun champ de strike dans l'objet Gamma.
+# Le chemin "strike officiel Polymarket" de _strike_at est donc du code MORT
+# en pratique : on retombe toujours sur le fallback, l'ouverture de la bougie
+# 1 minute Binance. Polymarket, lui, resout sur le flux Chainlink.
+# Mesure de la fiabilite de ce proxy sur 74 resolutions CERTAINES (celles
+# remboursees on-chain, donc gagnant indiscutable) : 69 accords / 5 erreurs
+# = 93.2%. Et les 5 erreurs sont TOUTES dans des fenetres bougeant de moins
+# de 0.07% :
+#     -0.002%  -0.014%  -0.041%  +0.059%  -0.066%
+# Autrement dit : quand le marche bouge franchement, Binance et Chainlink
+# sont d'accord ; quand ca se joue a quelques dollars, notre proxy est un
+# tirage au sort. Il faut donc un ecart MINIMUM au strike avant de traiter
+# le signal comme une confirmation. 0.1% couvre les 5 erreurs mesurees avec
+# de la marge. Deux autres endroits du code appliquaient deja une marge
+# (0.1% et 0.08%) ; la decision de TENIR une jambe nue, elle, n'en avait
+# aucune -- un seul tick au-dessus du strike suffisait.
+BINANCE_CONFIRM_MARGIN = 0.001
 # GROSSE MISE SUR RISK-FREE (Steven 29/07, "je veux grosse mise sur les arb
 # risk free") : contrairement au directionnel, l'arb garanti (2 jambes achetees
 # EN MEME TEMPS, profit fige quel que soit le resultat) n'expose PAS a un
@@ -3612,7 +3633,27 @@ class MultiTrader:
                 price = _binance_price(pos["pair"])
                 strike = _strike_at(pos["pair"], pos["start_ts"], slug=pos.get("slug"))
                 if price is not None and strike is not None:
-                    winning = (pos["side"] == "Up") == (price > strike)
+                    # MARGE DE CONFIRMATION (Steven 05/08) : notre strike n'est
+                    # PAS le strike officiel Polymarket (il n'est pas publie --
+                    # cf. BINANCE_CONFIRM_MARGIN), c'est l'ouverture Binance 1m,
+                    # fiable a 93.2% mais fausse dans TOUTES les fenetres qui
+                    # bougent de moins de 0.07%. Sans marge, un seul tick
+                    # au-dessus du strike suffisait a declarer "gagnant" et a
+                    # TENIR la jambe nue jusqu'a la resolution -- pile dans la
+                    # zone ou le proxy est un tirage au sort. On exige
+                    # desormais un ecart net ; en dessous, winning reste None
+                    # (indetermine) et la position part en gestion/vente au
+                    # lieu d'etre tenue sur une conviction qu'on n'a pas.
+                    _gap_w = abs(price - strike)
+                    if _gap_w >= price * BINANCE_CONFIRM_MARGIN:
+                        winning = (pos["side"] == "Up") == (price > strike)
+                    else:
+                        self._tlog(
+                            f"orphnoconf_{key}",
+                            f"🌫️ [ORPHAN] {sym} {pos['slug']} {pos['side']} ecart au strike "
+                            f"{_gap_w:.4f} < {price * BINANCE_CONFIRM_MARGIN:.4f} "
+                            f"(0.1%) -> signal Binance NON confirmatoire, on ne tient pas",
+                        )
             if winning and secs_left > 15:
                 _tp_price = orphan_params.get("tp_price", ORPHAN_TP_PRICE)
                 _tp_min_profit = orphan_params.get(
