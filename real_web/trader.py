@@ -822,6 +822,46 @@ BINANCE_CONFIRM_MARGIN = 0.001
 # 0.925 il faudrait 92.5% et on n'en fait que 72% : d'ou le -16.6%.
 # La bande est donc VOLONTAIREMENT etroite. L'elargir vers le bas detruit
 # l'edge, l'elargir vers le haut fait payer 99c pour en gagner 1.
+# ── COPY-TRADING AUTOMATIQUE (Steven 05/08, "je te laisse faire la
+# discussion seul" -- decision deleguee, documentee ici pour que le
+# raisonnement reste inspectable meme sans avoir suivi la conversation).
+#
+# CE QUE CA FAIT : suit un petit nombre de wallets choisis via
+# /api/copy-discover (ou ajoutes a la main), detecte leurs NOUVEAUX achats
+# sur les marches Up/Down 5min par polling de leur activite on-chain
+# publique, et repond avec une PETITE mise fixe -- jamais un montant
+# proportionnel au leur (ils peuvent avoir 100x notre capital).
+#
+# POURQUOI DESACTIVE PAR DEFAUT (comme FAV_ENABLED/REINFORCE_ENABLED avant
+# lui) : contrairement au near-certain, l'edge d'un trader source est
+# mesure -- mais le mecanisme de COPIE lui-meme ne l'est pas. Entre le
+# moment ou le trader source achete et le moment ou on le detecte (poll +
+# latence reseau) le prix a deja bouge ; copier un favori a 0.96 quand le
+# marche est passe a 0.99 pendant la latence, ce n'est plus le meme trade.
+# C'est pour ca que COPY_TRADE_MAX_STALE_SECS et COPY_TRADE_MAX_PRICE_DRIFT
+# existent : on prefere rater une copie que copier un prix perime.
+#
+# GARDE-FOUS (tous cumulatifs, comme le reste des mecanismes de ce soir) :
+#  - liste de wallets EXPLICITEMENT suivie par Steven (jamais auto-ajoutee) ;
+#  - mise fixe petite, jamais proportionnelle au trade source ;
+#  - jamais si l'evenement source a plus de COPY_TRADE_MAX_STALE_SECS ;
+#  - jamais si notre prix d'entree deriverait de plus de
+#    COPY_TRADE_MAX_PRICE_DRIFT par rapport au prix source ;
+#  - une seule copie par (wallet, slug) -- pas de sur-copie si le trader
+#    source fait plusieurs achats sur la meme fenetre ;
+#  - strat="copy", jamais is_risk_free -> TOUJOURS gere par le meme TP/SL
+#    que toutes les autres positions (ajoute au filtre de
+#    _manage_pnl_tier_exits, meme piege deja rencontre avec "fav"/"nearcert") ;
+#  - plafonds habituels : exposition/marche, plancher de cash, MIN_BUDGET_USD.
+COPY_TRADE_ENABLED = False
+COPY_TRADE_POLL_S = 5              # frequence de sondage de l'activite source
+COPY_TRADE_BUDGET_USD = 1.5        # mise FIXE, jamais proportionnelle au trade source
+COPY_TRADE_MAX_STALE_SECS = 15     # au-dela : le prix a trop bouge, on ignore
+COPY_TRADE_MAX_PRICE_DRIFT = 0.05  # notre ask ne doit pas depasser prix_source + 5c
+COPY_TRADE_MIN_SECS_LEFT = 20      # pas assez de temps pour qu'un SL serve a qqch
+COPY_TRADE_MAX_WALLETS = 5         # petit nombre, suivi manuel assume
+COPY_TRADE_SEEN_CAP = 400          # purge simple de la dedup, pas de fuite memoire
+
 NEARCERT_ENABLED = True
 NEARCERT_MIN_PRICE = 0.95
 NEARCERT_MAX_PRICE = 0.98
@@ -2373,6 +2413,12 @@ class MultiTrader:
         self._thread.start()
         self._fast_exit_thread = threading.Thread(target=self._fast_exit_loop, daemon=True)
         self._fast_exit_thread.start()
+        # COPY-TRADING (Steven 05/08) : thread dedie, tourne meme si
+        # COPY_TRADE_ENABLED est False -> le drapeau est verifie a chaque
+        # iteration, pas au demarrage, pour pouvoir l'activer/desactiver
+        # depuis le dashboard sans redemarrer le bot.
+        self._copy_trade_thread = threading.Thread(target=self._copy_trade_loop, daemon=True)
+        self._copy_trade_thread.start()
         # COPILOTE IA (Steven 29/07) : autonome, pilote les leviers d'admin du
         # bot (mode/budget/plancher/MM/DN) via Groq -> desactive silencieux si
         # pas de GROQ_API_KEY dans .env.
@@ -2537,6 +2583,222 @@ class MultiTrader:
             except Exception as e:
                 self._log(f"💥 [FAST-EXIT] erreur boucle: {e}")
             time.sleep(FAST_EXIT_POLL_S)
+
+    # ── COPY-TRADING AUTOMATIQUE (Steven 05/08) ─────────────────────────
+    # Cf. le commentaire des constantes COPY_TRADE_* pour le raisonnement
+    # complet (pourquoi desactive par defaut, quels garde-fous).
+
+    def _copy_trade_state(self):
+        return self.state.setdefault(
+            "copy_trade", {"enabled": False, "wallets": {}, "recent": [], "seen": []}
+        )
+
+    def get_copy_trade_status(self):
+        ct = self._copy_trade_state()
+        return {
+            "ok": True,
+            "enabled": bool(ct.get("enabled")),
+            "wallets": ct.get("wallets", {}),
+            "recent": ct.get("recent", [])[-30:],
+            "budget_usd": COPY_TRADE_BUDGET_USD,
+            "max_wallets": COPY_TRADE_MAX_WALLETS,
+        }
+
+    def set_copy_trade_enabled(self, enabled):
+        ct = self._copy_trade_state()
+        ct["enabled"] = bool(enabled)
+        self._save()
+        self._log(f"{'🟢' if enabled else '⭕'} [COPY] auto-copy {'ACTIVE' if enabled else 'desactive'}")
+        return {"ok": True, "enabled": ct["enabled"]}
+
+    def follow_copy_wallet(self, wallet, label=""):
+        import re
+
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", wallet or ""):
+            return {"ok": False, "message": "adresse wallet invalide"}
+        ct = self._copy_trade_state()
+        if wallet not in ct["wallets"] and len(ct["wallets"]) >= COPY_TRADE_MAX_WALLETS:
+            return {"ok": False, "message": f"deja {COPY_TRADE_MAX_WALLETS} wallets suivis (max)"}
+        ct["wallets"][wallet] = {"label": label or wallet[:10], "added_ts": time.time()}
+        self._save()
+        self._log(f"👥 [COPY] wallet suivi : {wallet} ({label or 'sans label'})")
+        return {"ok": True, "wallets": ct["wallets"]}
+
+    def unfollow_copy_wallet(self, wallet):
+        ct = self._copy_trade_state()
+        if ct["wallets"].pop(wallet, None) is not None:
+            self._save()
+            self._log(f"👥 [COPY] wallet retire : {wallet}")
+        return {"ok": True, "wallets": ct["wallets"]}
+
+    def _copy_trade_loop(self):
+        """Sonde l'activite on-chain des wallets suivis toutes les
+        COPY_TRADE_POLL_S secondes et repond aux NOUVEAUX achats sur les
+        marches Up/Down 5min avec une petite mise fixe. Tourne toujours (le
+        thread demarre avec le bot) mais ne fait rien tant que
+        COPY_TRADE_ENABLED est False OU qu'aucun wallet n'est suivi -- verifie
+        a CHAQUE iteration pour reagir immediatement a un changement depuis le
+        dashboard, sans redemarrage."""
+        import requests
+
+        while self._running.is_set():
+            try:
+                if COPY_TRADE_ENABLED:
+                    ct = self._copy_trade_state()
+                    if ct.get("enabled") and ct.get("wallets"):
+                        for wallet in list(ct["wallets"].keys()):
+                            try:
+                                self._copy_trade_poll_wallet(wallet, requests)
+                            except Exception as e:
+                                self._tlog(
+                                    f"copytrade_err_{wallet}",
+                                    f"💥 [COPY] {wallet[:10]} erreur de sondage: {e}",
+                                )
+            except Exception as e:
+                self._log(f"💥 [COPY] erreur boucle: {e}")
+            time.sleep(COPY_TRADE_POLL_S)
+
+    def _copy_trade_poll_wallet(self, wallet, requests):
+        ct = self._copy_trade_state()
+        seen = set(ct.setdefault("seen", []))
+        try:
+            r = requests.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": wallet, "limit": 20},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=8,
+            )
+            events = r.json()
+        except Exception:
+            return
+        if not isinstance(events, list):
+            return
+        now = time.time()
+        for a in events:
+            if a.get("type") != "TRADE" or a.get("side") != "BUY":
+                continue
+            slug = a.get("slug") or ""
+            if "updown-5m" not in slug:
+                continue
+            key = f"{wallet}|{a.get('transactionHash')}|{slug}|{a.get('outcome')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            # dedup une seule fois par (wallet, slug) : pas de sur-copie si le
+            # trader source multiplie les achats sur la meme fenetre.
+            slug_key = f"{wallet}|{slug}"
+            if slug_key in seen:
+                continue
+            age = now - (a.get("timestamp") or 0)
+            if age > COPY_TRADE_MAX_STALE_SECS:
+                seen.add(slug_key)  # trop tard, mais on ne retentera pas non plus
+                continue
+            seen.add(slug_key)
+            self._copy_trade_execute(wallet, slug, a.get("outcome"), a.get("price"), age)
+        # purge simple, pas de fuite memoire sur une session longue
+        if len(seen) > COPY_TRADE_SEEN_CAP:
+            seen = set(list(seen)[-COPY_TRADE_SEEN_CAP // 2 :])
+        ct["seen"] = list(seen)
+        self._save()
+
+    def _copy_trade_execute(self, wallet, slug, side, source_price, age_secs):
+        from core.btc_updown import _fetch_one_market
+
+        sym = slug.split("-")[0].upper()
+        if sym not in SYMBOLS:
+            return
+        if self.state["modes"].get(sym) != "real":
+            self._tlog(
+                f"copyoff_{sym}", f"⏸️ [COPY] {sym} {slug} signal de {wallet[:10]} ignore (mode != real)"
+            )
+            return
+        mk = self.state["markets"][sym]
+        if f"{slug}|{side}" in mk["open"]:
+            return  # deja une position dessus, rien a copier
+        m = _fetch_one_market(slug)
+        if not m:
+            self._log(f"⚠️ [COPY] {sym} {slug} marche introuvable (peut-etre deja resolu)")
+            return
+        # end_ts se deduit du slug lui-meme (format sym-updown-5m-<start_ts>),
+        # plus fiable que de reparser les dates du marche.
+        try:
+            start_ts = int(slug.rsplit("-", 1)[-1])
+            end_ts = start_ts + 300
+        except Exception:
+            return
+        secs_left = end_ts - time.time()
+        if secs_left < COPY_TRADE_MIN_SECS_LEFT:
+            self._tlog(f"copylate_{sym}", f"⏸️ [COPY] {sym} {slug} trop tard ({secs_left:.0f}s restantes)")
+            return
+        try:
+            outcomes = json.loads(m.get("outcomes") or "[]")
+            token_ids = json.loads(m.get("clobTokenIds") or "[]")
+        except Exception:
+            return
+        if side not in outcomes or len(token_ids) != len(outcomes):
+            return
+        tid = token_ids[outcomes.index(side)]
+        book = self._live.get_book_sync(tid)
+        ask = book["asks"][0][0] if book and book.get("asks") else None
+        if ask is None:
+            return
+        # DERIVE DE PRIX (coeur du garde-fou copy-trading) : entre l'achat
+        # source et notre detection, le marche a pu bouger. On ne poursuit
+        # jamais un prix qui s'est deja envole.
+        if source_price and ask > source_price + COPY_TRADE_MAX_PRICE_DRIFT:
+            self._tlog(
+                f"copydrift_{sym}",
+                f"⛔ [COPY] {sym} {slug} {side} ask={ask:.3f} > source {source_price:.3f}+"
+                f"{COPY_TRADE_MAX_PRICE_DRIFT} -> prix perime, on n'y va pas",
+            )
+            return
+        cash, _ = self._read_cash(max_age=0)
+        if cash is None:
+            return
+        investable = max(0.0, cash - self.floor())
+        budget = round(min(COPY_TRADE_BUDGET_USD, investable), 2)
+        budget = max(budget, round(MIN_SELL_SHARES * ask, 2))
+        if budget > investable or budget < MIN_BUDGET_USD:
+            return
+        ok_exp, why_exp = self._exposure_ok(sym, mk, slug, budget)
+        if not ok_exp:
+            self._tlog(f"copyexp_{sym}", f"⛔ [COPY] {sym} {slug} refuse : {why_exp}")
+            return
+        self._log(
+            f"🎯 [COPY] {sym} {slug} {side} @ {ask:.3f} budget={budget:.2f}$ "
+            f"-- signal de {wallet[:10]} (source @ {source_price}, detecte {age_secs:.1f}s apres)"
+        )
+        with self._order_lock:
+            res = self._live.snipe_buy_market(tid, round(ask + 0.02, 2), budget)
+        filled = res.get("filled_shares", 0.0)
+        if filled <= 0:
+            self._log(f"⚠️ [COPY] {sym} {slug} {side} non rempli ({res.get('error', '')})")
+            return
+        avg = res.get("avg_cost") or ask
+        self._add_slug_spent(mk, slug, round(filled * avg, 2))
+        mk["open"][f"{slug}|{side}"] = {
+            "symbol": sym, "slug": slug, "side": side, "mode": "real",
+            # strat "copy" -> jamais is_risk_free, TOUJOURS gere par le meme
+            # TP/SL que le reste (ajoute au filtre de _manage_pnl_tier_exits).
+            "strat": "copy", "token_id": tid, "entry_price": avg,
+            "filled_shares": filled, "cost": round(filled * avg, 2),
+            "start_ts": start_ts, "pair": None, "end_ts": end_ts,
+            "opened_ts": time.time(), "buffer": 0.0,
+            "copy_source_wallet": wallet, "copy_source_price": source_price,
+        }
+        ct = self._copy_trade_state()
+        ct.setdefault("recent", []).append(
+            {
+                "ts": time.time(), "wallet": wallet, "symbol": sym, "slug": slug,
+                "side": side, "price": avg, "budget": round(filled * avg, 2),
+            }
+        )
+        ct["recent"] = ct["recent"][-50:]
+        self._save()
+        self._log(
+            f"✅ [COPY] {sym} {slug} {side} {filled} parts @ {avg:.3f} "
+            f"({round(filled * avg, 2)}$) -> ouverte, TP/SL actifs"
+        )
 
     def stop(self):
         self._running.clear()
@@ -8098,7 +8360,7 @@ class MultiTrader:
             # DOIT etre gere ici, c'est toute sa raison d'etre. Sans ca il
             # serait skippe et tiendrait jusqu'a resolution sans TP ni SL --
             # exactement le bug qu'on a corrige partout ailleurs aujourd'hui.
-            if pos.get("strat") not in ("bothside", "swing", "fav", "nearcert"):
+            if pos.get("strat") not in ("bothside", "swing", "fav", "nearcert", "copy"):
                 continue
             # RISK-FREE : NE JAMAIS GERER INDIVIDUELLEMENT (Steven 29/07, bug
             # trouve en prod : une paire d'arb garanti a comb=0.93 (edge 7%,

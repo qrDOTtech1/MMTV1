@@ -95,6 +95,29 @@ def risk_free():
     return jsonify(trader.set_risk_free(d.get("symbol"), d.get("enabled")))
 
 
+@app.route("/api/copy-trade/status")
+def copy_trade_status():
+    return jsonify(trader.get_copy_trade_status())
+
+
+@app.route("/api/copy-trade/enabled", methods=["POST"])
+def copy_trade_enabled():
+    d = request.get_json(force=True)
+    return jsonify(trader.set_copy_trade_enabled(d.get("enabled")))
+
+
+@app.route("/api/copy-trade/follow", methods=["POST"])
+def copy_trade_follow():
+    d = request.get_json(force=True)
+    return jsonify(trader.follow_copy_wallet(d.get("wallet"), d.get("label", "")))
+
+
+@app.route("/api/copy-trade/unfollow", methods=["POST"])
+def copy_trade_unfollow():
+    d = request.get_json(force=True)
+    return jsonify(trader.unfollow_copy_wallet(d.get("wallet")))
+
+
 @app.route("/api/ultrapoly", methods=["POST"])
 def ultrapoly():
     d = request.get_json(force=True)
