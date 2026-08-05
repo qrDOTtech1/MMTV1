@@ -4379,6 +4379,33 @@ class MultiTrader:
                         f"(caps recalcules {cap1:.3f}/{cap2:.3f})"
                     )
                     pf[side1]["ok"] = pf[side2]["ok"] = True
+                else:
+                    # LOG D'ECHEC EXPLICITE (Steven 05/08, "on sait pas si down
+                    # laissait encore place a arb") : avant, un echec de la
+                    # reevaluation ne laissait AUCUNE trace -- impossible de
+                    # savoir apres coup si le combine frais avait ete verifie
+                    # et rejete, ou jamais teste du tout. Affiche desormais le
+                    # combine frais reel calcule et la raison precise du rejet.
+                    _reason_ko = (
+                        f"combine {_comb_frais:.3f} > {REAL_MAX_COMBINED} (seuil reel)"
+                        if _comb_frais > REAL_MAX_COMBINED
+                        else f"edge {_edge_frais*100:.1f}% < {EDGE_REDUCE_THRESHOLD*100:.0f}% requis"
+                    )
+                    self._log(
+                        f"♻️❌ [PREFLIGHT-REEVAL] {sym} {slug} combine FRAIS "
+                        f"{side1}@{_a1:.3f}+{side2}@{_a2:.3f}={_comb_frais:.3f} verifie "
+                        f"MAIS toujours invalide : {_reason_ko} -> abandon confirme"
+                    )
+            elif _depth_ko:
+                self._log(
+                    f"♻️❌ [PREFLIGHT-REEVAL] {sym} {slug} profondeur insuffisante "
+                    f"sur au moins une jambe -> reevaluation impossible, abandon"
+                )
+            else:
+                self._log(
+                    f"♻️❌ [PREFLIGHT-REEVAL] {sym} {slug} prix frais indisponible "
+                    f"({side1}={_a1}, {side2}={_a2}) -> reevaluation impossible, abandon"
+                )
         if not (pf[side1]["ok"] and pf[side2]["ok"]):
             for sd in (side1, side2):
                 if not pf[sd]["ok"]:
