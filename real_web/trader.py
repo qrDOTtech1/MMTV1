@@ -5877,6 +5877,18 @@ class MultiTrader:
             # un seul signal dispo (l'autre API/donnee indisponible) -> on le
             # prend quand meme plutot que de rester totalement aveugle.
             fav_side = _fav_binance if _fav_binance is not None else _fav_poly
+        # FAV POUR ORDRE D'ENVOI ARB GARANTI (Steven 05/08, "retire favoris
+        # desaccord de risk free") : le fav_side ci-dessus (accord requis)
+        # reste utilise pour le SIZING (FAVORITE_BUDGET_MULT, hedge favori/
+        # underdog risque -- la ou se tromper de sens coute cher, l'accord
+        # des 2 signaux reste justifie). Mais pour l'ARB GARANTI (2 jambes
+        # combinees < seuil, profit deja verrouille quel que soit le sens),
+        # ce favori ne sert QUE a decider quel ordre poster en 1er -- si une
+        # seule jambe se remplit malgre tout, autant que ce soit la plus
+        # probable des DEUX signaux, meme en desaccord, plutot qu'aucune
+        # preference du tout. Priorite Binance (plus rapide/frais), repli
+        # Polymarket si Binance indispo -- jamais bloque par un desaccord.
+        fav_side_ordering = _fav_binance if _fav_binance is not None else _fav_poly
         # ── mode INDEPENDANT (legacy) ──
         combined = None  # V3.1 : init pour eviter UnboundLocalError
         force_hedge = legs_held == 1 and secs_left <= BOTH_SIDE_FORCE_HEDGE_SECS_LEFT
@@ -5908,8 +5920,8 @@ class MultiTrader:
             # soit le FAVORI (donne gagnant par le marche) plutot qu'un cote au
             # hasard. Un orphelin favori gagne plus souvent qu'il ne perd ; un
             # orphelin underdog est perdant par construction.
-            if fav_side and len(leg_data_immediate) == 2:
-                leg_data_immediate.sort(key=lambda L: 0 if L[0] == fav_side else 1)
+            if fav_side_ordering and len(leg_data_immediate) == 2:
+                leg_data_immediate.sort(key=lambda L: 0 if L[0] == fav_side_ordering else 1)
             # GENUINE ARB SEULEMENT (Steven 29/07) : combined<0.98 est trivialement
             # vrai des qu'un marche est quasi-resolu (ex: Up=0.86/Down=0.015,
             # comb=0.875) -> ce n'est PAS un arb, la jambe a 1.5c est un billet
