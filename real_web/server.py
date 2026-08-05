@@ -550,6 +550,193 @@ def api_trades():
     )
 
 
+@app.route("/api/copy-analysis")
+def api_copy_analysis():
+    """ANALYSE COPY-TRADING (Steven 05/08, "inclu une fenetre dediee a
+    l'analyse copy dans dash").
+
+    Polymarket n'expose pas d'API de leaderboard publique (verifie : 404 sur
+    /leaderboard, /traders/leaderboard, /rankings). Steven trouve un wallet
+    interessant via l'UI Polymarket (leaderboard, profil d'un trader qu'il
+    observe) et le colle ici -- l'endpoint fait le meme travail de
+    reconstruction on-chain qu'on a fait ce soir sur SON propre wallet :
+    telecharge l'activite complete par pagination, ne garde que les marches
+    "updown-5m" (le terrain de jeu du bot), et sort EXACTEMENT les memes
+    metriques qui ont deja servi a diagnostiquer le bot cette nuit -- win
+    rate par tranche de prix (sans le biais de survie qui a fausse mes
+    premieres analyses : compte TOUS les achats, y compris ceux sans
+    redeem), taux d'usage de l'arb (paires vs jambes seules), et la bande
+    0.95-0.98 specifiquement (seule strategie directionnelle validee sur le
+    wallet de Steven) pour voir si ce trader la travaille aussi.
+
+    Lecture seule, aucune ecriture, aucun ordre. Le wallet est un parametre
+    utilisateur, jamais invente ni stocke."""
+    import re
+    import requests
+
+    wallet = (request.args.get("wallet") or "").strip()
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", wallet):
+        return jsonify({"ok": False, "error": "adresse wallet invalide (attendu 0x + 40 hex)"}), 400
+
+    try:
+        max_pages = max(1, min(20, int(request.args.get("max_pages", 10))))
+    except (TypeError, ValueError):
+        max_pages = 10
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    events = []
+    seen = set()
+    for off in range(0, max_pages * 500, 500):
+        try:
+            r = requests.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": wallet, "limit": 500, "offset": off},
+                headers=headers,
+                timeout=20,
+            )
+            batch = r.json()
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"appel Polymarket echoue: {e}"}), 502
+        if not isinstance(batch, list) or not batch:
+            break
+        new = 0
+        for a in batch:
+            k = (a.get("transactionHash"), a.get("slug"), a.get("outcome"), a.get("timestamp"), a.get("size"), a.get("type"))
+            if k in seen:
+                continue
+            seen.add(k)
+            events.append(a)
+            new += 1
+        if new == 0:
+            break
+
+    updown = [a for a in events if "updown-5m" in (a.get("slug") or "")]
+    if not updown:
+        return jsonify(
+            {
+                "ok": True,
+                "wallet": wallet,
+                "events_total": len(events),
+                "events_updown_5m": 0,
+                "message": "aucune activite sur les marches Up/Down 5min pour ce wallet",
+            }
+        )
+
+    ts_all = [a["timestamp"] for a in updown if a.get("timestamp")]
+    days_active = round((max(ts_all) - min(ts_all)) / 86400, 1) if ts_all else 0
+
+    # regroupe par jambe (slug, outcome) et par marche
+    legs = {}
+    sides_by_slug = {}
+    redeem_by_slug = {}
+    for a in updown:
+        slug = a.get("slug")
+        if a.get("type") == "REDEEM":
+            redeem_by_slug[slug] = redeem_by_slug.get(slug, 0.0) + (a.get("usdcSize") or 0.0)
+            continue
+        if a.get("type") != "TRADE":
+            continue
+        k = (slug, a.get("outcome"))
+        e = legs.setdefault(k, {"buy_usd": 0.0, "buy_sh": 0.0, "sell_usd": 0.0, "prices": []})
+        if a.get("side") == "BUY":
+            e["buy_usd"] += a.get("usdcSize") or 0.0
+            e["buy_sh"] += a.get("size") or 0.0
+            e["prices"].append(a.get("price"))
+            sides_by_slug.setdefault(slug, set()).add(a.get("outcome"))
+        else:
+            e["sell_usd"] += a.get("usdcSize") or 0.0
+
+    def band_of(px):
+        for lo, hi, name in (
+            (0.0, 0.30, "0.00-0.30"),
+            (0.30, 0.50, "0.30-0.50"),
+            (0.50, 0.70, "0.50-0.70"),
+            (0.70, 0.85, "0.70-0.85"),
+            (0.85, 0.90, "0.85-0.90"),
+            (0.90, 0.95, "0.90-0.95"),
+            (0.95, 0.98, "0.95-0.98"),
+            (0.98, 1.01, "0.98-1.00"),
+        ):
+            if lo <= px < hi:
+                return name
+        return None
+
+    bands = {}
+    n_paired_legs = 0
+    n_solo_legs = 0
+    total_cost = 0.0
+    total_return = 0.0
+    for (slug, outcome), e in legs.items():
+        if e["buy_sh"] <= 0.05 or e["buy_usd"] <= 0:
+            continue
+        avg_px = e["buy_usd"] / e["buy_sh"]
+        if not (0.01 < avg_px < 0.99):
+            continue
+        redeem = redeem_by_slug.get(slug, 0.0)
+        won = redeem > 0 and abs(redeem - e["buy_sh"]) < max(0.6, 0.3 * e["buy_sh"])
+        ret = e["sell_usd"] + (e["buy_sh"] if won else 0.0)
+        total_cost += e["buy_usd"]
+        total_return += ret
+        paired = len(sides_by_slug.get(slug, set())) == 2
+        if paired:
+            n_paired_legs += 1
+        else:
+            n_solo_legs += 1
+        bname = band_of(avg_px)
+        if bname is None:
+            continue
+        b = bands.setdefault(bname, {"n": 0, "win": 0, "cost": 0.0, "ret": 0.0, "n_solo": 0})
+        b["n"] += 1
+        b["win"] += 1 if won else 0
+        b["cost"] += e["buy_usd"]
+        b["ret"] += ret
+        if not paired:
+            b["n_solo"] += 1
+
+    band_rows = []
+    for name in ("0.00-0.30", "0.30-0.50", "0.50-0.70", "0.70-0.85", "0.85-0.90", "0.90-0.95", "0.95-0.98", "0.98-1.00"):
+        b = bands.get(name)
+        if not b or b["n"] < 3:
+            continue
+        band_rows.append(
+            {
+                "band": name,
+                "n": b["n"],
+                "win_rate_pct": round(100 * b["win"] / b["n"], 1),
+                "cost": round(b["cost"], 2),
+                "roi_pct": round(100 * (b["ret"] - b["cost"]) / b["cost"], 1) if b["cost"] else None,
+                "solo_pct": round(100 * b["n_solo"] / b["n"], 1),
+            }
+        )
+
+    total_legs = n_paired_legs + n_solo_legs
+    nc = bands.get("0.95-0.98")
+
+    return jsonify(
+        {
+            "ok": True,
+            "wallet": wallet,
+            "events_total": len(events),
+            "events_updown_5m": len(updown),
+            "days_active": days_active,
+            "total_cost_usd": round(total_cost, 2),
+            "total_return_usd": round(total_return, 2),
+            "overall_roi_pct": round(100 * (total_return - total_cost) / total_cost, 1) if total_cost else None,
+            "arb_usage_pct": round(100 * n_paired_legs / total_legs, 1) if total_legs else None,
+            "bands": band_rows,
+            "near_cert_0_95_0_98": (
+                {
+                    "n": nc["n"],
+                    "win_rate_pct": round(100 * nc["win"] / nc["n"], 1),
+                    "roi_pct": round(100 * (nc["ret"] - nc["cost"]) / nc["cost"], 1) if nc["cost"] else None,
+                }
+                if nc
+                else None
+            ),
+        }
+    )
+
+
 @app.route("/api/arb-quality")
 def api_arb_quality():
     """QUALITE DES PAIRES D'ARB (Steven 05/08).

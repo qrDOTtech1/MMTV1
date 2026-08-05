@@ -827,7 +827,13 @@ NEARCERT_MIN_PRICE = 0.95
 NEARCERT_MAX_PRICE = 0.98
 NEARCERT_MAX_SECS = 120   # tard dans la fenetre = issue deja largement jouee
 NEARCERT_MIN_SECS = 8
-NEARCERT_BUDGET_USD = 2.0
+# Mise relevee 2$ -> 4$ (Steven 05/08, "il faut mettre + que 2 euro pour en
+# profiter un max"). L'edge reste MINCE (+1.6%) donc la mise reste bornee :
+# toujours plafonnee par investable (cash - floor) et par
+# MAX_MARKET_EXPOSURE_USD (8$/fenetre) plus bas dans _try_near_certain --
+# doubler la mise ne double pas le risque de ruine, ca amplifie un edge deja
+# mesure et positif, sur un cash actuel de ~8$.
+NEARCERT_BUDGET_USD = 4.0
 
 FAV_ENABLED = False
 FAV_MIN_PRICE = 0.70
