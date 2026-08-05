@@ -2701,7 +2701,7 @@ class MultiTrader:
                 r = requests_mod.get(
                     "https://data-api.polymarket.com/activity",
                     params={"user": wallet, "limit": 500, "offset": off},
-                    headers=headers, timeout=15,
+                    headers=headers, timeout=8,
                 )
                 batch = r.json()
             except Exception:
@@ -2835,7 +2835,7 @@ class MultiTrader:
                 try:
                     m = requests_mod.get(
                         "https://gamma-api.polymarket.com/markets",
-                        params={"slug": slug}, headers=headers, timeout=12,
+                        params={"slug": slug}, headers=headers, timeout=8,
                     ).json()
                 except Exception:
                     continue
@@ -2846,7 +2846,7 @@ class MultiTrader:
                 try:
                     trs = requests_mod.get(
                         "https://data-api.polymarket.com/trades",
-                        params={"market": cid, "limit": 150}, headers=headers, timeout=12,
+                        params={"market": cid, "limit": 150}, headers=headers, timeout=8,
                     ).json()
                 except Exception:
                     continue
@@ -2865,11 +2865,21 @@ class MultiTrader:
         mais plus le choix de CHAQUE wallet individuel."""
         import requests
 
+        # DIAGNOSTIC (Steven 05/08, mesure en test local) : jusqu'a 6 marches
+        # + 15 wallets x plusieurs pages, chacun avec son propre timeout
+        # sequentiel -> plusieurs minutes au total, meme decouple du thread de
+        # sondage (80018cc). Log de debut/fin pour que ce ne soit pas une
+        # boite noire silencieuse pendant tout ce temps.
+        _t0 = time.time()
+        self._log("🔎 [COPY-AUTO] scan de selection demarre")
         ct = self._copy_trade_state()
         candidates = self._ct_scan_active_wallets(requests)
         evaluated = []
         for wallet, freq in candidates:
-            events = self._ct_fetch_wallet_events(wallet, requests, max_pages=2)
+            # 1 seule page (500 evenements) : suffisant pour juger un
+            # echantillon >= COPY_AUTOSELECT_MIN_COST_USD, et ca divise par 2
+            # le pire cas de latence par wallet compare aux 2 pages initiales.
+            events = self._ct_fetch_wallet_events(wallet, requests, max_pages=1)
             if not events:
                 continue
             an = self._ct_analyze(events)
@@ -2905,6 +2915,12 @@ class MultiTrader:
             "excluded": [{"wallet": e["wallet"], "reasons": e["reasons"]} for e in excluded],
         }
         self._save()
+        self._log(
+            f"🔎 [COPY-AUTO] scan termine en {time.time() - _t0:.0f}s : "
+            f"{len(candidates)} wallets vus, {len(evaluated)} analyses, "
+            f"{len(eligible_sorted)} eligibles, {len(excluded)} exclus, "
+            f"{len(ct['wallets'])} suivis"
+        )
 
     def _copy_trade_loop(self):
         """Sonde l'activite on-chain des wallets suivis toutes les
