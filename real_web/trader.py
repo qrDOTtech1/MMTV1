@@ -6984,7 +6984,21 @@ class MultiTrader:
         self._log_market_prices(sym, slug, outcomes, quotes)
         now = synced_now()
         secs_left = p["end_ts"] - now
-        legs_held = sum(1 for side in outcomes if f"{slug}|{side}" in mk["open"])
+        # FILTRE PAR STRAT (Steven 05/08, "je vois des near-certain qui
+        # attendent pas resolution") : cette fonction gere l'arb bothside/
+        # swing exclusivement. legs_held pilote TOUT son comportement en
+        # aval -- force_hedge, PARALLEL PATH, FIRST-LEG, et surtout
+        # HEDGE-NEAR/FORCE-PAIR (les mecanismes de completion corriges plus
+        # tot ce soir avec PAIR_COMPLETION_MAX_COMBINED). Sans ce filtre,
+        # une jambe near-certain/fav/copy ouverte SEULE (volontairement, ce
+        # n'est pas un echec d'arb) etait comptee comme "1 jambe en cours",
+        # et ces mecanismes tentaient de la completer ou de la refermer
+        # comme un orphelin -- observe on-chain : 100% des achats
+        # near-certain revendus dans les 6-18 SECONDES suivant l'achat.
+        legs_held = sum(
+            1 for side in outcomes
+            if (mk["open"].get(f"{slug}|{side}") or {}).get("strat") in ("bothside", "swing")
+        )
 
         # ── COMBINED HISTORY (Steven 26/07) :跟踪每个slug的combined历史 ──
         # Le combined oscille pendant la fenêtre 5min. Un snapshot à T peut
@@ -7787,10 +7801,41 @@ class MultiTrader:
         failed_legs = []
         # PRE-FILL (Steven 28/07) : les jambes deja en portefeuille comptent
         # comme "remplies" pour l'ATOMIC ARB GUARD.
+        # FILTRE PAR STRAT (Steven 05/08, "je vois des near-certain qui
+        # attendent pas resolution") : ce pre-fill comptait TOUTE position
+        # presente sur le slug, quelle que soit sa strategie d'origine -- une
+        # jambe near-certain (achetee seule, volontairement, a 0.95-0.98)
+        # etait donc prise pour une jambe d'arb en cours. Consequence directe
+        # observee on-chain : 100% des achats near-certain revendus dans les
+        # 6-18 SECONDES suivant l'achat, au meme prix (aucun profit/perte,
+        # juste un aller-retour) -- le combined sequentiel (near-cert deja
+        # tres cher + l'autre cote) depassait quasi-systematiquement le
+        # plafond de couverture, et l'ATOMIC ARB GUARD marquait la jambe
+        # "orpheline" -> must_close, alors qu'elle n'a jamais fait partie
+        # d'une tentative d'arb. Ne compter ici que ce que CE mecanisme gere
+        # lui-meme (bothside/swing) -- near-certain, fav et copy restent
+        # geres exclusivement par leur propre logique (TP/SL normal).
         for side, token_id in zip(outcomes, token_ids):
             key = f"{slug}|{side}"
-            if key in mk["open"]:
+            _existing = mk["open"].get(key)
+            if _existing and _existing.get("strat") in ("bothside", "swing"):
                 filled_legs.append((side, token_id))
+            elif _existing:
+                # RETRAIT COMPLET (Steven 05/08) : selon l'ordre de outcomes,
+                # une jambe etrangere (near-cert/fav/copy) pouvait se trouver
+                # en position i=0 -> ne bloquait alors PAS l'ouverture de la
+                # jambe opposee (le check "SKIP" plus bas ne saute que le
+                # MEME cote), et bothside finissait par acheter l'autre cote
+                # autour d'elle -- creant une paire non voulue, a un sizing
+                # qui n'a jamais ete pense pour ca. Plus simple et plus sur :
+                # des qu'un autre mecanisme a deja une jambe sur ce slug, on
+                # laisse la fenetre entiere tranquille.
+                self._tlog(
+                    f"bothside_foreign_{sym}",
+                    f"⏸️ [BOTHSIDE-SEQ] {sym} {slug} deja une jambe "
+                    f"{_existing.get('strat')} dessus -> on n'y touche pas",
+                )
+                return legs_held > 0
         # ── GATE COMBINED SEQUENTIEL (Steven 05/08) ─────────────────────
         # TROU TROUVE EN PRODUCTION. Cette boucle-ci n'a JAMAIS controle le
         # combine : elle calcule _comb_sequential, s'en sert pour le sizing et
