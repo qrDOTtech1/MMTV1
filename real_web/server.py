@@ -550,6 +550,72 @@ def api_trades():
     )
 
 
+@app.route("/api/history-summary")
+def api_history_summary():
+    """Resume par HEURE sur plusieurs heures (Steven 05/08, 'il faut que tu
+    puisse voir + de historique, genre resumer plusieurs heures') : le
+    journal texte ne garde que ~5000 lignes (~40min a ce rythme de log) --
+    inutilisable pour une vue longue duree. Ceci reconstruit a la demande
+    depuis mk['trades'] (deja en memoire pour toute la session, jamais
+    purge), donc dispo immediatement, pas besoin d'attendre que des heures
+    s'accumulent apres ce deploiement. Parametre ?hours=N (defaut 12)."""
+    try:
+        hours = max(1, min(72, int(request.args.get("hours", 12))))
+    except (TypeError, ValueError):
+        hours = 12
+    cutoff = time.time() - hours * 3600
+    trades = [t for t in _collect_all_trades() if (t.get("opened_ts") or 0) >= cutoff]
+
+    buckets = {}
+    for t in trades:
+        ts = t.get("opened_ts") or 0
+        bucket_ts = int(ts // 3600) * 3600
+        b = buckets.setdefault(
+            bucket_ts,
+            {
+                "bucket_start": bucket_ts,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnl": 0.0,
+                "by_symbol": {},
+                "by_strat": {},
+                "by_resolved_by": {},
+            },
+        )
+        pnl = t.get("pnl") or 0
+        b["trades"] += 1
+        b["pnl"] = round(b["pnl"] + pnl, 4)
+        if pnl > 0:
+            b["wins"] += 1
+        elif pnl < 0:
+            b["losses"] += 1
+        sym = t.get("_market_key", "?")
+        strat = t.get("strat", "?")
+        rb = t.get("resolved_by", "?")
+        b["by_symbol"][sym] = round(b["by_symbol"].get(sym, 0) + pnl, 4)
+        b["by_strat"][strat] = round(b["by_strat"].get(strat, 0) + pnl, 4)
+        b["by_resolved_by"][rb] = round(b["by_resolved_by"].get(rb, 0) + pnl, 4)
+
+    bucket_list = sorted(buckets.values(), key=lambda b: b["bucket_start"])
+    total_pnl = round(sum(b["pnl"] for b in bucket_list), 4)
+    total_trades = sum(b["trades"] for b in bucket_list)
+    total_wins = sum(b["wins"] for b in bucket_list)
+    return jsonify(
+        {
+            "ok": True,
+            "hours_requested": hours,
+            "buckets": bucket_list,
+            "summary": {
+                "total_trades": total_trades,
+                "total_wins": total_wins,
+                "win_rate_pct": round(total_wins / total_trades * 100, 1) if total_trades else None,
+                "total_pnl": total_pnl,
+            },
+        }
+    )
+
+
 @app.route("/api/trades/export")
 def api_trades_export():
     """Exporte les trades en CSV ou JSON (meme filtres que /api/trades)."""
