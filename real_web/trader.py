@@ -698,6 +698,37 @@ PAIR_COMPLETION_MAX_COMBINED = 0.99
 # reellement gerer (seulement 6 des 55 paires perdantes etaient en 1.00-1.05,
 # et elles l'ont ete SANS TP/SL fonctionnel, faussement taggees risk-free).
 PAIR_COMPLETION_HEDGE_MAX = 1.03
+
+# ── RENFORT DE LA JAMBE GAGNANTE (Steven 05/08) ────────────────────────
+# Idee de Steven : "des qu'on a fait un SL, meme de 25%, ca devient
+# directionnel -- rien n'empeche d'ajouter sur le gagnant (en verifiant
+# Binance)". C'est juste : toute coupe reduit min(parts_up, parts_down),
+# donc le payout du pire cas -- le verrou est deja entame, il n'y a plus
+# rien a preserver. Et une paire REELLEMENT verrouillee est taggee
+# is_risk_free donc exempte de SL : si un SL s'est declenche, c'est par
+# construction qu'il n'y avait pas de verrou.
+#
+# La question devient alors purement une question d'esperance. Sur un
+# marche binaire, acheter a un prix p ne gagne en esperance que si le taux
+# de reussite reel depasse p. Mesure sur l'historique on-chain (500
+# evenements, taux de reussite par tranche de prix d'achat) :
+#     0.40-0.50 :  25 jambes, 44% -> EV -0.010  (zone pile-ou-face)
+#     0.50-0.60 :  37 jambes, 78% -> EV +0.234, ROI reel +39%
+#     0.60-0.70 :  23 jambes, 78% -> EV +0.133, ROI reel +18%
+#     0.70-0.80 :  13 jambes, 85% -> EV +0.096, ROI reel +25%
+#     0.80-0.90 :   8 jambes, 62% -> EV -0.225, ROI reel -10%
+# La bande 0.50-0.80 est nettement positive sur 73 jambes ; au-dela de
+# 0.80 ca bascule (on paie plus cher que la probabilite reelle). D'ou les
+# bornes ci-dessous. RESERVE : echantillons petits (8 a 37 par tranche) et
+# la detection "jambe gagnante" est heuristique (rapprochement du montant
+# du redeem au nombre de parts) -- tendance nette sur 3 tranches
+# consecutives, pas une preuve definitive.
+REINFORCE_MIN_PRICE = 0.50   # sous ce prix : pas de confirmation du marche
+REINFORCE_MAX_PRICE = 0.80   # au-dela : esperance negative (mesure)
+REINFORCE_MIN_SECS = 20      # trop tard pour ressortir si ca tourne
+REINFORCE_MAX_SECS = 180     # trop tot : le marche peut encore se retourner
+REINFORCE_MAX_MULT = 1.0     # renfort plafonne aux parts deja detenues (x2 max)
+REINFORCE_BINANCE_MARGIN = 0.001  # ecart spot/strike mini (0.1%) = hors bruit
 # GROSSE MISE SUR RISK-FREE (Steven 29/07, "je veux grosse mise sur les arb
 # risk free") : contrairement au directionnel, l'arb garanti (2 jambes achetees
 # EN MEME TEMPS, profit fige quel que soit le resultat) n'expose PAS a un
@@ -2348,6 +2379,13 @@ class MultiTrader:
                         self._manage_pnl_tier_exits(sym)
                     except Exception as e:
                         self._tlog(f"fastexit_pnl_err_{sym}", f"💥 [FAST-EXIT] {sym} pnl-exits erreur: {e}")
+                    # RENFORT (Steven 05/08) : APRES les sorties, pour que le
+                    # marqueur sl_fired du cycle courant soit deja pose et que
+                    # le renfort travaille sur la taille reelle post-coupe.
+                    try:
+                        self._manage_reinforce(sym)
+                    except Exception as e:
+                        self._tlog(f"fastexit_reinf_err_{sym}", f"💥 [FAST-EXIT] {sym} renfort erreur: {e}")
             except Exception as e:
                 self._log(f"💥 [FAST-EXIT] erreur boucle: {e}")
             time.sleep(FAST_EXIT_POLL_S)
@@ -3238,6 +3276,113 @@ class MultiTrader:
         elif secs_left > 120:
             mult *= 1.08
         return round(base_stop * mult, 3)
+
+    def _manage_reinforce(self, sym):
+        """RENFORT DE LA JAMBE GAGNANTE (Steven 05/08).
+
+        Declenche UNIQUEMENT apres qu'un stop-loss ait deja coupe sur cette
+        fenetre : a ce moment la position n'est plus une paire couverte mais
+        un pari directionnel assume (toute coupe reduit min(parts), donc le
+        payout du pire cas -- le verrou est deja entame). La decision devient
+        alors une pure question d'esperance, et la mesure sur l'historique
+        montre que la bande 0.50-0.80 est nettement gagnante (cf. les
+        constantes REINFORCE_*). Au-dela de 0.80 l'esperance devient negative,
+        d'ou le plafond dur.
+
+        Toutes les conditions doivent tenir : SL deja declenche sur la
+        fenetre, jambe NON verrouillee, Binance qui confirme le sens au-dela
+        du bruit, prix dans la bande +EV, fenetre temporelle, et les plafonds
+        habituels (exposition par marche, plancher de cash)."""
+        from core.btc_updown import _binance_price, _strike_at
+
+        mk = self.state["markets"][sym]
+        if self.state["modes"].get(sym) != "real":
+            return
+        now = synced_now()
+        for key, pos in list(mk["open"].items()):
+            slug = pos.get("slug")
+            # 1) un SL doit avoir deja coupe sur CETTE fenetre
+            if not mk.get("sl_fired", {}).get(slug):
+                continue
+            # 2) jamais toucher a une paire reellement verrouillee
+            if pos.get("is_risk_free") or pos.get("must_close"):
+                continue
+            if pos.get("mode") != "real" or pos.get("filled_shares", 0) <= 0:
+                continue
+            # un seul renfort par jambe
+            if pos.get("reinforced"):
+                continue
+            # 3) fenetre temporelle : assez de temps pour ressortir, pas trop
+            secs_left = pos.get("end_ts", now) - now
+            if not (REINFORCE_MIN_SECS <= secs_left <= REINFORCE_MAX_SECS):
+                continue
+            # 4) prix dans la bande d'esperance positive
+            book = self._live.get_book_sync(pos["token_id"])
+            ask = book["asks"][0][0] if book and book.get("asks") else None
+            if ask is None or not (REINFORCE_MIN_PRICE <= ask <= REINFORCE_MAX_PRICE):
+                continue
+            # 5) Binance doit CONFIRMER le sens, au-dela du bruit
+            if not pos.get("pair"):
+                continue
+            spot = _binance_price(pos["pair"])
+            strike = _strike_at(pos["pair"], pos.get("start_ts"), slug=slug)
+            if spot is None or strike is None:
+                continue
+            gap = abs(spot - strike)
+            if gap < spot * REINFORCE_BINANCE_MARGIN:
+                continue  # trop proche du strike : aucune conviction
+            binance_side = "Up" if spot > strike else "Down"
+            if binance_side != pos.get("side"):
+                continue  # Binance dit l'inverse -> surtout pas renforcer
+            # 6) taille : plafonnee aux parts deja detenues, puis aux plafonds
+            held = pos["filled_shares"]
+            add_shares = round(held * REINFORCE_MAX_MULT, 2)
+            cost = round(add_shares * ask, 2)
+            cash, _ = self._read_cash(max_age=0)
+            if cash is None:
+                continue
+            investable = max(0.0, cash - self.floor())
+            if cost > investable:
+                add_shares = round(investable / ask, 2)
+                cost = round(add_shares * ask, 2)
+            if add_shares < MIN_SELL_SHARES or cost < MIN_BUDGET_USD:
+                continue
+            ok_exp, why_exp = self._exposure_ok(sym, mk, slug, cost)
+            if not ok_exp:
+                self._tlog(
+                    f"reinf_exp_{sym}",
+                    f"⛔ [RENFORT] {sym} {slug} {pos['side']} refuse : {why_exp}",
+                )
+                continue
+            self._log(
+                f"📈 [RENFORT] {sym} {slug} {pos['side']} @ {ask:.3f} "
+                f"(+{add_shares} parts / {cost:.2f}$) -- SL deja declenche donc "
+                f"directionnel assume, Binance confirme (ecart {gap:.2f}), "
+                f"{secs_left:.0f}s restantes"
+            )
+            with self._order_lock:
+                res = self._live.snipe_buy_market(pos["token_id"], round(ask + 0.02, 2), cost)
+            filled = res.get("filled_shares", 0.0)
+            if filled <= 0:
+                self._log(
+                    f"⚠️ [RENFORT] {sym} {slug} {pos['side']} non rempli "
+                    f"(err={res.get('error', '')})"
+                )
+                pos["reinforced"] = True  # pas de re-tir en boucle
+                continue
+            avg = res.get("avg_cost") or ask
+            self._add_slug_spent(mk, slug, round(filled * avg, 2))
+            _old_sh, _old_cost = held, pos.get("cost", 0.0)
+            pos["filled_shares"] = round(_old_sh + filled, 2)
+            pos["cost"] = round(_old_cost + filled * avg, 2)
+            pos["entry_price"] = round(pos["cost"] / pos["filled_shares"], 4)
+            pos["reinforced"] = True
+            # le palier de TP se recalibre sur la NOUVELLE taille
+            pos["init_shares"] = pos["filled_shares"]
+            self._log(
+                f"✅ [RENFORT] {sym} {slug} {pos['side']} +{filled} parts @ {avg:.3f} "
+                f"-> {pos['filled_shares']} parts, prix moyen {pos['entry_price']:.3f}"
+            )
 
     def _manage_orphans(self, sym):
         """GESTION ACTIVE DES JAMBES NUES (Steven 22/07) :
@@ -7384,6 +7529,15 @@ class MultiTrader:
                 )
                 if sold <= 0:
                     continue
+                # MARQUEUR DIRECTIONNEL (Steven 05/08) : "des qu'on a fait un
+                # SL, meme de 25%, ca devient directionnel". Exact -- toute
+                # coupe reduit min(parts_up, parts_down), donc le payout du
+                # pire cas : le verrou est deja entame. On le note sur la
+                # fenetre pour autoriser le renfort de la jambe survivante
+                # (_manage_reinforce). NB : une paire VRAIMENT verrouillee est
+                # taggee is_risk_free donc EXEMPTE de SL -- si on arrive ici,
+                # c'est par construction qu'il n'y avait pas de verrou a casser.
+                mk.setdefault("sl_fired", {})[slug] = time.time()
                 if sold < _sl_held - 0.01:
                     # Fill partiel : on comptabilise ce qui est reellement sorti
                     # et on garde le reste en position pour retenter au prochain
