@@ -729,6 +729,24 @@ REINFORCE_MIN_SECS = 20      # trop tard pour ressortir si ca tourne
 REINFORCE_MAX_SECS = 180     # trop tot : le marche peut encore se retourner
 REINFORCE_MAX_MULT = 1.0     # renfort plafonne aux parts deja detenues (x2 max)
 REINFORCE_BINANCE_MARGIN = 0.001  # ecart spot/strike mini (0.1%) = hors bruit
+
+# ── PRIX PLANCHER POUR GARDER UNE JAMBE ORPHELINE (Steven 05/08) ───────
+# _manage_orphans tenait toute jambe que Binance donnait gagnante, quel que
+# soit son PRIX. Sur un outsider a 0.13, "Binance dit que ca monte" ne vaut
+# rien : il faut un retournement complet pour que ca paie, et le marche le
+# price deja correctement. Constate en direct sur la fenetre 10:00-10:05 :
+#   ETH  Up @ 0.138 tenu jusqu'a resolution -> -1.49$ (-100%)
+#   DOGE Up @ 0.242 tenu jusqu'a resolution -> -1.48$ (-100%)
+#   SOL  Up @ 0.461 coupe au SL             -> -1.26$ (-27%)
+#   SOL  Down @ 0.660 gardee et geree       -> +1.58$ sur la paire (+46%)
+# Et ca colle a l'historique corrige (sans biais de survie, 215 jambes) :
+#   0.20-0.30 -> ROI -28%   |   0.50-0.60 -> ROI  +1%
+#   0.30-0.40 -> ROI -18%   |   0.60-0.70 -> ROI  -3%
+#   0.40-0.50 -> ROI -17%   |   0.70-0.80 -> ROI  -2%
+# Sous 0.50 c'est franchement perdant ; au-dessus c'est l'equilibre, donc
+# gerable au TP/SL. On ferme donc les orphelines bon marche au lieu de les
+# tenir en esperant un retournement, et on garde/gere les cheres.
+ORPHAN_KEEP_MIN_PRICE = 0.50
 # GROSSE MISE SUR RISK-FREE (Steven 29/07, "je veux grosse mise sur les arb
 # risk free") : contrairement au directionnel, l'arb garanti (2 jambes achetees
 # EN MEME TEMPS, profit fige quel que soit le resultat) n'expose PAS a un
@@ -3443,6 +3461,26 @@ class MultiTrader:
                     del mk["open"][key]
                 continue
 
+            # ── ORPHELINE BON MARCHE = BILLET DE LOTERIE (Steven 05/08) ──
+            # Place AVANT toute logique "Binance dit que ca monte, on tient" :
+            # une jambe nue sous ORPHAN_KEEP_MIN_PRICE est structurellement
+            # perdante (cf. commentaire de la constante -- -17% a -28% de ROI
+            # historique sous 0.50, et deux pertes a -100% le jour meme sur
+            # ETH @ 0.138 et DOGE @ 0.242, toutes deux tenues parce que
+            # Binance les donnait gagnantes). Le signal ne rachete pas un
+            # mauvais prix : il faudrait un retournement complet, que le
+            # marche price deja correctement. On ferme.
+            _op_px = self._live_price(pos.get("token_id"), None, pos.get("side"))
+            if _op_px is not None and _op_px < ORPHAN_KEEP_MIN_PRICE:
+                pos["must_close"] = True
+                self._tlog(
+                    f"orphcheap_{key}",
+                    f"⛔ [ORPHELINE-BON-MARCHE] {sym} {pos['slug']} {pos['side']} "
+                    f"@ {_op_px:.3f} < {ORPHAN_KEEP_MIN_PRICE} -> billet de loterie, "
+                    f"marquee A FERMER (plus de 'on tient' sur signal Binance)",
+                )
+                continue
+
             # V3.1 AXE 5 : sortie d'urgence (fenetre proche + position perdante)
             _emrg, _emrg_reason = self._should_emergency_exit(pos, sym, now)
             if _emrg:
@@ -5128,10 +5166,19 @@ class MultiTrader:
                         "filled_shares": _leftover, "cost": round(_leftover * px, 2),
                         "start_ts": p["start_ts"], "pair": p["pair"],
                         "end_ts": p["end_ts"], "opened_ts": time.time(), "buffer": 0.0,
+                        # (Steven 05/08) Ce residu vient d'un unwind qui n'a pas
+                        # confirme : l'intention etait de SORTIR. Il naissait
+                        # sans must_close, donc _manage_orphans pouvait decider
+                        # de le "tenir" sur signal Binance -- exactement ce qui
+                        # a tue ETH @ 0.138 et DOGE @ 0.242. Sous
+                        # ORPHAN_KEEP_MIN_PRICE il reste marque a fermer ;
+                        # au-dessus, il redevient gerable en TP/SL.
+                        "must_close": px < ORPHAN_KEEP_MIN_PRICE,
                     }
                     self._log(
                         f"🦺 [ORPHAN] {sym} {slug} {side} {_leftover} parts residuelles "
-                        f"(vente non confirmee a temps) -> trackees pour gestion/retry"
+                        f"@ {px:.3f} (vente non confirmee) -> "
+                        f"{'A FERMER (sous ' + str(ORPHAN_KEEP_MIN_PRICE) + ')' if px < ORPHAN_KEEP_MIN_PRICE else 'gerees en TP/SL'}"
                     )
             self._log(f"↩️ [BOTHSIDE][REEL] {sym} {slug} pair KO (f1={f1} f2={f2})")
             _fill_pct = round(min(f1, f2) / target_shares * 100, 1) if target_shares else 0.0
