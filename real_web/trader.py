@@ -241,6 +241,17 @@ DN_MIN_FREE_CASH = 4.0  # sous ce seuil, n'ouvre meme pas une nouvelle paire
 # RETOUR AUX VALEURS D'ORIGINE (demande Steven 21/07) : mon boost (18$/55%/2$)
 # est retire pour ne pas fausser les stats. On garde la base prouvee (10W/0L)...
 HARD_CAP_USD = 16.0  # cout max d'un trade (releve 10->16, Steven 22/07 : plein gaz)
+# ── PLAFOND D'EXPOSITION PAR MARCHE (Steven 05/08, idee reprise du spec
+# ENGINEBTB3 section 10 "max exposure par marche"). HARD_CAP_USD plafonne UN
+# ordre, mais RIEN ne plafonnait le CUMUL sur une meme fenetre de 5 min : le
+# bot pouvait rentrer 10 fois de suite sur la meme jambe. Mesure on-chain sur
+# btc-updown-5m-1785879900 : 10 achats consecutifs, 10.47$ engages, 0 vente,
+# prix moyenne a la baisse de 0.41 a 0.29. Ce plafond est un filet STRUCTUREL :
+# il coupe ce type de derive quelle qu'en soit la cause (bug de garde, boucle
+# de re-entree, strategie qui s'emballe), sans dependre d'un diagnostic exact.
+# Une paire d'arb normale coute ~5$ (5 parts x combined ~1.0) -> 8$ laisse la
+# marge d'une paire complete + un ajustement, mais jamais un doublement.
+MAX_MARKET_EXPOSURE_USD = 8.0
 MAX_FRACTION = 0.40  # ... et au plus 40% du capital investissable (releve 0.30->0.40)
 MIN_BUDGET_USD = 1.0
 PAPER_START_BAL = 20.0  # solde papier de depart (par marche paper)
@@ -1655,9 +1666,38 @@ class MultiTrader:
         return False, ""
 
     def _set_slug_cooldown(self, sym, slug, mk):
-        """Active le cooldown post-abort pour un slug."""
+        """Active le cooldown post-abort pour un slug.
+        NB (Steven 05/08) : _in_cooldown() est desactive depuis le 30/07
+        ("retire tous les cooldown existants") -> cet appel n'a plus d'effet
+        bloquant. C'est MAX_MARKET_EXPOSURE_USD (ci-dessous) qui joue
+        desormais le role de garde-fou anti-reentree, et lui ne depend
+        d'aucun cooldown."""
         now = time.time()
         mk.setdefault("cooldowns", {})[slug] = now + SLUG_COOLDOWN_SECS
+
+    # ── EXPOSITION CUMULEE PAR MARCHE (Steven 05/08, spec ENGINEBTB3 s.10) ──
+    def _slug_spent(self, mk, slug):
+        """Total $ REELS deja engages a l'achat sur cette fenetre de 5 min."""
+        return round(mk.setdefault("slug_spent", {}).get(slug, 0.0), 2)
+
+    def _add_slug_spent(self, mk, slug, usd):
+        """Comptabilise un achat reel dans l'exposition de la fenetre."""
+        if not slug or usd is None or usd <= 0:
+            return
+        d = mk.setdefault("slug_spent", {})
+        d[slug] = round(d.get(slug, 0.0) + usd, 2)
+
+    def _exposure_ok(self, sym, mk, slug, add_usd):
+        """Refuse un achat qui ferait depasser MAX_MARKET_EXPOSURE_USD sur ce
+        marche. Filet STRUCTUREL contre les boucles de re-entree : peu importe
+        quel bug ou quelle strategie relance l'achat, le cumul par fenetre est
+        borne. Retourne (ok: bool, detail: str)."""
+        spent = self._slug_spent(mk, slug)
+        if spent + (add_usd or 0.0) <= MAX_MARKET_EXPOSURE_USD:
+            return True, ""
+        return False, (
+            f"expo={spent:.2f}$+{(add_usd or 0.0):.2f}$ > max={MAX_MARKET_EXPOSURE_USD:.2f}$"
+        )
 
     def _record_abort(self, sym, mk):
         """Enregistre un abort. Incremente le compteur et active cooldown symbole si >= MAX."""
@@ -2632,6 +2672,15 @@ class MultiTrader:
                 # ordres LIMIT/FAK -> suit fidelement le budget Kelly, meme tout petit
                 # (jusqu'a 0.10$), sur TOUS les marches y compris BTC. L'ancien chemin
                 # LIMIT/FAK (snipe_buy) reste dispo mais n'est plus utilise par defaut.
+                # PLAFOND D'EXPOSITION PAR MARCHE (Steven 05/08) : identique au
+                # chemin both-side, borne le cumul engage sur cette fenetre.
+                _exp_ok, _exp_why = self._exposure_ok(sym, mk, slug, budget)
+                if not _exp_ok:
+                    self._log(
+                        f"⛔ [EXPO-MAX] {sym} {slug} {sig['side']} achat refuse : {_exp_why}"
+                    )
+                    self._reject(sym, slug, "risk_limit", _exp_why)
+                    return
                 res = self._live.snipe_buy_market(token_id, max_entry, budget)
                 filled = res.get("filled_shares", 0.0)
                 self._log(
@@ -2647,6 +2696,7 @@ class MultiTrader:
                     )
                     return
                 avg = res.get("avg_cost") or ask
+                self._add_slug_spent(mk, slug, round(filled * avg, 2))
                 mk["open"][slug] = {
                     "symbol": sym,
                     "slug": slug,
@@ -2838,6 +2888,19 @@ class MultiTrader:
                             f"{MIN_ORDER_SIZE_SHARES} (investable={investable:.2f}) -> jambe invendable evitee"
                         )
                         return False, 0.0
+                # PLAFOND D'EXPOSITION PAR MARCHE (Steven 05/08) : dernier
+                # controle avant d'engager du vrai argent. Borne le CUMUL sur
+                # la fenetre, pas juste cet ordre -> coupe toute boucle de
+                # re-entree quelle qu'en soit la cause.
+                _exp_cost = round((target_shares * ask) if target_shares is not None else budget, 2)
+                _exp_ok, _exp_why = self._exposure_ok(sym, mk, slug, _exp_cost)
+                if not _exp_ok:
+                    self._log(
+                        f"⛔ [EXPO-MAX] {sym} {slug} {side} achat refuse : {_exp_why} "
+                        f"-> plafond d'exposition de la fenetre atteint"
+                    )
+                    self._reject(sym, slug, "risk_limit", _exp_why)
+                    return False, 0.0
                 if no_slippage:
                     _shares = target_shares if target_shares is not None else round(budget / ask, 2)
                     res = self._live.snipe_buy_limit_exact(token_id, ask, _shares)
@@ -2879,35 +2942,19 @@ class MultiTrader:
                 if filled <= 0:
                     return False, 0.0
                 avg = res.get("avg_cost") or ask
-                # TOP-UP FILL PARTIEL SOUS MINIMUM (Steven 05/08) : meme avec le
-                # garde-fou budget ci-dessus, le carnet peut ne remplir qu'une
-                # FRACTION de l'ordre (ex: 2.78/5 parts demandees) -> la position
-                # reste invendable et _manage_pnl_tier_exits la skip totalement
-                # (bug trouve en live : peak +168% jamais pris). On tente UNE
-                # relance immediate pour completer jusqu'au minimum vendable.
+                # NB (Steven 05/08) : un TOP-UP etait tente ici pour amener un
+                # fill partiel a 5 parts. Retire -- il reposait sur la meme
+                # premisse fausse que celui de _sell_orphan (vente impossible
+                # sous 5 parts). Les ventes sous 5 parts passent (verifie
+                # on-chain, plus petite a 1.37 part) et la gestion TP/SL
+                # accepte desormais toute taille > 0 : racheter pour "pouvoir
+                # gerer" ne ferait qu'engager plus de capital sans raison.
+                self._add_slug_spent(mk, slug, round(filled * avg, 2))
                 if 0 < filled < MIN_ORDER_SIZE_SHARES:
-                    missing = round(MIN_ORDER_SIZE_SHARES - filled, 2)
-                    ask_topup = res.get("ask") or ask
-                    if ask_topup and ask_topup <= max_entry:
-                        topup_budget = round(missing * ask_topup * 1.02, 2)
-                        cash2, _ = self._read_cash(max_age=0)
-                        if cash2 is not None and cash2 - self.floor() >= topup_budget:
-                            res2 = self._live.snipe_buy_market(token_id, max_entry, topup_budget)
-                            filled2 = res2.get("filled_shares", 0.0)
-                            if filled2 > 0:
-                                spent2 = filled2 * (res2.get("avg_cost") or ask_topup)
-                                spent1 = filled * ask
-                                filled = round(filled + filled2, 2)
-                                avg = round((spent1 + spent2) / filled, 4) if filled else ask
-                                self._log(
-                                    f"🔁 [TOP-UP-MIN] {sym} {slug} {side} +{filled2} parts "
-                                    f"(total={filled}) -> minimum vendable atteint"
-                                )
-                    if filled < MIN_ORDER_SIZE_SHARES:
-                        self._log(
-                            f"⚠️ [SOUS-MIN-VENDABLE] {sym} {slug} {side} filled={filled} < "
-                            f"{MIN_ORDER_SIZE_SHARES} apres top-up -> position restera hors gestion TP/SL"
-                        )
+                    self._log(
+                        f"ℹ️ [FILL-PARTIEL] {sym} {slug} {side} {filled} parts remplies "
+                        f"(< {MIN_ORDER_SIZE_SHARES}) -> gerees normalement en TP/SL"
+                    )
                 base.update(
                     mode="real",
                     entry_price=avg,
@@ -3120,6 +3167,44 @@ class MultiTrader:
             if secs_left <= 3:
                 continue  # trop tard, la resolution normale prendra le relais
 
+            # ── ZERO JAMBE NUE (Steven 05/08, "pas de demi-mesure") ──
+            # Une jambe issue d'une paire qui n'a pas pu se completer est un
+            # pari directionnel non voulu. Mesure on-chain sur 27.9h : les 64
+            # marches ou un SEUL cote a ete achete pesent -32.98$ pour un win
+            # rate de ~33% -- structurellement perdants, alors qu'un arb
+            # complet est gagnant par construction. On ne "gere" donc pas ces
+            # jambes au momentum : on les FERME, et on continue d'essayer
+            # tant qu'elles ne sont pas soldees (avant, une vente ratee
+            # laissait la position courir jusqu'a resolution).
+            if pos.get("must_close"):
+                _mc_shares = pos.get("filled_shares", 0)
+                if _mc_shares > 0:
+                    _tries = pos.get("close_attempts", 0)
+                    _mc_sold = self._sell_orphan(
+                        pos["token_id"], _mc_shares,
+                        f" {sym} {pos['slug']} {pos['side']} ZERO-JAMBE-NUE(essai {_tries + 1})",
+                        entry_price=pos["entry_price"], symbol=sym,
+                        slug=pos.get("slug"), side=pos.get("side"),
+                    )
+                    if _mc_sold >= _mc_shares - 0.01:
+                        del mk["open"][key]
+                        self._log(
+                            f"✅ [ZERO-JAMBE-NUE] {sym} {pos['slug']} {pos['side']} "
+                            f"jambe non couverte soldee ({_mc_sold} parts)"
+                        )
+                    else:
+                        pos["filled_shares"] = round(_mc_shares - _mc_sold, 2)
+                        pos["close_attempts"] = _tries + 1
+                        self._tlog(
+                            f"mustclose_{key}",
+                            f"🔁 [ZERO-JAMBE-NUE] {sym} {pos['slug']} {pos['side']} "
+                            f"{_mc_sold}/{_mc_shares} vendues, reste "
+                            f"{pos['filled_shares']} -> nouvelle tentative au prochain cycle",
+                        )
+                else:
+                    del mk["open"][key]
+                continue
+
             # V3.1 AXE 5 : sortie d'urgence (fenetre proche + position perdante)
             _emrg, _emrg_reason = self._should_emergency_exit(pos, sym, now)
             if _emrg:
@@ -3188,7 +3273,7 @@ class MultiTrader:
                     _margin = _px * 0.001  # 0.1% du prix
                     if _gap > _margin:
                         _hard_stop = round(_hard_stop * 0.8, 3)
-            if _shares >= MIN_ORDER_SIZE_SHARES:
+            if _shares > 0:
                 _book = self._live.get_book_sync(pos["token_id"])
                 _bid = _book["bids"][0][0] if _book and _book.get("bids") else None
                 if _bid is not None and (pos["entry_price"] - _bid) >= _hard_stop:
@@ -4876,6 +4961,8 @@ class MultiTrader:
                 "arb_combined": round(combined, 4),
                 "arb_edge": round(1 - combined, 4),
             }
+            # Comptabilise l'exposition de la fenetre (Steven 05/08).
+            self._add_slug_spent(mk, slug, round(M * px, 2))
             if side in _residual_excess:
                 mk["open"][f"{slug}|{side}|excess"] = {
                     "symbol": sym, "slug": slug, "side": side, "mode": "real",
@@ -6130,10 +6217,14 @@ class MultiTrader:
                                         _rest = round(_held - _sold_uw, 2)
                                         _pos1["filled_shares"] = _rest
                                         _pos1["strat"] = "orphan"
+                                        # ZERO JAMBE NUE : le reliquat n'est pas
+                                        # une position a "gerer", c'est une jambe
+                                        # non couverte -> a fermer, point.
+                                        _pos1["must_close"] = True
                                         self._log(
                                             f"⚠️ [UNWIND-PARTIEL] {sym} {slug} {_pos1['side']} "
                                             f"{_sold_uw}/{_held} parts vendues -> {_rest} parts "
-                                            f"CONSERVEES en gestion (jamais supprimees a l'aveugle)"
+                                            f"marquees A FERMER (retentee chaque cycle)"
                                         )
                                     # Cooldown du slug : empeche le re-achat
                                     # immediat de la meme fenetre apres un
@@ -6398,9 +6489,10 @@ class MultiTrader:
                                     _restp = round(_heldp - _sold_p, 2)
                                     _pos1p["filled_shares"] = _restp
                                     _pos1p["strat"] = "orphan"
+                                    _pos1p["must_close"] = True
                                     self._log(
                                         f"⚠️ [UNWIND-PARTIEL] {sym} {slug} {_pos1p['side']} "
-                                        f"{_sold_p}/{_heldp} parts vendues -> {_restp} parts CONSERVEES"
+                                        f"{_sold_p}/{_heldp} parts vendues -> {_restp} parts A FERMER"
                                     )
                                 self._set_slug_cooldown(sym, slug, mk)
                             else:
@@ -6613,16 +6705,32 @@ class MultiTrader:
                                         f"-> VENTE jambe {sell_side}@{sell_price:.3f} "
                                         f"(perte ~{(sell_info.get('entry_price', 0) - sell_price) * sell_shares:.2f}$)"
                                     )
+                                    # FIX CRITIQUE (Steven 04/08, trouve via le
+                                    # screenshot "31.9 positions" jamais liquidees) :
+                                    # ordre (token, PRIX, parts) -- sell_shares et
+                                    # sell_price etaient inverses, envoyant un
+                                    # "prix" de plusieurs parts (invalide, >1$) ->
+                                    # cette vente d'urgence echouait TOUJOURS
+                                    # silencieusement, expliquant l'accumulation.
+                                    #
+                                    # FIX (Steven 05/08) : on passe par _sell_orphan
+                                    # au lieu de sell_position brut. Deux raisons :
+                                    #  1) sell_position par defaut poste un GTC
+                                    #     PASSIF, qui peut ne jamais croiser -- ici
+                                    #     on veut sortir, pas esperer un match ;
+                                    #     _sell_orphan poste en FAK agressif ET
+                                    #     VERIFIE le fill on-chain.
+                                    #  2) le retour etait totalement ignore, puis la
+                                    #     position etait pop() quoi qu'il arrive ->
+                                    #     meme bug que les unwinds : jambe fantome
+                                    #     detenue on-chain mais absente de l'etat.
+                                    _fp_sold = 0.0
                                     try:
-                                        # FIX CRITIQUE (Steven 04/08, trouve via le
-                                        # screenshot "31.9 positions" jamais liquidees) :
-                                        # ordre (token, PRIX, parts) -- sell_shares et
-                                        # sell_price etaient inverses, envoyant un
-                                        # "prix" de plusieurs parts (invalide, >1$) ->
-                                        # cette vente d'urgence echouait TOUJOURS
-                                        # silencieusement, expliquant l'accumulation.
-                                        self._live.sell_position(
-                                            sell_token, sell_price, sell_shares
+                                        _fp_sold = self._sell_orphan(
+                                            sell_token, sell_shares,
+                                            f" {sym} {slug} {sell_side} FORCE-PAIR-ECHEC",
+                                            entry_price=sell_info.get("entry_price"),
+                                            symbol=sym, slug=slug, side=sell_side,
                                         )
                                     except Exception as e:
                                         self._log(f"⚠️ [FORCE-PAIR] vente echouee: {e}")
@@ -6672,7 +6780,25 @@ class MultiTrader:
                                         "rejected",
                                         loss_tag,
                                     )
-                                    mk["open"].pop(f"{slug}|{sell_side}", None)
+                                    # ZERO JAMBE NUE (Steven 05/08) : ne retirer de
+                                    # l'etat QUE ce qui est reellement solde. Sinon
+                                    # la jambe reste marquee a fermer et sera
+                                    # retentee a chaque cycle par _manage_orphans,
+                                    # au lieu de devenir un pari directionnel
+                                    # invisible (-32.98$ mesures sur 27.9h).
+                                    if _fp_sold >= sell_shares - 0.01:
+                                        mk["open"].pop(f"{slug}|{sell_side}", None)
+                                    else:
+                                        sell_info["filled_shares"] = round(
+                                            sell_shares - _fp_sold, 2
+                                        )
+                                        sell_info["strat"] = "orphan"
+                                        sell_info["must_close"] = True
+                                        self._log(
+                                            f"⚠️ [FORCE-PAIR] {sym} {slug} {sell_side} vente "
+                                            f"{_fp_sold}/{sell_shares} -> reste "
+                                            f"{sell_info['filled_shares']} parts MARQUEES A FERMER"
+                                        )
         # ORPHAN FIX (Laguna XS 25/07) : quand legs_held==1 depuis un tick
         # precedent, filled_legs est VIDE (la jambe existante est skippee par
         # _open_leg). On retente l'achat de la 2e jambe chaque tick avec prix
