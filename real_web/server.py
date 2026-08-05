@@ -550,40 +550,11 @@ def api_trades():
     )
 
 
-@app.route("/api/copy-analysis")
-def api_copy_analysis():
-    """ANALYSE COPY-TRADING (Steven 05/08, "inclu une fenetre dediee a
-    l'analyse copy dans dash").
-
-    Polymarket n'expose pas d'API de leaderboard publique (verifie : 404 sur
-    /leaderboard, /traders/leaderboard, /rankings). Steven trouve un wallet
-    interessant via l'UI Polymarket (leaderboard, profil d'un trader qu'il
-    observe) et le colle ici -- l'endpoint fait le meme travail de
-    reconstruction on-chain qu'on a fait ce soir sur SON propre wallet :
-    telecharge l'activite complete par pagination, ne garde que les marches
-    "updown-5m" (le terrain de jeu du bot), et sort EXACTEMENT les memes
-    metriques qui ont deja servi a diagnostiquer le bot cette nuit -- win
-    rate par tranche de prix (sans le biais de survie qui a fausse mes
-    premieres analyses : compte TOUS les achats, y compris ceux sans
-    redeem), taux d'usage de l'arb (paires vs jambes seules), et la bande
-    0.95-0.98 specifiquement (seule strategie directionnelle validee sur le
-    wallet de Steven) pour voir si ce trader la travaille aussi.
-
-    Lecture seule, aucune ecriture, aucun ordre. Le wallet est un parametre
-    utilisateur, jamais invente ni stocke."""
-    import re
+def _fetch_updown5m_events(wallet, max_pages, headers):
+    """Pagine data-api.polymarket.com/activity pour un wallet, ne garde que
+    les evenements sur les marches Up/Down 5min. Retourne (events, error)."""
     import requests
 
-    wallet = (request.args.get("wallet") or "").strip()
-    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", wallet):
-        return jsonify({"ok": False, "error": "adresse wallet invalide (attendu 0x + 40 hex)"}), 400
-
-    try:
-        max_pages = max(1, min(20, int(request.args.get("max_pages", 10))))
-    except (TypeError, ValueError):
-        max_pages = 10
-
-    headers = {"User-Agent": "Mozilla/5.0"}
     events = []
     seen = set()
     for off in range(0, max_pages * 500, 500):
@@ -596,36 +567,49 @@ def api_copy_analysis():
             )
             batch = r.json()
         except Exception as e:
-            return jsonify({"ok": False, "error": f"appel Polymarket echoue: {e}"}), 502
+            return None, f"appel Polymarket echoue: {e}"
         if not isinstance(batch, list) or not batch:
             break
         new = 0
         for a in batch:
+            if "updown-5m" not in (a.get("slug") or ""):
+                continue
             k = (a.get("transactionHash"), a.get("slug"), a.get("outcome"), a.get("timestamp"), a.get("size"), a.get("type"))
             if k in seen:
                 continue
             seen.add(k)
             events.append(a)
             new += 1
-        if new == 0:
+        if new == 0 and len(batch) < 500:
             break
+    return events, None
 
-    updown = [a for a in events if "updown-5m" in (a.get("slug") or "")]
-    if not updown:
-        return jsonify(
-            {
-                "ok": True,
-                "wallet": wallet,
-                "events_total": len(events),
-                "events_updown_5m": 0,
-                "message": "aucune activite sur les marches Up/Down 5min pour ce wallet",
-            }
-        )
 
+def _band_of(px):
+    for lo, hi, name in (
+        (0.0, 0.30, "0.00-0.30"),
+        (0.30, 0.50, "0.30-0.50"),
+        (0.50, 0.70, "0.50-0.70"),
+        (0.70, 0.85, "0.70-0.85"),
+        (0.85, 0.90, "0.85-0.90"),
+        (0.90, 0.95, "0.90-0.95"),
+        (0.95, 0.98, "0.95-0.98"),
+        (0.98, 1.01, "0.98-1.00"),
+    ):
+        if lo <= px < hi:
+            return name
+    return None
+
+
+def _analyze_updown5m(updown, min_band_n=3):
+    """Coeur d'analyse partage entre /api/copy-analysis et /api/copy-discover :
+    prend une liste d'evenements DEJA filtres sur updown-5m et sort les
+    metriques (bandes de prix, ROI, usage arb). Compte TOUS les achats, y
+    compris ceux sans redeem -- c'est le point qui evite le biais de survie
+    trouve deux fois sur l'analyse du wallet de Steven ce soir."""
     ts_all = [a["timestamp"] for a in updown if a.get("timestamp")]
     days_active = round((max(ts_all) - min(ts_all)) / 86400, 1) if ts_all else 0
 
-    # regroupe par jambe (slug, outcome) et par marche
     legs = {}
     sides_by_slug = {}
     redeem_by_slug = {}
@@ -637,29 +621,13 @@ def api_copy_analysis():
         if a.get("type") != "TRADE":
             continue
         k = (slug, a.get("outcome"))
-        e = legs.setdefault(k, {"buy_usd": 0.0, "buy_sh": 0.0, "sell_usd": 0.0, "prices": []})
+        e = legs.setdefault(k, {"buy_usd": 0.0, "buy_sh": 0.0, "sell_usd": 0.0})
         if a.get("side") == "BUY":
             e["buy_usd"] += a.get("usdcSize") or 0.0
             e["buy_sh"] += a.get("size") or 0.0
-            e["prices"].append(a.get("price"))
             sides_by_slug.setdefault(slug, set()).add(a.get("outcome"))
         else:
             e["sell_usd"] += a.get("usdcSize") or 0.0
-
-    def band_of(px):
-        for lo, hi, name in (
-            (0.0, 0.30, "0.00-0.30"),
-            (0.30, 0.50, "0.30-0.50"),
-            (0.50, 0.70, "0.50-0.70"),
-            (0.70, 0.85, "0.70-0.85"),
-            (0.85, 0.90, "0.85-0.90"),
-            (0.90, 0.95, "0.90-0.95"),
-            (0.95, 0.98, "0.95-0.98"),
-            (0.98, 1.01, "0.98-1.00"),
-        ):
-            if lo <= px < hi:
-                return name
-        return None
 
     bands = {}
     n_paired_legs = 0
@@ -682,7 +650,7 @@ def api_copy_analysis():
             n_paired_legs += 1
         else:
             n_solo_legs += 1
-        bname = band_of(avg_px)
+        bname = _band_of(avg_px)
         if bname is None:
             continue
         b = bands.setdefault(bname, {"n": 0, "win": 0, "cost": 0.0, "ret": 0.0, "n_solo": 0})
@@ -696,7 +664,7 @@ def api_copy_analysis():
     band_rows = []
     for name in ("0.00-0.30", "0.30-0.50", "0.50-0.70", "0.70-0.85", "0.85-0.90", "0.90-0.95", "0.95-0.98", "0.98-1.00"):
         b = bands.get(name)
-        if not b or b["n"] < 3:
+        if not b or b["n"] < min_band_n:
             continue
         band_rows.append(
             {
@@ -711,30 +679,167 @@ def api_copy_analysis():
 
     total_legs = n_paired_legs + n_solo_legs
     nc = bands.get("0.95-0.98")
+    return {
+        "events_updown_5m": len(updown),
+        "days_active": days_active,
+        "total_cost_usd": round(total_cost, 2),
+        "total_return_usd": round(total_return, 2),
+        "overall_roi_pct": round(100 * (total_return - total_cost) / total_cost, 1) if total_cost else None,
+        "arb_usage_pct": round(100 * n_paired_legs / total_legs, 1) if total_legs else None,
+        "bands": band_rows,
+        "near_cert_0_95_0_98": (
+            {
+                "n": nc["n"],
+                "win_rate_pct": round(100 * nc["win"] / nc["n"], 1),
+                "roi_pct": round(100 * (nc["ret"] - nc["cost"]) / nc["cost"], 1) if nc["cost"] else None,
+            }
+            if nc
+            else None
+        ),
+    }
 
-    return jsonify(
-        {
-            "ok": True,
-            "wallet": wallet,
-            "events_total": len(events),
-            "events_updown_5m": len(updown),
-            "days_active": days_active,
-            "total_cost_usd": round(total_cost, 2),
-            "total_return_usd": round(total_return, 2),
-            "overall_roi_pct": round(100 * (total_return - total_cost) / total_cost, 1) if total_cost else None,
-            "arb_usage_pct": round(100 * n_paired_legs / total_legs, 1) if total_legs else None,
-            "bands": band_rows,
-            "near_cert_0_95_0_98": (
-                {
-                    "n": nc["n"],
-                    "win_rate_pct": round(100 * nc["win"] / nc["n"], 1),
-                    "roi_pct": round(100 * (nc["ret"] - nc["cost"]) / nc["cost"], 1) if nc["cost"] else None,
-                }
-                if nc
-                else None
-            ),
-        }
-    )
+
+@app.route("/api/copy-analysis")
+def api_copy_analysis():
+    """ANALYSE COPY-TRADING (Steven 05/08, "inclu une fenetre dediee a
+    l'analyse copy dans dash").
+
+    Steven fournit un wallet (trouve via l'UI Polymarket, ou via
+    /api/copy-discover ci-dessous) -- l'endpoint fait le meme travail de
+    reconstruction on-chain qu'on a fait ce soir sur SON propre wallet :
+    telecharge l'activite complete par pagination, ne garde que les marches
+    "updown-5m" (le terrain de jeu du bot), et sort EXACTEMENT les memes
+    metriques qui ont deja servi a diagnostiquer le bot cette nuit.
+
+    Lecture seule, aucune ecriture, aucun ordre. Le wallet est un parametre
+    utilisateur, jamais invente ni stocke."""
+    import re
+
+    wallet = (request.args.get("wallet") or "").strip()
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", wallet):
+        return jsonify({"ok": False, "error": "adresse wallet invalide (attendu 0x + 40 hex)"}), 400
+
+    try:
+        max_pages = max(1, min(20, int(request.args.get("max_pages", 10))))
+    except (TypeError, ValueError):
+        max_pages = 10
+
+    updown, err = _fetch_updown5m_events(wallet, max_pages, {"User-Agent": "Mozilla/5.0"})
+    if err:
+        return jsonify({"ok": False, "error": err}), 502
+    events_seen_total = len(updown)  # deja filtre updown-only par _fetch_updown5m_events
+    if not updown:
+        return jsonify(
+            {
+                "ok": True,
+                "wallet": wallet,
+                "events_total": events_seen_total,
+                "events_updown_5m": 0,
+                "message": "aucune activite sur les marches Up/Down 5min pour ce wallet",
+            }
+        )
+    result = _analyze_updown5m(updown)
+    result.update({"ok": True, "wallet": wallet, "events_total": events_seen_total})
+    return jsonify(result)
+
+
+_copy_discover_cache = {"ts": 0.0, "data": None}
+COPY_DISCOVER_TTL = 900  # 15min : le classement d'une session de scan ne bouge pas vite
+
+
+@app.route("/api/copy-discover")
+def api_copy_discover():
+    """DECOUVERTE DE TRADERS 5MIN CRYPTO (Steven 05/08, "pour voir le
+    leaderboard faut utiliser une cle je crois mais on peut y acceder").
+
+    Verifie : lb-api.polymarket.com/profit repond SANS cle -- l'echec
+    precedent venait d'un mauvais chemin d'URL (/leaderboard au lieu de
+    /profit, deja utilise par core/copytrade.py). MAIS ce leaderboard est
+    GLOBAL (tous marches confondus) : teste sur les 40 premiers traders 7j,
+    1 SEUL touchait meme un peu au 5min crypto (5 evenements sur 500). Les
+    gros traders du leaderboard general font leur volume sur sport/politique,
+    pas sur cette niche -- le leaderboard global est donc inutile ici.
+
+    Mecanisme retenu : data-api.polymarket.com/trades?market=<conditionId>
+    liste TOUS les traders d'un marche donne, sans cle (verifie : 148
+    wallets distincts sur un seul marche BTC 5min de 200 trades). On
+    echantillonne plusieurs marches 5min recents (plusieurs symboles), on
+    collecte les wallets les plus actifs dessus, puis on lance sur chacun la
+    meme analyse que /api/copy-analysis (courte : peu de pages) pour ne
+    garder que ceux avec un ROI positif et un echantillon suffisant.
+
+    Resultat mis en cache 15min : scanner reste couteux (dizaines d'appels
+    Polymarket), pas quelque chose a refaire a chaque chargement de page."""
+    import requests
+
+    now = time.time()
+    force = request.args.get("refresh") == "1"
+    if not force and _copy_discover_cache["data"] and (now - _copy_discover_cache["ts"] < COPY_DISCOVER_TTL):
+        cached = dict(_copy_discover_cache["data"])
+        cached["cached"] = True
+        cached["cache_age_s"] = round(now - _copy_discover_cache["ts"])
+        return jsonify(cached)
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    syms = ["btc", "eth", "sol", "xrp", "doge"]
+    base = int(now // 300) * 300
+    wallet_freq = {}
+    markets_scanned = 0
+    for sym in syms:
+        for off in (-300, -600, -900):
+            slug = f"{sym}-updown-5m-{base + off}"
+            try:
+                m = requests.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params={"slug": slug}, headers=headers, timeout=15,
+                ).json()
+            except Exception:
+                continue
+            mk = m[0] if isinstance(m, list) and m else None
+            cid = mk.get("conditionId") if mk else None
+            if not cid:
+                continue
+            try:
+                trs = requests.get(
+                    "https://data-api.polymarket.com/trades",
+                    params={"market": cid, "limit": 200}, headers=headers, timeout=15,
+                ).json()
+            except Exception:
+                continue
+            if not isinstance(trs, list):
+                continue
+            markets_scanned += 1
+            for t in trs:
+                w = t.get("proxyWallet")
+                if w:
+                    wallet_freq[w] = wallet_freq.get(w, 0) + 1
+
+    # les plus actifs d'abord : plus de signal, moins d'appels gaspilles sur
+    # des wallets qui n'ont fait qu'un trade de passage
+    candidates = sorted(wallet_freq.items(), key=lambda kv: -kv[1])[:25]
+
+    results = []
+    for wallet, freq in candidates:
+        updown, err = _fetch_updown5m_events(wallet, max_pages=2, headers=headers)
+        if err or not updown:
+            continue
+        an = _analyze_updown5m(updown, min_band_n=1)
+        if an["total_cost_usd"] < 20 or an["overall_roi_pct"] is None:
+            continue  # echantillon trop petit pour juger
+        results.append({"wallet": wallet, "trades_seen_in_scan": freq, **an})
+
+    results.sort(key=lambda r: -(r["overall_roi_pct"] or -999))
+    payload = {
+        "ok": True,
+        "markets_scanned": markets_scanned,
+        "wallets_seen": len(wallet_freq),
+        "wallets_analyzed": len(candidates),
+        "candidates": results[:15],
+        "cached": False,
+    }
+    _copy_discover_cache["ts"] = now
+    _copy_discover_cache["data"] = payload
+    return jsonify(payload)
 
 
 @app.route("/api/arb-quality")
