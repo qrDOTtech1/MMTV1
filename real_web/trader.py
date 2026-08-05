@@ -659,6 +659,25 @@ TIER_SIZE_ULTRA = 2.00  # $ par jambe (marche ultra liquide + edge > 15%)
 # capital dort : on scale la taille sur le capital dispo, PLANCHER a
 # MIN_ORDER_SIZE_SHARES (5 parts), tant que combined < INSTANT_ARB_MAX_COMBINED.
 INSTANT_ARB_MAX_COMBINED = 0.99  # au-dela : pas assez de marge garantie
+# ── PLAFOND DE COMPLETION D'UNE PAIRE (Steven 05/08) ────────────────────
+# S'applique a TOUS les chemins qui completent une paire deja entamee
+# (FORCE-PAIR, ORPHAN-PAIR, HEDGE-NEAR). Avant, ces chemins toleraient un
+# combined de 1.02 -- voire AUCUN plafond du tout pour HEDGE-NEAR, qui
+# calculait combined_h, le loggait, et ne s'en servait jamais.
+# Or completer a combined >= 1.00, c'est payer plus de 1$ pour recevoir
+# exactement 1$ : une perte GARANTIE, pas une couverture.
+# Mesure on-chain sur 27.9h (67 paires) :
+#   - combined NOMINAL median (somme des 2 prix)      : 1.032
+#   - combined EFFECTIF median (paye / payout garanti): 1.325
+#   - 55 paires sur 67 achetees a perte garantie, dont 36 au-dessus de 1.20
+# La justification historique ("mieux vaut combined 1.05 qu'un pari nu")
+# ne tient pas a l'examen : quand l'autre cote coute 0.95, completer et
+# solder la jambe coutent EXACTEMENT la meme chose (marche efficient), mais
+# completer immobilise en plus le prix de la 2e jambe. Sur un bankroll de
+# quelques dollars, ce capital immobilise est ce qui empeche de prendre le
+# vrai arb suivant. On complete donc UNIQUEMENT si ca verrouille vraiment ;
+# sinon la jambe part en must_close (cf. "zero jambe nue").
+PAIR_COMPLETION_MAX_COMBINED = 0.99
 # GROSSE MISE SUR RISK-FREE (Steven 29/07, "je veux grosse mise sur les arb
 # risk free") : contrairement au directionnel, l'arb garanti (2 jambes achetees
 # EN MEME TEMPS, profit fige quel que soit le resultat) n'expose PAS a un
@@ -6679,10 +6698,12 @@ class MultiTrader:
             acted = acted or ok
         # FIX 23/07 : si jambe 1 remplie mais jambe 2 ratee, FORCER jambe 2
         # MACHINE A POGNON (Laguna XS 25/07) : on attend que Leg2 baisse assez
-        # pour que combined <= 1.02. Si ca echoue -> ON VEND PAS, on attend.
+        # pour que combined < PAIR_COMPLETION_MAX_COMBINED (0.99). Si ca echoue
         # La fenetre de 5min oscille: Leg2 finit par baisser a un moment.
         # HEDGE-NEAR-RESOLUTION rattrape tout a <30s si Leg2 n'est jamais
-        # devenue assez pas chere. max_payable = 1.02 - fill_price.
+        # devenue assez pas chere. max_payable = 0.99 - fill_price (Steven 05/08 :
+        # etait 1.02, soit une perte garantie -- on ne complete plus qu'un
+        # verrou reel, cf. PAIR_COMPLETION_MAX_COMBINED).
         if filled_legs and failed_legs and secs_left > 5:
             for side, token_id in failed_legs:
                 fill_price = None
@@ -6696,7 +6717,9 @@ class MultiTrader:
                         _leg1_shares = leg_info.get("filled_shares")
                         break
                 if fill_price is not None:
-                    max_payable = round(max(0.05, 1.02 - fill_price), 3)
+                    max_payable = round(
+                        max(0.05, PAIR_COMPLETION_MAX_COMBINED - fill_price), 3
+                    )
                 else:
                     max_payable = 0.50
                 tag_force = f"[FORCE-PAIR {secs_left:.0f}s]"
@@ -6885,7 +6908,7 @@ class MultiTrader:
         # precedent, filled_legs est VIDE (la jambe existante est skippee par
         # _open_leg). On retente l'achat de la 2e jambe chaque tick avec prix
         # frais (WS temps reel). ON VEND PAS — on attend que Leg2 baisse.
-        # max_payable = 1.02 - fill_price. Si ca echoue, le prochain tick
+        # max_payable = 0.99 - fill_price (Steven 05/08). Si ca echoue, le tick
         # retentera. HEDGE-NEAR-RESOLUTION rattrape a <30s.
         if not filled_legs and legs_held == 1 and secs_left > 5:
             for side_o, token_id_o in zip(outcomes, token_ids):
@@ -6898,7 +6921,9 @@ class MultiTrader:
                             owned_info.get("entry_price") if owned_info else None
                         )
                         if fill_price is not None:
-                            max_payable = round(max(0.05, 1.02 - fill_price), 3)
+                            max_payable = round(
+                        max(0.05, PAIR_COMPLETION_MAX_COMBINED - fill_price), 3
+                    )
                         else:
                             max_payable = 0.50
                         tag_orphan = f"[ORPHAN-FIX {secs_left:.0f}s]"
@@ -6988,6 +7013,22 @@ class MultiTrader:
                                 f"@ {ask_h:.3f} (owned={owned_side_h[0]}@{entry_h:.3f} "
                                 f"comb={combined_h:.3f} secs={secs_left:.0f})"
                             )
+                            # PLAFOND (Steven 05/08) : combined_h etait calcule
+                            # et logge mais JAMAIS teste -> ce chemin achetait
+                            # la 2e jambe a n'importe quel prix, y compris a
+                            # perte garantie. Principal producteur des paires
+                            # a combined effectif 1.20-2.00 mesurees on-chain.
+                            if combined_h >= PAIR_COMPLETION_MAX_COMBINED:
+                                _owned_pos = owned_info_h
+                                if _owned_pos is not None:
+                                    _owned_pos["strat"] = "orphan"
+                                    _owned_pos["must_close"] = True
+                                self._log(
+                                    f"⛔ [HEDGE-NEAR] {sym} {slug} comb={combined_h:.3f} >= "
+                                    f"{PAIR_COMPLETION_MAX_COMBINED} -> completer serait une perte "
+                                    f"GARANTIE : jambe {owned_side_h[0]} marquee A FERMER"
+                                )
+                                continue
                             ok_h, _ = self._open_leg(
                                 sym,
                                 mode,
@@ -6998,6 +7039,11 @@ class MultiTrader:
                                 ask_h + 0.02,
                                 "[HEDGE-NEAR]",
                                 force=True,
+                                target_shares=(
+                                    round(owned_info_h.get("filled_shares"), 2)
+                                    if owned_info_h and owned_info_h.get("filled_shares")
+                                    else None
+                                ),
                             )
                             if ok_h:
                                 self._log(
