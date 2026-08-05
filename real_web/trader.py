@@ -809,6 +809,26 @@ BINANCE_CONFIRM_MARGIN = 0.001
 # consommer du capital utile aux arbs verrouilles, seuls +EV par arithmetique.
 # A reactiver si (et seulement si) une mesure montre un edge du filtre
 # Binance strict a l'entree -- ce qui reste non teste a ce jour.
+# ── NEAR-CERTAIN (Steven 05/08) : la SEULE strategie directionnelle que
+# l'historique valide. Verifie sur 24.6 jours / 1718 jambes / 4545$ engages,
+# en comptant TOUS les achats (y compris les marches sans redeem, donc sans
+# le biais de survie qui avait fausse mes analyses precedentes) :
+#     prix 0.90-0.95 :  80 jambes, WR 72%, ROI -16.6%
+#     prix 0.95-0.98 : 182 jambes, WR 95%, ROI  +1.6%   <-- la seule positive
+#     prix 0.98-1.00 :  31 jambes, WR 84%, ROI  -4.7%
+# La regle qui explique tout : sur un marche binaire, acheter a un prix p
+# n'est gagnant que si le taux de reussite depasse p. A 0.96 il faut plus de
+# 96% -- c'est atteint (95% mesure, plus le filtre Binance ci-dessous). A
+# 0.925 il faudrait 92.5% et on n'en fait que 72% : d'ou le -16.6%.
+# La bande est donc VOLONTAIREMENT etroite. L'elargir vers le bas detruit
+# l'edge, l'elargir vers le haut fait payer 99c pour en gagner 1.
+NEARCERT_ENABLED = True
+NEARCERT_MIN_PRICE = 0.95
+NEARCERT_MAX_PRICE = 0.98
+NEARCERT_MAX_SECS = 120   # tard dans la fenetre = issue deja largement jouee
+NEARCERT_MIN_SECS = 8
+NEARCERT_BUDGET_USD = 2.0
+
 FAV_ENABLED = False
 FAV_MIN_PRICE = 0.70
 FAV_MAX_PRICE = 0.85
@@ -3398,6 +3418,97 @@ class MultiTrader:
         elif secs_left > 120:
             mult *= 1.08
         return round(base_stop * mult, 3)
+
+    def _try_near_certain(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+        """NEAR-CERTAIN : achat d'un cote quasi-acquis, tard dans la fenetre.
+
+        Seule strategie directionnelle que l'historique valide (cf. les
+        constantes NEARCERT_*) : 182 jambes a 0.95-0.98, 95% de reussite,
+        +1.6% de ROI -- mesure SANS biais de survie. Les bandes voisines
+        perdent (-16.6% en 0.90-0.95, -4.7% au-dessus de 0.98), la fenetre de
+        prix est donc etroite par necessite, pas par prudence.
+
+        L'edge est MINCE (+1.6%). Il ne survit que si on ne paie pas plus cher
+        que la bande et qu'on ne le dilue pas : mise fixe, une seule tentative
+        par fenetre, et confirmation Binance exigee en plus du prix."""
+        from core.btc_updown import _binance_price, _strike_at
+
+        if not NEARCERT_ENABLED or mode != "real":
+            return False
+        now = synced_now()
+        secs_left = p.get("end_ts", now) - now
+        if not (NEARCERT_MIN_SECS <= secs_left <= NEARCERT_MAX_SECS):
+            return False
+        if mk.setdefault("nc_tried", {}).get(slug):
+            return False
+        if any(k.startswith(f"{slug}|") for k in mk["open"]):
+            return False
+        # le cote quasi-acquis = celui dont l'ask est dans la bande
+        cand = None
+        for side in outcomes:
+            _, ask, _ = quotes.get(side, (None, None, None))
+            if ask is not None and NEARCERT_MIN_PRICE <= ask <= NEARCERT_MAX_PRICE:
+                cand = (side, ask)
+                break
+        if not cand:
+            return False
+        side, ask = cand
+        # Binance doit CONFIRMER : le prix seul ne suffit pas, c'est ce qui
+        # separe cette bande (95% de reussite) de la bande d'en dessous (72%).
+        pair = p.get("pair")
+        if pair:
+            spot = _binance_price(pair)
+            strike = _strike_at(pair, p.get("start_ts"), slug=slug)
+            if spot is None or strike is None:
+                return False
+            gap = abs(spot - strike)
+            if gap < spot * BINANCE_CONFIRM_MARGIN:
+                return False
+            if ("Up" if spot > strike else "Down") != side:
+                self._tlog(
+                    f"ncconflict_{sym}",
+                    f"🌫️ [NEAR-CERTAIN] {sym} {slug} marche donne {side} @ {ask:.3f} "
+                    f"mais Binance dit l'inverse -> on s'abstient",
+                )
+                return False
+        cash, _ = self._read_cash(max_age=0)
+        if cash is None:
+            return False
+        investable = max(0.0, cash - self.floor())
+        budget = round(min(NEARCERT_BUDGET_USD, investable), 2)
+        budget = max(budget, round(MIN_SELL_SHARES * ask, 2))
+        if budget > investable or budget < MIN_BUDGET_USD:
+            return False
+        ok_exp, why_exp = self._exposure_ok(sym, mk, slug, budget)
+        if not ok_exp:
+            return False
+        mk["nc_tried"][slug] = time.time()
+        tid = token_ids[outcomes.index(side)]
+        self._log(
+            f"🎯 [NEAR-CERTAIN] {sym} {slug} {side} @ {ask:.3f} budget={budget:.2f}$ "
+            f"({secs_left:.0f}s restantes, Binance confirme) -> bande 0.95-0.98 "
+            f"(95% de reussite mesuree sur 182 jambes)"
+        )
+        with self._order_lock:
+            res = self._live.snipe_buy_market(tid, round(min(0.99, ask + 0.01), 2), budget)
+        filled = res.get("filled_shares", 0.0)
+        if filled <= 0:
+            self._log(f"⚠️ [NEAR-CERTAIN] {sym} {slug} {side} non rempli ({res.get('error', '')})")
+            return False
+        avg = res.get("avg_cost") or ask
+        self._add_slug_spent(mk, slug, round(filled * avg, 2))
+        mk["open"][f"{slug}|{side}"] = {
+            "symbol": sym, "slug": slug, "side": side, "mode": "real",
+            "strat": "nearcert", "token_id": tid, "entry_price": avg,
+            "filled_shares": filled, "cost": round(filled * avg, 2),
+            "start_ts": p["start_ts"], "pair": pair, "end_ts": p["end_ts"],
+            "opened_ts": time.time(), "buffer": 0.0,
+        }
+        self._log(
+            f"✅ [NEAR-CERTAIN] {sym} {slug} {side} {filled} parts @ {avg:.3f} "
+            f"({round(filled * avg, 2)}$) -> ouverte, TP/SL actifs"
+        )
+        return True
 
     def _try_favorite(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
         """PARI DIRECTIONNEL SUR LE FAVORI (Steven 05/08, demande explicite).
@@ -6807,7 +6918,10 @@ class MultiTrader:
                     # cher ET que Binance le donne gagnant NETTEMENT, on tente
                     # une petite mise directionnelle assumee, geree en TP/SL.
                     # Voir les constantes FAV_* pour ce que disent les donnees.
-                    self._try_favorite(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug)
+                    # NEAR-CERTAIN d'abord (seule strategie directionnelle
+                    # validee par l'historique), FAV ensuite (desactive).
+                    if not self._try_near_certain(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+                        self._try_favorite(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug)
                     return legs_held > 0
                 in_cd, cd_reason = self._in_cooldown(sym, slug, mk)
                 if in_cd:
@@ -7978,7 +8092,7 @@ class MultiTrader:
             # DOIT etre gere ici, c'est toute sa raison d'etre. Sans ca il
             # serait skippe et tiendrait jusqu'a resolution sans TP ni SL --
             # exactement le bug qu'on a corrige partout ailleurs aujourd'hui.
-            if pos.get("strat") not in ("bothside", "swing", "fav"):
+            if pos.get("strat") not in ("bothside", "swing", "fav", "nearcert"):
                 continue
             # RISK-FREE : NE JAMAIS GERER INDIVIDUELLEMENT (Steven 29/07, bug
             # trouve en prod : une paire d'arb garanti a comb=0.93 (edge 7%,
