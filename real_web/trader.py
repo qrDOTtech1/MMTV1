@@ -853,7 +853,13 @@ BINANCE_CONFIRM_MARGIN = 0.001
 #    que toutes les autres positions (ajoute au filtre de
 #    _manage_pnl_tier_exits, meme piege deja rencontre avec "fav"/"nearcert") ;
 #  - plafonds habituels : exposition/marche, plancher de cash, MIN_BUDGET_USD.
-COPY_TRADE_ENABLED = False
+#
+# LEVE (Steven 05/08, "bah le mieux c'est tester en reel hein") : garde
+# module retiree. Deuxieme verrou toujours en place et volontaire : le
+# mecanisme reste inerte tant que Steven n'a pas suivi au moins un wallet et
+# active le toggle depuis le dashboard (self.state["copy_trade"]["enabled"]) --
+# je ne choisis pas le wallet ni ne clique le toggle a sa place.
+COPY_TRADE_ENABLED = True
 COPY_TRADE_POLL_S = 5              # frequence de sondage de l'activite source
 COPY_TRADE_BUDGET_USD = 1.5        # mise FIXE, jamais proportionnelle au trade source
 COPY_TRADE_MAX_STALE_SECS = 15     # au-dela : le prix a trop bouge, on ignore
