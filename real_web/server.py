@@ -550,6 +550,113 @@ def api_trades():
     )
 
 
+@app.route("/api/arb-quality")
+def api_arb_quality():
+    """QUALITE DES PAIRES D'ARB (Steven 05/08).
+
+    Le PnL seul ne dit pas SI une paire etait un vrai arb. Cet endpoint
+    mesure ce qui compte reellement, par paire :
+      - combined NOMINAL  = somme des prix d'entree des 2 jambes
+      - combined EFFECTIF = cout total / payout du pire cas
+        (le gagnant paie 1$ PAR PART, donc le pire cas vaut min(parts))
+      - verrouillee       = payout du pire cas > cout total
+      - desequilibre      = max(parts)/min(parts), 1.0 = parfait
+
+    L'ecart entre nominal et effectif isole exactement ce que coute un
+    mauvais sizing : mesure sur l'historique on-chain du 05/08, median
+    nominal 1.032 contre effectif 1.325, soit +0.293 de perte imputable au
+    seul desequilibre de parts."""
+    pairs = {}
+    state = trader.state
+    for sym, mk in state.get("markets", {}).items():
+        rows = list(mk.get("trades", [])) + list(mk.get("open", {}).values())
+        for t in rows:
+            slug = t.get("slug")
+            side = t.get("side")
+            if not slug or not side or side == "ARB":
+                continue
+            if t.get("mode") != "real":
+                continue
+            sh = t.get("filled_shares") or 0
+            if sh <= 0:
+                continue
+            p = pairs.setdefault(
+                slug, {"slug": slug, "symbol": sym, "legs": {}, "opened_ts": t.get("opened_ts")}
+            )
+            leg = p["legs"].setdefault(side, {"shares": 0.0, "cost": 0.0})
+            leg["shares"] += sh
+            leg["cost"] += t.get("cost") or (sh * (t.get("entry_price") or 0))
+            if t.get("is_risk_free"):
+                p["tagged_risk_free"] = True
+            if t.get("arb_locked") is not None:
+                p["arb_locked_flag"] = t.get("arb_locked")
+
+    out = []
+    for slug, p in pairs.items():
+        legs = p["legs"]
+        if len(legs) != 2:
+            continue
+        (s1, l1), (s2, l2) = list(legs.items())
+        worst = min(l1["shares"], l2["shares"])
+        cost = l1["cost"] + l2["cost"]
+        if worst <= 0 or cost <= 0:
+            continue
+        px1 = l1["cost"] / l1["shares"] if l1["shares"] else 0
+        px2 = l2["cost"] / l2["shares"] if l2["shares"] else 0
+        out.append(
+            {
+                "slug": slug,
+                "symbol": p["symbol"],
+                "opened_ts": p.get("opened_ts"),
+                "combined_nominal": round(px1 + px2, 4),
+                "combined_effective": round(cost / worst, 4),
+                "locked": worst > cost,
+                "lock_margin": round(worst - cost, 3),
+                "imbalance": round(
+                    max(l1["shares"], l2["shares"]) / min(l1["shares"], l2["shares"]), 3
+                )
+                if min(l1["shares"], l2["shares"]) > 0
+                else None,
+                "cost": round(cost, 2),
+                "worst_payout": round(worst, 2),
+                "tagged_risk_free": bool(p.get("tagged_risk_free")),
+            }
+        )
+
+    out.sort(key=lambda r: r.get("opened_ts") or 0, reverse=True)
+    n = len(out)
+    nlock = sum(1 for r in out if r["locked"])
+
+    def _median(vals):
+        v = sorted(x for x in vals if x is not None)
+        if not v:
+            return None
+        mid = len(v) // 2
+        return round(v[mid] if len(v) % 2 else (v[mid - 1] + v[mid]) / 2, 4)
+
+    # Incoherence a surveiller : paire tagguee risk-free alors qu'elle n'est
+    # PAS verrouillee -> elle serait exemptee de TP/SL sans raison.
+    mislabeled = [r for r in out if r["tagged_risk_free"] and not r["locked"]]
+    return jsonify(
+        {
+            "ok": True,
+            "pairs": out[:200],
+            "summary": {
+                "total_pairs": n,
+                "locked_pairs": nlock,
+                "lock_rate_pct": round(100 * nlock / n, 1) if n else None,
+                "median_combined_nominal": _median([r["combined_nominal"] for r in out]),
+                "median_combined_effective": _median([r["combined_effective"] for r in out]),
+                "median_imbalance": _median([r["imbalance"] for r in out]),
+                "mislabeled_risk_free": len(mislabeled),
+                "guaranteed_margin_total": round(
+                    sum(r["lock_margin"] for r in out if r["locked"]), 2
+                ),
+            },
+        }
+    )
+
+
 @app.route("/api/history-summary")
 def api_history_summary():
     """Resume par HEURE sur plusieurs heures (Steven 05/08, 'il faut que tu
