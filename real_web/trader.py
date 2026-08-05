@@ -5840,17 +5840,13 @@ class MultiTrader:
                         del slot[old]
             return bool(ok)
 
-        # ── FAVORITE DETECTION (Steven 28/07, refonte 05/08) : Binance N'ETAIT
-        # utilise QUE comme signal principal, Polymarket seulement en repli si
-        # Binance echouait -> Steven : "on regarde les prix poly autant que
-        # binance ... bien les 2 en meme temps". Desormais les DEUX signaux
-        # sont TOUJOURS calcules, et le favori n'est retenu QUE s'ils sont
-        # D'ACCORD (meme cote favori). S'ils se contredisent (Binance dit Up
-        # mais Polymarket cote Down plus cher, ou l'inverse), on ne privilegie
-        # AUCUN cote -> pas de FAVORITE_BUDGET_MULT applique ce cycle, plutot
-        # que de trancher a l'aveugle entre 2 signaux qui divergent. Utilise
-        # pour : FIRST-LEG (achat favori en 1er), FAVORITE-BUDGET (mise 2.5x),
-        # max_entry (favori achetable a tout prix).
+        # ── FAVORITE DETECTION (Steven 28/07, desaccord retire 05/08 sur
+        # instruction directe : "retire COMPLETEMENT desaccord de risk free")
+        # : priorite Binance (spot vs strike), repli Polymarket (cote le plus
+        # cher) si Binance indisponible -- jamais de blocage/neutralisation
+        # sur desaccord entre les 2 signaux. Utilise pour : FIRST-LEG (achat
+        # favori en 1er), FAVORITE-BUDGET (mise 2.5x), max_entry (favori
+        # achetable a tout prix), et l'ordre d'envoi des jambes en arb.
         from core.btc_updown import _binance_price as _bp
         _fav_binance = None
         try:
@@ -5863,32 +5859,8 @@ class MultiTrader:
         _fav_prices = [(s, a) for s, (_, a, _) in zip(outcomes, [quotes.get(s, (None, None, None)) for s in outcomes]) if a is not None]
         if len(_fav_prices) == 2:
             _fav_poly = max(_fav_prices, key=lambda x: x[1])[0]
-        if _fav_binance is not None and _fav_poly is not None:
-            fav_side = _fav_binance if _fav_binance == _fav_poly else None
-            if fav_side is None:
-                self._tlog(
-                    f"fav_disagree_{sym}",
-                    f"⚖️ [FAVORI-DESACCORD] {sym} {slug} Binance={_fav_binance} "
-                    f"vs Polymarket={_fav_poly} -> pas de favori ce cycle, "
-                    f"budget neutre sur les 2 jambes",
-                    every=10.0,
-                )
-        else:
-            # un seul signal dispo (l'autre API/donnee indisponible) -> on le
-            # prend quand meme plutot que de rester totalement aveugle.
-            fav_side = _fav_binance if _fav_binance is not None else _fav_poly
-        # FAV POUR ORDRE D'ENVOI ARB GARANTI (Steven 05/08, "retire favoris
-        # desaccord de risk free") : le fav_side ci-dessus (accord requis)
-        # reste utilise pour le SIZING (FAVORITE_BUDGET_MULT, hedge favori/
-        # underdog risque -- la ou se tromper de sens coute cher, l'accord
-        # des 2 signaux reste justifie). Mais pour l'ARB GARANTI (2 jambes
-        # combinees < seuil, profit deja verrouille quel que soit le sens),
-        # ce favori ne sert QUE a decider quel ordre poster en 1er -- si une
-        # seule jambe se remplit malgre tout, autant que ce soit la plus
-        # probable des DEUX signaux, meme en desaccord, plutot qu'aucune
-        # preference du tout. Priorite Binance (plus rapide/frais), repli
-        # Polymarket si Binance indispo -- jamais bloque par un desaccord.
-        fav_side_ordering = _fav_binance if _fav_binance is not None else _fav_poly
+        fav_side = _fav_binance if _fav_binance is not None else _fav_poly
+        fav_side_ordering = fav_side
         # ── mode INDEPENDANT (legacy) ──
         combined = None  # V3.1 : init pour eviter UnboundLocalError
         force_hedge = legs_held == 1 and secs_left <= BOTH_SIDE_FORCE_HEDGE_SECS_LEFT
