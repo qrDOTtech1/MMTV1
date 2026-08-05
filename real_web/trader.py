@@ -723,6 +723,15 @@ PAIR_COMPLETION_HEDGE_MAX = 1.03
 # la detection "jambe gagnante" est heuristique (rapprochement du montant
 # du redeem au nombre de parts) -- tendance nette sur 3 tranches
 # consecutives, pas une preuve definitive.
+# DESACTIVE (Steven 05/08, meme raison que FAV_ENABLED). Ce mecanisme a ete
+# construit sur la table d'esperance BIAISEE (elle excluait 29% de
+# l'echantillon -- les jambes revendues avant resolution, donc les
+# perdantes). Une fois le biais corrige, la bande 0.50-0.80 n'est plus
+# gagnante mais a l'equilibre (+1% / -3% / -2%). La regle de declenchement
+# de Steven reste juste (apres un SL on est bien directionnel, le verrou est
+# deja entame) -- c'est la rentabilite du renfort qui n'est pas etablie.
+# Code conserve intact, reactivable en passant ce drapeau a True.
+REINFORCE_ENABLED = False
 REINFORCE_MIN_PRICE = 0.50   # sous ce prix : pas de confirmation du marche
 REINFORCE_MAX_PRICE = 0.80   # au-dela : esperance negative (mesure)
 REINFORCE_MIN_SECS = 20      # trop tard pour ressortir si ca tourne
@@ -788,6 +797,19 @@ BINANCE_CONFIRM_MARGIN = 0.001
 #     15 ;
 #   - une taille volontairement modeste (pas de FAVORITE_BUDGET_MULT ici) ;
 #   - strat="fav" -> JAMAIS is_risk_free, donc toujours gere en TP/SL.
+# DESACTIVE (Steven 05/08, apres mesure). Le mecanisme reste entierement en
+# place et reactivable en passant ce drapeau a True, mais rien ne le justifie
+# aujourd'hui : la decomposition des 554$ engages montre que nos ENTREES sont
+# deja neutres (+0.2% de ROI sur les marches resolus, 48% de reussite) et que
+# 98% de la perte totale (-89$ sur -91$) vient des marches ou l'on finissait
+# par ne detenir QUE des perdants. Le probleme n'a jamais ete le choix du
+# cote -- l'inversion complete a d'ailleurs ete testee et donne -6.9% contre
+# +0.2%. Ajouter un pari directionnel de plus, sur une tranche de prix qui
+# affiche -2% (0.70-0.80) a -20% (0.80-0.90) de ROI historique, ne ferait que
+# consommer du capital utile aux arbs verrouilles, seuls +EV par arithmetique.
+# A reactiver si (et seulement si) une mesure montre un edge du filtre
+# Binance strict a l'entree -- ce qui reste non teste a ce jour.
+FAV_ENABLED = False
 FAV_MIN_PRICE = 0.70
 FAV_MAX_PRICE = 0.85
 FAV_BINANCE_MARGIN = 0.0025   # 0.25% = signal "clair", pas juste "devant"
@@ -3356,6 +3378,8 @@ class MultiTrader:
         mesurer, pas un edge etabli -- d'ou la taille volontairement petite."""
         from core.btc_updown import _binance_price, _strike_at
 
+        if not FAV_ENABLED:
+            return False
         if mode != "real":
             return False
         now = synced_now()
@@ -3461,6 +3485,8 @@ class MultiTrader:
         habituels (exposition par marche, plancher de cash)."""
         from core.btc_updown import _binance_price, _strike_at
 
+        if not REINFORCE_ENABLED:
+            return
         mk = self.state["markets"][sym]
         if self.state["modes"].get(sym) != "real":
             return
