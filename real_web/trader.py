@@ -3396,13 +3396,14 @@ class MultiTrader:
                 continue
             # perdant (ou signal indisponible) -> vente par paliers adaptees au momentum
             shares = pos["filled_shares"]
-            if shares < MIN_ORDER_SIZE_SHARES:
-                self._tlog(
-                    f"orph_{key}",
-                    f"🦺 [ORPHAN] {sym} {pos['slug']} {pos['side']} {shares} parts "
-                    f"< min CLOB -> invendable, hold force",
-                )
+            if shares <= 0:
                 continue
+            # RETRAIT DU SKIP "< min CLOB" (Steven 05/08) : le plancher
+            # MIN_ORDER_SIZE_SHARES est une regle d'ACHAT, pas de vente --
+            # vendre TOUT ce qu'on detient (meme sous 5 parts) fonctionne
+            # cote Polymarket (confirme par l'UI + un ancien comportement
+            # du bot sur des trades a 1$). En dessous du plancher, la
+            # logique plus bas force deja sell_n=shares (fin_fenetre).
             # VENTE MOMENTUM (Steven 25/07) : le fraction vendu depend du signal Binance
             # - momentum CONFIRME perte (fast+slow meme sens negatif) -> 70% (agressif)
             # - momentum MIXTE (pas de confirmation) -> 30% (conservateur, en cas de rebond)
@@ -3507,7 +3508,7 @@ class MultiTrader:
             if secs_left > _arb_sl_secs or secs_left <= 3:
                 continue
             shares = pos["filled_shares"]
-            if shares < MIN_ORDER_SIZE_SHARES:
+            if shares <= 0:
                 continue
             _book = self._live.get_book_sync(pos["token_id"])
             _bid = _book["bids"][0][0] if _book and _book.get("bids") else None
@@ -7102,7 +7103,7 @@ class MultiTrader:
                                     _spread = _other_pnl - _own_pnl
                                     if _spread > SPREAD_EXIT_THRESHOLD:
                                         _shares = pos.get("filled_shares", 0)
-                                        if _shares >= MIN_ORDER_SIZE_SHARES:
+                                        if _shares > 0:
                                             _bid = self._get_bid(pos)
                                             if _bid is None:
                                                 continue
@@ -7160,8 +7161,19 @@ class MultiTrader:
                 peak_pct = pnl_pct
 
             shares = pos.get("filled_shares", 0)
-            if shares < MIN_ORDER_SIZE_SHARES:
+            if shares <= 0:
                 continue
+            # RETRAIT DU SKIP MIN_ORDER_SIZE_SHARES (Steven 05/08, preuve
+            # directe : "je peux vendre 25/50/75/100% quand je veux" via
+            # l'UI Polymarket, + une ancienne version du bot faisait deja
+            # du palier sur des trades a 1$/sous 5 parts). Ce plancher est
+            # une regle d'ACHAT (taille minimum d'un nouvel ordre), pas de
+            # VENTE (fermer une position existante n'a pas cette contrainte
+            # cote Polymarket) -- le skip ici excluait A TORT toute gestion
+            # TP/SL/trailing sur les positions sous 5 parts (bug trouve en
+            # live : jambe a 2.78 parts, peak +168%, jamais prise). La
+            # logique plus bas (ligne ~7354, "sell_shares < MIN -> vend
+            # tout") gere deja correctement la vente en dessous du plancher.
 
             # Auto-init pour les positions ouvertes avant V3.2
             if "init_shares" not in pos:
