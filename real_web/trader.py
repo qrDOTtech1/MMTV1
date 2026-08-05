@@ -6967,6 +6967,17 @@ class MultiTrader:
                                         f"-> VENTE jambe {owned_side[0]}@{sell_price_orph:.3f} "
                                         f"(perte ~{(sell_info_orph.get('entry_price', 0) - sell_price_orph) * sell_shares_orph:.2f}$)"
                                     )
+                                    # FIX (Steven 05/08) : 4e occurrence du meme
+                                    # bug que les unwinds et FORCE-PAIR --
+                                    # sell_position() en GTC PASSIF (peut ne
+                                    # jamais croiser), retour ignore, puis pop()
+                                    # inconditionnel -> jambe fantome detenue
+                                    # on-chain mais absente de l'etat, et garde
+                                    # anti-doublon contournee. On passe par
+                                    # _sell_orphan (FAK agressif + verification
+                                    # du fill on-chain) et on ne retire que ce
+                                    # qui est reellement solde.
+                                    _orph_sold = 0.0
                                     try:
                                         token_own = (
                                             mk["open"]
@@ -6974,22 +6985,37 @@ class MultiTrader:
                                             .get("token_id")
                                         )
                                         if token_own:
-                                            # FIX CRITIQUE (Steven 04/08) : ordre
-                                            # (token, PRIX, parts) -- meme inversion
-                                            # que les 2 autres chemins d'urgence,
-                                            # meme consequence (vente jamais executee).
-                                            self._live.sell_position(
+                                            _orph_sold = self._sell_orphan(
                                                 token_own,
-                                                sell_price_orph,
                                                 sell_shares_orph,
+                                                f" {sym} {slug} {owned_side[0]} ORPHAN-PAIR-ECHEC",
+                                                entry_price=sell_info_orph.get("entry_price"),
+                                                symbol=sym, slug=slug, side=owned_side[0],
                                             )
                                     except Exception as e:
                                         self._log(f"⚠️ [ORPHAN] vente echouee: {e}")
-                                    mk["open"].pop(f"{slug}|{owned_side[0]}", None)
+                                    if _orph_sold >= sell_shares_orph - 0.01:
+                                        mk["open"].pop(f"{slug}|{owned_side[0]}", None)
+                                    else:
+                                        sell_info_orph["filled_shares"] = round(
+                                            sell_shares_orph - _orph_sold, 2
+                                        )
+                                        sell_info_orph["strat"] = "orphan"
+                                        sell_info_orph["must_close"] = True
+                                        self._log(
+                                            f"⚠️ [ORPHAN] {sym} {slug} {owned_side[0]} vente "
+                                            f"{_orph_sold}/{sell_shares_orph} -> reste "
+                                            f"{sell_info_orph['filled_shares']} parts A FERMER"
+                                        )
         # HEDGE NEAR-RESOLUTION (Laguna XS 24/07) : si < 30s et on tient 1 jambe,
-        # on achete l'autre AU MARCHE quel que soit le prix pour completer la paire.
-        # Meme a combined 1.05, c'est mieux que de perdre 1$ sur un bet directionnel.
-        # Transforme un bet directionnel en hedge (perte limitee a combined - 1.00).
+        # on achete l'autre pour completer la paire.
+        # REVISE (Steven 05/08) : le raisonnement d'origine ("meme a combined
+        # 1.05 c'est mieux qu'un bet directionnel") ne resiste pas a la mesure.
+        # Quand l'autre cote coute 0.95, completer et solder la jambe coutent la
+        # MEME chose (marche efficient), mais completer immobilise en plus le
+        # prix de la 2e jambe -- ce capital est precisement ce qui manque pour
+        # prendre le vrai arb suivant. On ne complete donc plus qu'en dessous de
+        # PAIR_COMPLETION_MAX_COMBINED ; au-dessus, la jambe part en must_close.
         HEDGE_NEAR_SECS = 30
         if legs_held == 1 and secs_left < HEDGE_NEAR_SECS and secs_left > 3:
             for side_h, token_h in zip(outcomes, token_ids):
@@ -7226,17 +7252,42 @@ class MultiTrader:
                 bid = book["bids"][0][0] if book and book.get("bids") else None
                 if bid is None:
                     continue
-                with self._order_lock:
-                    res = self._live.sell_position(
-                        pos["token_id"], round(bid, 2), pos["filled_shares"]
-                    )
-                ok = bool(res) and res.get("success", True) is not False
+                # FILL VERIFIE (Steven 05/08) : avant, un sell_position() en GTC
+                # PASSIF dont on ne testait que le `success` de l'API. Or un
+                # ordre ACCEPTE n'est pas un ordre EXECUTE : un GTC pile au bid
+                # peut ne jamais croiser. Le stop-loss enregistrait donc une
+                # sortie et un PnL qui n'avaient pas eu lieu, tout en laissant
+                # les parts detenues on-chain (l'inverse exact de la jambe
+                # fantome : ici le bot se croit sorti alors qu'il est expose).
+                # _sell_orphan poste en FAK agressif ET verifie le fill on-chain.
+                # NB : appel HORS de self._order_lock -- _sell_orphan prend ce
+                # meme lock non reentrant, l'imbriquer bloquerait le bot.
+                _sl_held = pos["filled_shares"]
+                sold = self._sell_orphan(
+                    pos["token_id"], _sl_held,
+                    f" {sym} {slug} {pos['side']} STOP-LOSS",
+                )
                 mom_txt = f"{mom['fast_pct_s']:+.4f}%/s" if mom else "n/a"
                 self._log(
                     f"🩹 [SL][REEL] {sym} {slug} {pos['side']} coupe @ {bid:.3f} "
-                    f"(entree {pos['entry_price']:.3f}) mom={mom_txt} ok={ok}"
+                    f"(entree {pos['entry_price']:.3f}) mom={mom_txt} vendu={sold}/{_sl_held}"
                 )
-                if not ok:
+                if sold <= 0:
+                    continue
+                if sold < _sl_held - 0.01:
+                    # Fill partiel : on comptabilise ce qui est reellement sorti
+                    # et on garde le reste en position pour retenter au prochain
+                    # cycle, au lieu de cloturer un trade a moitie execute.
+                    pos["realized_pnl"] = round(
+                        pos.get("realized_pnl", 0.0)
+                        + sold * (bid - pos["entry_price"]),
+                        3,
+                    )
+                    pos["filled_shares"] = round(_sl_held - sold, 2)
+                    self._log(
+                        f"⚠️ [SL][REEL] {sym} {slug} {pos['side']} fill partiel -> "
+                        f"reste {pos['filled_shares']} parts, nouvelle tentative au prochain cycle"
+                    )
                     continue
                 exit_price = bid
             else:  # paper
@@ -7317,13 +7368,19 @@ class MultiTrader:
                 bid = book["bids"][0][0] if book and book.get("bids") else None
                 if bid is None or bid < target_price * 0.9:  # tampon anti-slippage
                     continue
-                with self._order_lock:
-                    res = self._live.sell_position(
-                        pos["token_id"], round(bid, 2), sell_shares
-                    )
-                ok = bool(res) and res.get("success", True) is not False
-                if not ok:
+                # FILL VERIFIE (Steven 05/08) : meme correction que le stop-loss
+                # ci-dessus -- un GTC accepte n'est pas un GTC execute. Le
+                # palier de TP creditait un gain jamais encaisse. _sell_orphan
+                # poste en FAK agressif et verifie le fill on-chain ; on
+                # comptabilise EXACTEMENT ce qui est sorti (appel hors du
+                # _order_lock, qui n'est pas reentrant).
+                sold = self._sell_orphan(
+                    pos["token_id"], sell_shares,
+                    f" {sym} {pos['slug']} {pos['side']} TP{stage + 1}",
+                )
+                if sold <= 0:
                     continue
+                sell_shares = sold
                 exit_price = bid
             else:
                 exit_price = cur
