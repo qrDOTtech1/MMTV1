@@ -2927,13 +2927,31 @@ class MultiTrader:
                         # cycle apres activation (last_autoselect_ts absent).
                         if COPY_AUTOSELECT_ENABLED:
                             last = ct.get("last_autoselect_ts", 0)
-                            if time.time() - last >= COPY_AUTOSELECT_INTERVAL_S:
+                            if time.time() - last >= COPY_AUTOSELECT_INTERVAL_S and not ct.get("_autoselect_running"):
+                                # THREAD SEPARE (fix apres constat en test local) :
+                                # le scan est reseau-bound et peut prendre
+                                # plusieurs minutes (jusqu'a 6 marches + 15
+                                # wallets x 2 pages, chacun avec son propre
+                                # timeout). Le lancer ICI, dans la boucle
+                                # principale, bloquerait le sondage des wallets
+                                # DEJA suivis pendant tout ce temps -- exactement
+                                # le moment ou la latence de copie compte le
+                                # plus. Le scan tourne donc en tache de fond,
+                                # independamment du sondage.
                                 ct["last_autoselect_ts"] = time.time()
+                                ct["_autoselect_running"] = True
                                 self._save()
-                                try:
-                                    self._copy_autoselect()
-                                except Exception as e:
-                                    self._log(f"💥 [COPY-AUTO] erreur de selection: {e}")
+
+                                def _run_autoselect():
+                                    try:
+                                        self._copy_autoselect()
+                                    except Exception as e:
+                                        self._log(f"💥 [COPY-AUTO] erreur de selection: {e}")
+                                    finally:
+                                        self._copy_trade_state()["_autoselect_running"] = False
+                                        self._save()
+
+                                threading.Thread(target=_run_autoselect, daemon=True).start()
                         for wallet in list(ct.get("wallets", {}).keys()):
                             try:
                                 self._copy_trade_poll_wallet(wallet, requests)
