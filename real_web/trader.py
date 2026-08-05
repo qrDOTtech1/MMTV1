@@ -2799,6 +2799,36 @@ class MultiTrader:
                 # REPLAFONNEMENT POST-BOOST (Steven 04/08) : meme garde-fou que
                 # plus haut -- jamais depasser le capital reellement disponible.
                 budget = min(budget, HARD_CAP_USD, investable)
+                # GARDE-FOU MINIMUM VENDABLE (Steven 05/08, meme bug que dans le
+                # chemin "opportunity" ligne ~2603, trouve ici via une jambe
+                # FORCE-PAIR a 2.78 parts qui n'a jamais recu de TP/SL malgre un
+                # peak PnL de +168% -- _manage_pnl_tier_exits skip toute position
+                # sous MIN_ORDER_SIZE_SHARES). Sans ce plancher, _open_leg peut
+                # ouvrir une jambe invendable qui devient un pari pile-ou-face
+                # force et casse la symetrie de l'arb (voir aussi target_shares
+                # ci-dessous, meme raisonnement en mode parts-egales).
+                if target_shares is None:
+                    _min_sellable_budget = round(MIN_ORDER_SIZE_SHARES * ask, 2)
+                    if budget < _min_sellable_budget:
+                        if investable >= _min_sellable_budget:
+                            budget = _min_sellable_budget
+                        else:
+                            self._log(
+                                f"⛔ [MIN-VENDABLE] {sym} {slug} {side} budget={budget:.2f} < "
+                                f"min_vendable={_min_sellable_budget:.2f} (investable={investable:.2f}) "
+                                f"-> jambe invendable evitee"
+                            )
+                            return False, 0.0
+                elif target_shares < MIN_ORDER_SIZE_SHARES:
+                    _min_sellable_budget = round(MIN_ORDER_SIZE_SHARES * ask, 2)
+                    if investable >= _min_sellable_budget:
+                        target_shares = MIN_ORDER_SIZE_SHARES
+                    else:
+                        self._log(
+                            f"⛔ [MIN-VENDABLE] {sym} {slug} {side} target_shares={target_shares:.2f} < "
+                            f"{MIN_ORDER_SIZE_SHARES} (investable={investable:.2f}) -> jambe invendable evitee"
+                        )
+                        return False, 0.0
                 if no_slippage:
                     _shares = target_shares if target_shares is not None else round(budget / ask, 2)
                     res = self._live.snipe_buy_limit_exact(token_id, ask, _shares)
@@ -2840,6 +2870,35 @@ class MultiTrader:
                 if filled <= 0:
                     return False, 0.0
                 avg = res.get("avg_cost") or ask
+                # TOP-UP FILL PARTIEL SOUS MINIMUM (Steven 05/08) : meme avec le
+                # garde-fou budget ci-dessus, le carnet peut ne remplir qu'une
+                # FRACTION de l'ordre (ex: 2.78/5 parts demandees) -> la position
+                # reste invendable et _manage_pnl_tier_exits la skip totalement
+                # (bug trouve en live : peak +168% jamais pris). On tente UNE
+                # relance immediate pour completer jusqu'au minimum vendable.
+                if 0 < filled < MIN_ORDER_SIZE_SHARES:
+                    missing = round(MIN_ORDER_SIZE_SHARES - filled, 2)
+                    ask_topup = res.get("ask") or ask
+                    if ask_topup and ask_topup <= max_entry:
+                        topup_budget = round(missing * ask_topup * 1.02, 2)
+                        cash2, _ = self._read_cash(max_age=0)
+                        if cash2 is not None and cash2 - self.floor() >= topup_budget:
+                            res2 = self._live.snipe_buy_market(token_id, max_entry, topup_budget)
+                            filled2 = res2.get("filled_shares", 0.0)
+                            if filled2 > 0:
+                                spent2 = filled2 * (res2.get("avg_cost") or ask_topup)
+                                spent1 = filled * ask
+                                filled = round(filled + filled2, 2)
+                                avg = round((spent1 + spent2) / filled, 4) if filled else ask
+                                self._log(
+                                    f"🔁 [TOP-UP-MIN] {sym} {slug} {side} +{filled2} parts "
+                                    f"(total={filled}) -> minimum vendable atteint"
+                                )
+                    if filled < MIN_ORDER_SIZE_SHARES:
+                        self._log(
+                            f"⚠️ [SOUS-MIN-VENDABLE] {sym} {slug} {side} filled={filled} < "
+                            f"{MIN_ORDER_SIZE_SHARES} apres top-up -> position restera hors gestion TP/SL"
+                        )
                 base.update(
                     mode="real",
                     entry_price=avg,
