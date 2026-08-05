@@ -1832,6 +1832,41 @@ class MultiTrader:
         now = time.time()
         mk.setdefault("cooldowns", {})[slug] = now + SLUG_COOLDOWN_SECS
 
+    def _hedge_would_break(self, mk, slug, side, own_price, entry_price):
+        """Vendre CETTE jambe casserait-il une couverture encore en place ?
+
+        REGRESSION CORRIGEE (Steven 05/08). En posant is_risk_free seulement
+        sur les paires reellement verrouillees (_tag_pair_lock), j'ai rendu le
+        SL et le SPREAD-EXIT actifs sur les paires DESEQUILIBREES -- qui ne
+        sont pas verrouillees mais restent des couvertures. Resultat mesure en
+        production, deux fenetres consecutives :
+          ETH  +0s BUY Up 6.35@0.630 | +7s BUY Down 2.94@0.340 (comb 0.97)
+              +18s SELL Down @0.160  -> Up reste a nu -> -4.71$
+          SOL  +0s BUY Up 4.80@0.740 | +3s BUY Down 4.35@0.230 (comb 0.97)
+              +10s SELL Down @0.190  -> Up reste a nu -> -3.89$
+        Chiffrage sur ETH : paire gardee = +1.35$ si Up gagne / -2.06$ si Down
+        gagne. Apres avoir coupe la couverture : +1.79$ / -4.56$. On a donc
+        MULTIPLIE PAR DEUX le risque a la baisse pour encaisser 0.44$.
+
+        Regle : tant que la jambe opposee est detenue, couper la jambe
+        PERDANTE est destructeur -- c'est precisement elle qui borne la perte.
+        Vendre la jambe GAGNANTE reste autorise (c'est comme ca qu'on encaisse
+        un TP). On ne bloque donc que la vente a perte d'une jambe couverte."""
+        if own_price is None or entry_price is None:
+            return False
+        if own_price >= entry_price:
+            return False  # jambe gagnante -> le TP peut la vendre
+        for k, other in mk.get("open", {}).items():
+            if other is None or k == f"{slug}|{side}":
+                continue
+            if other.get("slug") != slug:
+                continue
+            if other.get("side") in (None, side):
+                continue
+            if (other.get("filled_shares") or 0) > 0.01 and not other.get("must_close"):
+                return True
+        return False
+
     # ── VERROU REEL D'UNE PAIRE (Steven 05/08) ──────────────────────────
     def _pair_is_locked(self, shares_a, cost_a, shares_b, cost_b):
         """Une paire n'est un arb GARANTI que si le payout du PIRE cas couvre
@@ -7764,6 +7799,17 @@ class MultiTrader:
                 # _sell_orphan poste en FAK agressif ET verifie le fill on-chain.
                 # NB : appel HORS de self._order_lock -- _sell_orphan prend ce
                 # meme lock non reentrant, l'imbriquer bloquerait le bot.
+                # NE PAS CASSER LA COUVERTURE (Steven 05/08) : meme garde que
+                # le SPREAD-EXIT. Couper la jambe perdante d'une paire encore
+                # tenue retire precisement ce qui borne la perte -- mesure a
+                # -8.60$ sur deux fenetres. Voir _hedge_would_break.
+                if self._hedge_would_break(mk, slug, pos.get("side"), cur, pos.get("entry_price")):
+                    self._tlog(
+                        f"slhedge_{key}",
+                        f"🛡️ [SL] {sym} {slug} {pos['side']} coupe ANNULEE : la jambe "
+                        f"opposee est encore tenue, la couverture borne deja la perte",
+                    )
+                    continue
                 _sl_held = pos["filled_shares"]
                 sold = self._sell_orphan(
                     pos["token_id"], _sl_held,
@@ -7979,6 +8025,24 @@ class MultiTrader:
                                     _other_pnl = (_other_cur - _other_entry) / _other_entry
                                     _spread = _other_pnl - _own_pnl
                                     if _spread > SPREAD_EXIT_THRESHOLD:
+                                        # NE PAS CASSER LA COUVERTURE (Steven
+                                        # 05/08) : c'est exactement ce chemin
+                                        # qui a vendu la jambe Down d'ETH et de
+                                        # SOL 10-18s apres l'achat, laissant la
+                                        # jambe Up a nu -> -8.60$ sur deux
+                                        # fenetres. Voir _hedge_would_break.
+                                        if self._hedge_would_break(
+                                            mk, slug, pos.get("side"),
+                                            self._live_price(pos.get("token_id"), None, pos.get("side")),
+                                            pos.get("entry_price"),
+                                        ):
+                                            self._tlog(
+                                                f"spreadhedge_{key}",
+                                                f"🛡️ [SPREAD-EXIT] {sym} {slug} {pos['side']} "
+                                                f"vente ANNULEE : la jambe opposee est encore tenue, "
+                                                f"couper celle-ci retirerait la couverture",
+                                            )
+                                            continue
                                         _shares = pos.get("filled_shares", 0)
                                         if _shares > 0:
                                             _bid = self._get_bid(pos)
