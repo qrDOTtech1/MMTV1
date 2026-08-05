@@ -1675,6 +1675,60 @@ class MultiTrader:
         now = time.time()
         mk.setdefault("cooldowns", {})[slug] = now + SLUG_COOLDOWN_SECS
 
+    # ── VERROU REEL D'UNE PAIRE (Steven 05/08) ──────────────────────────
+    def _pair_is_locked(self, shares_a, cost_a, shares_b, cost_b):
+        """Une paire n'est un arb GARANTI que si le payout du PIRE cas couvre
+        le cout total. Sur un marche binaire le gagnant paie 1$ PAR PART, donc
+        le pire cas vaut min(parts_a, parts_b) -- pas la moyenne, pas le total.
+
+        C'est la seule definition qui tienne, et elle etait absente du code :
+        `is_risk_free=True` etait pose des que les DEUX jambes etaient
+        remplies, sans jamais verifier le verrou. Or ce tag EXEMPTE la
+        position de toute gestion TP/SL (elle est censee rider jusqu'a une
+        resolution garantie). Un faux arb tagge risk-free est donc le pire
+        des deux mondes : expose comme un pari directionnel, mais protege de
+        rien. Mesure on-chain sur 27.9h : 62 paires non verrouillees pour
+        -41.79$, contre 16 vraies paires verrouillees a +11.23$.
+
+        Retourne (locked: bool, marge_$: float)."""
+        try:
+            worst_payout = min(float(shares_a or 0), float(shares_b or 0))
+            total_cost = float(cost_a or 0) + float(cost_b or 0)
+        except (TypeError, ValueError):
+            return False, 0.0
+        return worst_payout > total_cost, round(worst_payout - total_cost, 3)
+
+    def _tag_pair_lock(self, pos_a, pos_b, combined, tag=""):
+        """Pose is_risk_free UNIQUEMENT si la paire est reellement verrouillee.
+        Sinon la laisse geree normalement (TP/SL actifs) : mieux vaut une
+        position surveillee qu'un faux arb abandonne a la resolution."""
+        if not pos_a or not pos_b:
+            return False
+        locked, margin = self._pair_is_locked(
+            pos_a.get("filled_shares"), pos_a.get("cost"),
+            pos_b.get("filled_shares"), pos_b.get("cost"),
+        )
+        for _p in (pos_a, pos_b):
+            _p["arb_combined"] = round(combined, 4) if combined else None
+            _p["arb_edge"] = round(1 - combined, 4) if combined else None
+            _p["arb_locked"] = locked
+            _p["arb_lock_margin"] = margin
+            _p["is_risk_free"] = locked
+        if locked:
+            self._log(
+                f"🔒 [PAIRE-VERROUILLEE]{tag} pire cas {min(pos_a.get('filled_shares', 0), pos_b.get('filled_shares', 0))} parts "
+                f"vs cout {round((pos_a.get('cost') or 0) + (pos_b.get('cost') or 0), 2)}$ "
+                f"-> gain garanti {margin:+.2f}$ (tenue jusqu'a resolution)"
+            )
+        else:
+            self._log(
+                f"⚠️ [PAIRE-NON-VERROUILLEE]{tag} pire cas "
+                f"{min(pos_a.get('filled_shares', 0), pos_b.get('filled_shares', 0))} parts "
+                f"vs cout {round((pos_a.get('cost') or 0) + (pos_b.get('cost') or 0), 2)}$ "
+                f"-> manque {abs(margin):.2f}$ : PAS un arb, TP/SL laisses ACTIFS"
+            )
+        return locked
+
     # ── EXPOSITION CUMULEE PAR MARCHE (Steven 05/08, spec ENGINEBTB3 s.10) ──
     def _slug_spent(self, mk, slug):
         """Total $ REELS deja engages a l'achat sur cette fenetre de 5 min."""
@@ -4957,6 +5011,9 @@ class MultiTrader:
                 # sans ca, cette paire reelle est geree comme un hedge
                 # directionnel ordinaire par _manage_pnl_tier_exits (SL/TP
                 # individuel) au lieu de rider a la resolution garantie.
+                # Valeur PROVISOIRE (Steven 05/08) : recalculee juste apres la
+                # boucle par _tag_pair_lock, qui verifie le verrou reel au lieu
+                # de le supposer.
                 "is_risk_free": True,
                 "arb_combined": round(combined, 4),
                 "arb_edge": round(1 - combined, 4),
@@ -4972,6 +5029,17 @@ class MultiTrader:
                     "start_ts": p["start_ts"], "pair": p["pair"],
                     "end_ts": p["end_ts"], "opened_ts": time.time(), "buffer": 0.0,
                 }
+        # VERROU VERIFIE (Steven 05/08) : les 2 jambes viennent d'etre ecrites
+        # avec is_risk_free=True par defaut. On recalcule ici sur les fills
+        # REELS -- si le pire cas ne couvre pas le cout, ce n'est pas un arb et
+        # la paire doit rester sous surveillance TP/SL au lieu d'etre laissee
+        # rider jusqu'a resolution.
+        self._tag_pair_lock(
+            mk["open"].get(f"{slug}|{side1}"),
+            mk["open"].get(f"{slug}|{side2}"),
+            combined,
+            tag=f" {sym} {slug} ARB-BATCH",
+        )
         # RECONCILIATION (Steven 30/07, "fetch mon histo poly reel") : verifie
         # le solde REEL on-chain (position_size, verite terrain Polymarket)
         # contre ce qu'on vient d'ecrire (M) -> si notre comptage de fill (f1/
@@ -6147,18 +6215,17 @@ class MultiTrader:
                         # On tague chaque jambe avec is_risk_free + le combined
                         # (edge garanti) au moment de l'execution -> visible dans
                         # le detail du trade, meme apres resolution/SL/TP.
-                        if _ok1:
-                            _p1 = mk["open"].get(f"{slug}|{leg_data_immediate[0][0]}")
-                            if _p1:
-                                _p1["is_risk_free"] = True
-                                _p1["arb_combined"] = combined_now
-                                _p1["arb_edge"] = round(1 - combined_now, 4)
-                        if _ok2:
-                            _p2 = mk["open"].get(f"{slug}|{leg_data_immediate[1][0]}")
-                            if _p2:
-                                _p2["is_risk_free"] = True
-                                _p2["arb_combined"] = combined_now
-                                _p2["arb_edge"] = round(1 - combined_now, 4)
+                        # VERROU VERIFIE (Steven 05/08) : is_risk_free n'est
+                        # plus pose sur la seule foi que les 2 jambes sont
+                        # remplies -- on controle que le pire cas couvre
+                        # reellement le cout (voir _tag_pair_lock).
+                        if _ok1 and _ok2:
+                            self._tag_pair_lock(
+                                mk["open"].get(f"{slug}|{leg_data_immediate[0][0]}"),
+                                mk["open"].get(f"{slug}|{leg_data_immediate[1][0]}"),
+                                combined_now,
+                                tag=f" {sym} {slug} ARB-BYPASS",
+                            )
                         # ATOMICITE (Steven 29/07, fail meconnu trouve en analysant
                         # les 3 vrais echecs de cette nuit) : si UNE seule jambe se
                         # remplit, l'ancien code laissait _ok_bp=False sans rien
@@ -6453,18 +6520,15 @@ class MultiTrader:
                     # taguait jamais is_risk_free -> le SL/TP pouvait encore casser
                     # la paire individuellement (meme bug ARB_NEGATIVE que celui
                     # deja corrige sur ARB-BYPASS, juste sur ce chemin-ci).
-                    if ok1:
-                        _pp1 = mk["open"].get(f"{slug}|{leg_data[0][0]}")
-                        if _pp1:
-                            _pp1["is_risk_free"] = True
-                            _pp1["arb_combined"] = combined
-                            _pp1["arb_edge"] = round(1 - combined, 4)
-                    if ok2:
-                        _pp2 = mk["open"].get(f"{slug}|{leg_data[1][0]}")
-                        if _pp2:
-                            _pp2["is_risk_free"] = True
-                            _pp2["arb_combined"] = combined
-                            _pp2["arb_edge"] = round(1 - combined, 4)
+                    # VERROU VERIFIE (Steven 05/08) : cf. _tag_pair_lock --
+                    # is_risk_free seulement si le pire cas couvre le cout.
+                    if ok1 and ok2:
+                        self._tag_pair_lock(
+                            mk["open"].get(f"{slug}|{leg_data[0][0]}"),
+                            mk["open"].get(f"{slug}|{leg_data[1][0]}"),
+                            combined,
+                            tag=f" {sym} {slug} ARB-PARALLEL",
+                        )
                     if ok1 and not ok2:
                         # ATOMICITE (meme fix que ARB-BYPASS) : jambe seule -> revente immediate
                         _key1p = f"{slug}|{leg_data[0][0]}"
@@ -6623,11 +6687,13 @@ class MultiTrader:
             for side, token_id in failed_legs:
                 fill_price = None
                 filled_side = None
+                _leg1_shares = None
                 for fs, _ in filled_legs:
                     leg_info = mk["open"].get(f"{slug}|{fs}")
                     if leg_info:
                         fill_price = leg_info.get("entry_price")
                         filled_side = fs
+                        _leg1_shares = leg_info.get("filled_shares")
                         break
                 if fill_price is not None:
                     max_payable = round(max(0.05, 1.02 - fill_price), 3)
@@ -6642,6 +6708,22 @@ class MultiTrader:
                 # surpaye pour forcer la paire -> une paire trop chere garantit
                 # une perte, ce n'est pas le but). Court delai entre essais pour
                 # laisser une chance a un carnet qui bouge vite.
+                # PARTS EGALES, PAS DOLLARS EGAUX (Steven 05/08) : la 2e jambe
+                # etait dimensionnee en BUDGET $ (fav_budget/leg_budget), donc
+                # son nombre de parts dependait de son prix. Or le payout d'un
+                # marche binaire vaut 1$ PAR PART : une paire 8 parts Up / 5
+                # parts Down ne garantit que 5$, pas 8$. Le verrou d'un arb est
+                # min(parts_up, parts_down) > cout_total -- il exige donc des
+                # parts EGALES, pas des mises egales.
+                # Mesure on-chain sur 27.9h : ecart median de 1.60x entre les 2
+                # jambes, 67% des paires desequilibrees de plus de 20%, et
+                # seulement 16 paires sur 78 reellement verrouillees (+11.23$)
+                # contre 62 faux arbs (-41.79$). C'est LA cause du desequilibre.
+                _fp_kwargs = (
+                    {"target_shares": round(_leg1_shares, 2)}
+                    if _leg1_shares
+                    else {"budget_usd": fav_budget if side == fav_side else leg_budget}
+                )
                 ok2 = False
                 for _fp_try in range(FORCE_PAIR_MAX_RETRIES):
                     ok2, _ = self._open_leg(
@@ -6653,7 +6735,7 @@ class MultiTrader:
                         token_id,
                         max_payable,
                         tag_force,
-                        budget_usd=fav_budget if side == fav_side else leg_budget,
+                        **_fp_kwargs,
                     )
                     if ok2:
                         break
