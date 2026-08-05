@@ -6640,6 +6640,40 @@ class MultiTrader:
             key = f"{slug}|{side}"
             if key in mk["open"]:
                 filled_legs.append((side, token_id))
+        # ── GATE COMBINED SEQUENTIEL (Steven 05/08) ─────────────────────
+        # TROU TROUVE EN PRODUCTION. Cette boucle-ci n'a JAMAIS controle le
+        # combine : elle calcule _comb_sequential, s'en sert pour le sizing et
+        # pour afficher l'edge, puis achete chaque jambe en ne verifiant que le
+        # plafond de prix de CHAQUE jambe prise isolement. Deux prix
+        # individuellement acceptables peuvent evidemment sommer au-dessus de
+        # 1.00 -- et un pack Up+Down rapporte EXACTEMENT 1.00 a la resolution.
+        # Trace reelle (prod, 07:00:13 UTC) :
+        #   [BOTHSIDE][REEL][d=66] BTC Up ask=0.640 budget=4.00$ rempli=6.25
+        #   [ENTRY] ... comb_ask=1.010 edge=0.0%
+        #   -> paire achetee 5.98$ pour un payout garanti de 4.39$ = -1.59$
+        # Le code affichait donc "edge=0.0%" et achetait quand meme. Les
+        # plafonds poses plus tot ne couvraient que les chemins de COMPLETION
+        # (FORCE-PAIR, ORPHAN-PAIR, HEDGE-NEAR), pas cette entree initiale.
+        if mode == "real" and _comb_sequential >= PAIR_COMPLETION_MAX_COMBINED:
+            self._tlog(
+                f"seqcomb_{sym}",
+                f"⛔ [BOTHSIDE-SEQ] {sym} {slug} comb={_comb_sequential:.3f} >= "
+                f"{PAIR_COMPLETION_MAX_COMBINED} -> perte garantie, aucune jambe ouverte",
+            )
+            # Si UNE seule jambe est deja tenue, elle ne pourra plus etre
+            # couverte a profit sur cette fenetre -> on la ferme (zero jambe
+            # nue) plutot que d'attendre une amelioration qui, statistiquement,
+            # n'arrive pas. Une paire deja complete (2 jambes) n'est pas touchee.
+            if len(filled_legs) == 1:
+                _held_pos = mk["open"].get(f"{slug}|{filled_legs[0][0]}")
+                if _held_pos and not _held_pos.get("is_risk_free"):
+                    _held_pos["strat"] = "orphan"
+                    _held_pos["must_close"] = True
+                    self._log(
+                        f"⛔ [BOTHSIDE-SEQ] {sym} {slug} {filled_legs[0][0]} jambe seule "
+                        f"non couvrable a profit -> marquee A FERMER"
+                    )
+            return legs_held > 0
         for i, (side, token_id) in enumerate(zip(outcomes, token_ids)):
             key = f"{slug}|{side}"
             # SKIP : jambe deja tenue (pas de rachat)
