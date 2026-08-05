@@ -768,6 +768,32 @@ ORPHAN_KEEP_MIN_PRICE = 0.50
 # (0.1% et 0.08%) ; la decision de TENIR une jambe nue, elle, n'en avait
 # aucune -- un seul tick au-dessus du strike suffisait.
 BINANCE_CONFIRM_MARGIN = 0.001
+
+# ── PARI DIRECTIONNEL SUR LE FAVORI (Steven 05/08) ─────────────────────
+# Demande explicite : "je veux voir dans le journal une ligne FAV qui mise
+# sur une position a +70c en directionnel, declenchee par prix > 70c +
+# signal Binance clair, puis geree par SL/TP".
+# Ce que disent les donnees, honnetement : sur l'historique corrige (sans
+# le biais de survie), la zone 0.70-0.80 fait -2% de ROI (n=15) et la zone
+# 0.80-0.90 fait -20% (n=10). Le marche price deja correctement le fait que
+# le favori est devant -- il n'y a pas d'edge gratuit a acheter cher.
+# CE QUI EST NOUVEAU ici, et jamais teste : le filtre Binance STRICT a
+# l'entree. L'historique ne contient aucune entree filtree ainsi. C'est donc
+# une hypothese a mesurer, pas un edge etabli. D'ou :
+#   - une marge Binance nettement plus exigeante que la marge de simple
+#     confirmation (0.25% contre 0.1%) : on ne veut pas "le favori est
+#     devant", on veut "il est devant NETTEMENT" ;
+#   - un plafond a 0.85, parce que la tranche 0.80-0.90 est franchement
+#     perdante dans les donnees et qu'au-dela on risque 85c pour en gagner
+#     15 ;
+#   - une taille volontairement modeste (pas de FAVORITE_BUDGET_MULT ici) ;
+#   - strat="fav" -> JAMAIS is_risk_free, donc toujours gere en TP/SL.
+FAV_MIN_PRICE = 0.70
+FAV_MAX_PRICE = 0.85
+FAV_BINANCE_MARGIN = 0.0025   # 0.25% = signal "clair", pas juste "devant"
+FAV_MIN_SECS = 30             # sous 30s : plus le temps de sortir si ca tourne
+FAV_MAX_SECS = 150            # au-dela : trop de temps pour se retourner
+FAV_BUDGET_USD = 1.60         # mise directionnelle volontairement petite
 # GROSSE MISE SUR RISK-FREE (Steven 29/07, "je veux grosse mise sur les arb
 # risk free") : contrairement au directionnel, l'arb garanti (2 jambes achetees
 # EN MEME TEMPS, profit fige quel que soit le resultat) n'expose PAS a un
@@ -3315,6 +3341,107 @@ class MultiTrader:
         elif secs_left > 120:
             mult *= 1.08
         return round(base_stop * mult, 3)
+
+    def _try_favorite(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+        """PARI DIRECTIONNEL SUR LE FAVORI (Steven 05/08, demande explicite).
+
+        Appele UNIQUEMENT quand l'arb a ete declare impossible sur cette
+        fenetre (FIRST-LEG-BLOCKED). Mise petite, assumee directionnelle,
+        strat="fav" -> jamais is_risk_free, donc toujours geree en TP/SL.
+
+        Honnetete sur l'esperance : l'historique corrige donne -2% de ROI sur
+        la tranche 0.70-0.80 et -20% sur 0.80-0.90. Ce qui est NOUVEAU ici et
+        n'a jamais ete teste, c'est le filtre Binance strict a l'entree
+        (0.25% d'ecart au strike, pas juste "devant"). C'est une hypothese a
+        mesurer, pas un edge etabli -- d'ou la taille volontairement petite."""
+        from core.btc_updown import _binance_price, _strike_at
+
+        if mode != "real":
+            return False
+        now = synced_now()
+        secs_left = p.get("end_ts", now) - now
+        if not (FAV_MIN_SECS <= secs_left <= FAV_MAX_SECS):
+            return False
+        # une seule tentative FAV par fenetre, et jamais si on tient deja qqch
+        if mk.setdefault("fav_tried", {}).get(slug):
+            return False
+        if any(k.startswith(f"{slug}|") for k in mk["open"]):
+            return False
+        # Binance doit trancher NETTEMENT
+        pair = p.get("pair")
+        if not pair:
+            return False
+        spot = _binance_price(pair)
+        strike = _strike_at(pair, p.get("start_ts"), slug=slug)
+        if spot is None or strike is None:
+            return False
+        gap = abs(spot - strike)
+        if gap < spot * FAV_BINANCE_MARGIN:
+            self._tlog(
+                f"favweak_{sym}",
+                f"🌫️ [FAV] {sym} {slug} signal Binance trop faible "
+                f"(ecart {gap:.4f} < {spot * FAV_BINANCE_MARGIN:.4f} = {FAV_BINANCE_MARGIN * 100:.2f}%) "
+                f"-> pas de pari directionnel",
+            )
+            return False
+        fav_side = "Up" if spot > strike else "Down"
+        if fav_side not in outcomes:
+            return False
+        tid = token_ids[outcomes.index(fav_side)]
+        _, ask, _ = quotes.get(fav_side, (None, None, None))
+        if ask is None:
+            return False
+        # le favori doit etre CHER (le marche doit etre d'accord avec Binance)
+        if not (FAV_MIN_PRICE <= ask <= FAV_MAX_PRICE):
+            self._tlog(
+                f"favpx_{sym}",
+                f"🌫️ [FAV] {sym} {slug} {fav_side} @ {ask:.3f} hors bande "
+                f"[{FAV_MIN_PRICE}, {FAV_MAX_PRICE}] -> pas de pari directionnel",
+            )
+            return False
+        cash, _ = self._read_cash(max_age=0)
+        if cash is None:
+            return False
+        investable = max(0.0, cash - self.floor())
+        budget = round(min(FAV_BUDGET_USD, investable), 2)
+        # plancher vendable : jamais une position qu'on ne pourra pas sortir
+        budget = max(budget, round(MIN_SELL_SHARES * ask, 2))
+        if budget > investable or budget < MIN_BUDGET_USD:
+            return False
+        ok_exp, why_exp = self._exposure_ok(sym, mk, slug, budget)
+        if not ok_exp:
+            self._tlog(f"favexp_{sym}", f"⛔ [FAV] {sym} {slug} refuse : {why_exp}")
+            return False
+        mk["fav_tried"][slug] = time.time()
+        self._log(
+            f"🎯 [FAV] {sym} {slug} {fav_side} @ {ask:.3f} budget={budget:.2f}$ "
+            f"-- arb impossible, Binance NET (ecart {gap:.4f} = "
+            f"{100 * gap / spot:.3f}% > {FAV_BINANCE_MARGIN * 100:.2f}%), "
+            f"{secs_left:.0f}s restantes -> pari directionnel assume, gere en TP/SL"
+        )
+        with self._order_lock:
+            res = self._live.snipe_buy_market(tid, round(ask + 0.02, 2), budget)
+        filled = res.get("filled_shares", 0.0)
+        if filled <= 0:
+            self._log(f"⚠️ [FAV] {sym} {slug} {fav_side} non rempli (err={res.get('error', '')})")
+            return False
+        avg = res.get("avg_cost") or ask
+        self._add_slug_spent(mk, slug, round(filled * avg, 2))
+        mk["open"][f"{slug}|{fav_side}"] = {
+            "symbol": sym, "slug": slug, "side": fav_side, "mode": "real",
+            # strat "fav" : suivi par _manage_pnl_tier_exits comme une position
+            # normale (TP par paliers + SL + trailing). JAMAIS is_risk_free.
+            "strat": "fav", "token_id": tid, "entry_price": avg,
+            "filled_shares": filled, "cost": round(filled * avg, 2),
+            "start_ts": p["start_ts"], "pair": pair, "end_ts": p["end_ts"],
+            "opened_ts": time.time(), "buffer": 0.0,
+            "fav_binance_gap_pct": round(100 * gap / spot, 4),
+        }
+        self._log(
+            f"✅ [FAV] {sym} {slug} {fav_side} {filled} parts @ {avg:.3f} "
+            f"({round(filled * avg, 2)}$) -> ouverte, TP/SL actifs"
+        )
+        return True
 
     def _manage_reinforce(self, sym):
         """RENFORT DE LA JAMBE GAGNANTE (Steven 05/08).
@@ -6614,6 +6741,12 @@ class MultiTrader:
                         f"⛔ [FIRST-LEG-BLOCKED] {sym} {slug} {first_target[0]} "
                         f"@ {first_target[1]:.3f} -> {reason_pf} (V3.1 pre-flight)"
                     )
+                    # PARI DIRECTIONNEL SUR LE FAVORI (Steven 05/08) : l'arb
+                    # est impossible sur cette fenetre, mais si le favori est
+                    # cher ET que Binance le donne gagnant NETTEMENT, on tente
+                    # une petite mise directionnelle assumee, geree en TP/SL.
+                    # Voir les constantes FAV_* pour ce que disent les donnees.
+                    self._try_favorite(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug)
                     return legs_held > 0
                 in_cd, cd_reason = self._in_cooldown(sym, slug, mk)
                 if in_cd:
@@ -7769,7 +7902,11 @@ class MultiTrader:
         mk = self.state["markets"][sym]
         now = synced_now()
         for key, pos in list(mk["open"].items()):
-            if pos.get("strat") not in ("bothside", "swing"):
+            # "fav" ajoute (Steven 05/08) : le pari directionnel sur le favori
+            # DOIT etre gere ici, c'est toute sa raison d'etre. Sans ca il
+            # serait skippe et tiendrait jusqu'a resolution sans TP ni SL --
+            # exactement le bug qu'on a corrige partout ailleurs aujourd'hui.
+            if pos.get("strat") not in ("bothside", "swing", "fav"):
                 continue
             # RISK-FREE : NE JAMAIS GERER INDIVIDUELLEMENT (Steven 29/07, bug
             # trouve en prod : une paire d'arb garanti a comb=0.93 (edge 7%,
