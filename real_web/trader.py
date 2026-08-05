@@ -5840,27 +5840,32 @@ class MultiTrader:
                         del slot[old]
             return bool(ok)
 
-        # ── FAVORITE DETECTION (Steven 28/07, desaccord retire 05/08 sur
-        # instruction directe : "retire COMPLETEMENT desaccord de risk free")
-        # : priorite Binance (spot vs strike), repli Polymarket (cote le plus
-        # cher) si Binance indisponible -- jamais de blocage/neutralisation
-        # sur desaccord entre les 2 signaux. Utilise pour : FIRST-LEG (achat
-        # favori en 1er), FAVORITE-BUDGET (mise 2.5x), max_entry (favori
-        # achetable a tout prix), et l'ordre d'envoi des jambes en arb.
-        from core.btc_updown import _binance_price as _bp
-        _fav_binance = None
-        try:
-            spot = self._ws.spot_price(p["pair"]) or _bp(p["pair"])
-            if spot is not None and strike is not None:
-                _fav_binance = "Up" if spot > strike else "Down"
-        except Exception:
-            pass
-        _fav_poly = None
-        _fav_prices = [(s, a) for s, (_, a, _) in zip(outcomes, [quotes.get(s, (None, None, None)) for s in outcomes]) if a is not None]
-        if len(_fav_prices) == 2:
-            _fav_poly = max(_fav_prices, key=lambda x: x[1])[0]
-        fav_side = _fav_binance if _fav_binance is not None else _fav_poly
-        fav_side_ordering = fav_side
+        # ── FAVORITE DETECTION (Steven 05/08, "pas d'appel a fav_side en
+        # risk free ! on cherche arb donc parfois aucun favoris !") : la
+        # notion de favori (Binance/Polymarket) ne sert qu'aux strategies
+        # directionnelles (hedge favori/underdog, FIRST-LEG). Un arb garanti
+        # (2 jambes combinees < seuil) n'a besoin d'AUCUN favori -- il est
+        # symetrique par construction, le sens ne compte pas. Sous risk-free,
+        # on saute donc completement ce calcul (pas d'appel Binance/strike
+        # inutile) : fav_side reste None, aucune preference forcee.
+        if self._risk_free_on(sym):
+            fav_side = None
+            fav_side_ordering = None
+        else:
+            from core.btc_updown import _binance_price as _bp
+            _fav_binance = None
+            try:
+                spot = self._ws.spot_price(p["pair"]) or _bp(p["pair"])
+                if spot is not None and strike is not None:
+                    _fav_binance = "Up" if spot > strike else "Down"
+            except Exception:
+                pass
+            _fav_poly = None
+            _fav_prices = [(s, a) for s, (_, a, _) in zip(outcomes, [quotes.get(s, (None, None, None)) for s in outcomes]) if a is not None]
+            if len(_fav_prices) == 2:
+                _fav_poly = max(_fav_prices, key=lambda x: x[1])[0]
+            fav_side = _fav_binance if _fav_binance is not None else _fav_poly
+            fav_side_ordering = fav_side
         # ── mode INDEPENDANT (legacy) ──
         combined = None  # V3.1 : init pour eviter UnboundLocalError
         force_hedge = legs_held == 1 and secs_left <= BOTH_SIDE_FORCE_HEDGE_SECS_LEFT
