@@ -4471,6 +4471,32 @@ class MultiTrader:
     def _preopen_state(self, mk):
         return mk.setdefault("preopen", {})
 
+    def _preopen_record(self, sym, slug, issue, **kw):
+        """JOURNAL DES TENTATIVES PRE-OUVERTURE (Steven 06/08).
+
+        Steven : "en pre ouverture je ne vois aucune perte j'ai meme
+        l'impression de n'avoir aucun frais quand ca ne passe pas mon solde
+        ne bouge pas". C'est exact et c'est structurel : Polymarket ne regle
+        QUE les trades executes -- verifie sur l'historique on-chain, qui ne
+        contient que des types TRADE et REDEEM, aucun ORDER/CANCEL. Poser
+        puis annuler ne produit aucun evenement, donc aucun mouvement de
+        solde. Le cout d'une tentative ratee est exactement zero.
+
+        Consequence directe : le taux de reussite ne se lit PAS dans le PnL
+        (les echecs y sont invisibles), il faut le journaliser ici. Sans ca
+        on ne peut pas savoir si poser plus agressivement ameliore ou degrade
+        quoi que ce soit.
+
+        issue : 'both' (verrouille), 'solo' (une jambe, soldee), 'none'
+        (rien rempli, gratuit), 'rejected' (ordre refuse, gratuit)."""
+        h = self.state.setdefault("preopen_hist", [])
+        h.append({
+            "ts": time.time(), "symbol": sym, "slug": slug, "issue": issue, **kw,
+        })
+        # borne memoire : ~2 fenetres/10min -> 400 couvre plusieurs jours
+        if len(h) > 400:
+            del h[: len(h) - 400]
+
     def _manage_preopen(self, sym):
         """ARB PRE-OUVERTURE EN MAKER (Steven 06/08).
 
@@ -4513,7 +4539,13 @@ class MultiTrader:
                     n = fills[side]
                     mk["open"][f"{slug}|{leg['side']}"] = {
                         "symbol": sym, "slug": slug, "side": leg["side"], "mode": "real",
-                        "strat": "bothside", "token_id": leg["token_id"],
+                        # strat reste 'bothside' A DESSEIN : chaque nouveau
+                        # strat doit etre ajoute a la main dans les filtres de
+                        # _manage_pnl_tier_exits, sinon la position se retrouve
+                        # sans aucune gestion TP/SL (piege deja rencontre avec
+                        # fav/nearcert/copy). On marque l'origine a cote.
+                        "strat": "bothside", "preopen": True,
+                        "token_id": leg["token_id"],
                         "entry_price": leg["price"], "filled_shares": round(n, 2),
                         "cost": round(n * leg["price"], 2),
                         "start_ts": e.get("open_ts"), "pair": None,
@@ -4531,6 +4563,12 @@ class MultiTrader:
                     mk["open"].get(f"{slug}|{e['a']['side']}"),
                     mk["open"].get(f"{slug}|{e['b']['side']}"),
                     pa + pb, tag=f" {sym} {slug} PRE-OUVERTURE",
+                )
+                self._preopen_record(
+                    sym, slug, "both", combined=round(pa + pb, 4),
+                    shares=round(min(fa, fb), 2), cost=round(fa * pa + fb * pb, 2),
+                    imbalance=round(max(fa, fb) / max(0.01, min(fa, fb)), 3),
+                    posted_ts=e.get("posted_ts"), tick=e.get("tick"),
                 )
                 st.pop(slug, None)
                 self._save()
@@ -4550,6 +4588,11 @@ class MultiTrader:
                     f"preopen_none_{sym}",
                     f"⭕ [PRE-OUVERTURE] {sym} {slug} aucun remplissage -> ordres annules, "
                     f"rien engage",
+                )
+                self._preopen_record(
+                    sym, slug, "none",
+                    combined=round((e["a"]["price"] + e["b"]["price"]), 4),
+                    cost=0.0, posted_ts=e.get("posted_ts"), tick=e.get("tick"),
                 )
                 st.pop(slug, None)
                 self._save()
@@ -4580,6 +4623,11 @@ class MultiTrader:
                     "end_ts": e.get("open_ts", now) + 300,
                     "opened_ts": now, "buffer": 0.0, "must_close": True,
                 }
+            self._preopen_record(
+                sym, slug, "solo", combined=round(e["a"]["price"] + e["b"]["price"], 4),
+                shares=round(n, 2), cost=round(n * leg["price"], 2),
+                sold=round(sold, 2), leg=leg["side"], posted_ts=e.get("posted_ts"), tick=e.get("tick"),
+            )
             st.pop(slug, None)
             self._save()
 
@@ -4614,7 +4662,15 @@ class MultiTrader:
                 # ne JAMAIS atteindre l'ask, sinon l'ordre traverse le carnet
                 # et on redevient TAKER -- ce qui ferait perdre les 4.2% de
                 # frais economises, toute la raison d'etre du mecanisme.
-                px = round(bb + PREOPEN_IMPROVE_TICK, 2)
+                # tick REGLABLE A CHAUD (Steven 06/08 : "on a fait le bid+1
+                # mais on pourrait ptt meme +2 si ca permet de vendre mieux").
+                # Reglable sans redeploiement pour pouvoir comparer les deux
+                # sur des tentatives reelles -- une tentative ratee coutant
+                # zero, ce test ne peut rien couter d'autre que du temps.
+                _tick = self.state.get("preopen_tick")
+                if _tick is None:
+                    _tick = PREOPEN_IMPROVE_TICK
+                px = round(bb + float(_tick), 2)
                 if aa is not None and px >= aa:
                     px = bb          # pas la place d'ameliorer, on reste au bid
                 bids.append(px)
@@ -4682,9 +4738,11 @@ class MultiTrader:
                 # (taille, solde, marche pas pret) -> on laisse passer du temps.
                 mk.setdefault("preopen_cooldown", {})[slug] = now + 60
                 self._log(f"⭕ [PRE-OUVERTURE] {sym} {slug} pose incomplete -> tout annule")
+                self._preopen_record(sym, slug, "rejected", combined=comb, cost=0.0)
                 continue
             posted["open_ts"] = open_ts
             posted["posted_ts"] = now
+            posted["tick"] = float(self.state.get("preopen_tick") or PREOPEN_IMPROVE_TICK)
             st[slug] = posted
             self._save()
             return

@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from flask import Flask, Response, jsonify, request, send_from_directory  # noqa: E402
 
+from real_web import trader as trader_mod  # noqa: E402 (constantes PREOPEN_* pour /api/arb-quality)
 from real_web.trader import MultiTrader, SYMBOLS  # noqa: E402
 from real_control.api import Api as ReadApi  # noqa: E402 (courbes/horloge/log en lecture seule)
 
@@ -913,6 +914,10 @@ def api_arb_quality():
                 p["tagged_risk_free"] = True
             if t.get("arb_locked") is not None:
                 p["arb_locked_flag"] = t.get("arb_locked")
+            if t.get("preopen"):
+                p["preopen"] = True
+            if t.get("pnl") is not None:
+                p["pnl"] = round((p.get("pnl") or 0) + float(t.get("pnl") or 0), 3)
 
     out = []
     for slug, p in pairs.items():
@@ -943,6 +948,8 @@ def api_arb_quality():
                 "cost": round(cost, 2),
                 "worst_payout": round(worst, 2),
                 "tagged_risk_free": bool(p.get("tagged_risk_free")),
+                "preopen": bool(p.get("preopen")),
+                "pnl": p.get("pnl"),
             }
         )
 
@@ -960,10 +967,71 @@ def api_arb_quality():
     # Incoherence a surveiller : paire tagguee risk-free alors qu'elle n'est
     # PAS verrouillee -> elle serait exemptee de TP/SL sans raison.
     mislabeled = [r for r in out if r["tagged_risk_free"] and not r["locked"]]
+
+    # ── SECTION PRE-OUVERTURE ────────────────────────────────────────────
+    # Steven (06/08) : "en pre ouverture je ne vois aucune perte, j'ai meme
+    # l'impression de n'avoir aucun frais quand ca ne passe pas". Verifie et
+    # exact : l'historique on-chain ne contient que des TRADE et des REDEEM,
+    # jamais d'ORDER ni de CANCEL -- Polymarket ne regle que les executions.
+    # Une tentative non remplie coute donc EXACTEMENT zero.
+    #
+    # C'est pour ca que cette section ne peut pas se deduire du PnL : les
+    # echecs y sont litteralement invisibles. Le taux de reussite se lit dans
+    # le journal des tentatives (state['preopen_hist']), pas dans les trades.
+    hist = list(trader.state.get("preopen_hist", []))
+    hist.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+    by_issue = {}
+    for r in hist:
+        by_issue[r.get("issue")] = by_issue.get(r.get("issue"), 0) + 1
+    n_att = len(hist)
+    n_both = by_issue.get("both", 0)
+    n_free = by_issue.get("none", 0) + by_issue.get("rejected", 0)
+    po_pairs = [r for r in out if r["preopen"]]
+    engaged = sum(r["cost"] for r in po_pairs)
+
+    # comparatif par tick d'amelioration : repond a "on pourrait ptt +2"
+    by_tick = {}
+    for r in hist:
+        k = r.get("tick")
+        k = "?" if k is None else f"+{float(k):.2f}"
+        d = by_tick.setdefault(k, {"tick": k, "attempts": 0, "both": 0, "solo": 0, "free": 0})
+        d["attempts"] += 1
+        if r.get("issue") == "both":
+            d["both"] += 1
+        elif r.get("issue") == "solo":
+            d["solo"] += 1
+        else:
+            d["free"] += 1
+    for d in by_tick.values():
+        d["fill_rate_pct"] = round(100 * d["both"] / d["attempts"], 1) if d["attempts"] else None
+
+    preopen = {
+        "enabled": bool(getattr(trader_mod, "PREOPEN_ENABLED", False)),
+        "symbols": list(getattr(trader_mod, "PREOPEN_SYMBOLS", ())),
+        "tick": float(
+            trader.state.get("preopen_tick")
+            if trader.state.get("preopen_tick") is not None
+            else getattr(trader_mod, "PREOPEN_IMPROVE_TICK", 0.01)
+        ),
+        "attempts": n_att,
+        "locked": n_both,
+        "solo": by_issue.get("solo", 0),
+        "free_misses": n_free,
+        "fill_rate_pct": round(100 * n_both / n_att, 1) if n_att else None,
+        # ce que les echecs ont coute : zero par construction, on l'affiche
+        # explicitement pour que ce ne soit pas juste une intuition
+        "cost_of_misses": 0.0,
+        "engaged_usd": round(engaged, 2),
+        "pairs": po_pairs[:60],
+        "by_tick": sorted(by_tick.values(), key=lambda d: d["tick"]),
+        "recent": hist[:60],
+    }
+
     return jsonify(
         {
             "ok": True,
             "pairs": out[:200],
+            "preopen": preopen,
             "summary": {
                 "total_pairs": n,
                 "locked_pairs": nlock,
@@ -978,6 +1046,27 @@ def api_arb_quality():
             },
         }
     )
+
+
+@app.route("/api/preopen/tick", methods=["POST"])
+def api_preopen_tick():
+    """Regle a chaud l'amelioration du bid en pre-ouverture (Steven 06/08 :
+    "on a fait le bid+1 mais on pourrait ptt meme +2"). Sans redeploiement,
+    pour comparer les deux reglages sur des tentatives reelles -- une
+    tentative ratee coutant zero, le test ne risque que du temps.
+
+    Garde-fou cote moteur : la pose ne franchit jamais l'ask, sinon l'ordre
+    traverse le carnet et on redevient TAKER, ce qui reperdrait les 4.2% de
+    frais economises (toute la raison d'etre du mecanisme)."""
+    try:
+        tick = float((request.get_json(silent=True) or {}).get("tick"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "tick invalide"}), 400
+    if not (0.0 <= tick <= 0.05):
+        return jsonify({"ok": False, "error": "tick hors bornes (0 a 0.05)"}), 400
+    trader.state["preopen_tick"] = round(tick, 2)
+    trader._save()
+    return jsonify({"ok": True, "tick": trader.state["preopen_tick"]})
 
 
 @app.route("/api/history-summary")
