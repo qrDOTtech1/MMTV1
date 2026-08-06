@@ -1092,7 +1092,24 @@ PREOPEN_MAX_IMBALANCE = 1.05
 # la moitie de la perte totale, pour un tiers des fenetres. On remonte donc
 # le plancher de 0.38 a 0.44.
 STAGGER_ENTRY_MIN = 0.44          # sous ca : moins de completions ET plus de pertes
-STAGGER_ENTRY_MAX = 0.58          # legerement releve : les tranches hautes tiennent mieux
+# PLAFOND SOUS 0.50 (Steven 06/08 : "il faut les acheter en dessous de 50c !!").
+#
+# J'avais monte ce plafond a 0.58 en optimisant la SURVIE DIRECTIONNELLE de la
+# jambe -- les tranches hautes gagnent plus souvent, c'est vrai mais hors sujet.
+# Ce qui decide du resultat ici, c'est le TAUX DE VERROUILLAGE. Mesure sur 67
+# fenetres (26h) :
+#     entree sous 0.50   : 48 fenetres, 58% verrouillees, 25% restent seules
+#     entree a 0.50 pile :  7 fenetres, 29% verrouillees, 43% restent seules
+#     entree au-dessus   : 12 fenetres, 33% verrouillees, 50% restent seules
+#
+# La raison est mecanique. Pour verrouiller il faut payer la 2e jambe sous
+# 1 - p1, et comme les deux asks somment toujours a 1 + spread, la condition
+# revient a : NOTRE jambe doit s'apprecier de plus que le spread. Une jambe
+# prise a 0.46 est l'outsider : lui revenir a 0.50 est un mouvement de 4
+# centimes qui arrive en permanence dans une fenetre de 5 minutes. Une jambe
+# prise a 0.52 doit aller a 0.56+, c'est-a-dire PROLONGER un mouvement deja
+# entame. A 0.50 pile il n'y a aucun coussin : pile ou face.
+STAGGER_ENTRY_MAX = 0.49
 STAGGER_MIN_SECS_LEFT = 180       # acheter TOT : il faut du temps pour que ca bouge
 STAGGER_COMPLETE_MAX = 0.99       # verrou reel exige pour completer
 STAGGER_GIVEUP_SECS = 50          # filet de fin de fenetre (garde en secours)
