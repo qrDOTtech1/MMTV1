@@ -2892,9 +2892,31 @@ class MultiTrader:
         # RE-EVALUE d'abord les wallets DEJA suivis : un edge peut se degrader
         # (c'est tout le sens de "identifier ceux a ne pas suivre" applique en
         # continu, pas juste a l'ajout).
+        # BUG CORRIGE (Steven 06/08, audit avant depot) : la version precedente
+        # cherchait le wallet suivi dans `evaluated`, qui ne contient QUE les
+        # ~15 wallets les plus actifs du scan courant. Un wallet suivi qui
+        # n'apparaissait pas dans ce top-15 avait match=None -> jamais
+        # reevalue, donc JAMAIS retire. Constate en prod : dernier scan =
+        # 0 eligible / 15 exclus, et pourtant 5 wallets toujours suivis,
+        # ajoutes par un scan anterieur et jamais reverifies depuis.
+        # Desormais on va CHERCHER explicitement les donnees de chaque wallet
+        # suivi, meme absent du scan -- c'est la seule facon que "identifier
+        # ceux a ne pas suivre" fonctionne vraiment en continu.
         for wallet in list(ct["wallets"].keys()):
             match = next((e for e in evaluated if e["wallet"] == wallet), None)
-            if match and not match["eligible"]:
+            if match is None:
+                _ev = self._ct_fetch_wallet_events(wallet, requests, max_pages=1)
+                if not _ev:
+                    self._log(
+                        f"👥 [COPY-AUTO] retire {wallet[:10]} : plus aucune activite "
+                        f"Up/Down 5min recuperable -> impossible de verifier son edge"
+                    )
+                    ct["wallets"].pop(wallet, None)
+                    continue
+                _an = self._ct_analyze(_ev)
+                _ok, _sc, _rs = self._score_trader(_an)
+                match = {"wallet": wallet, "eligible": _ok, "score": _sc, "reasons": _rs, **_an}
+            if not match["eligible"]:
                 self._log(f"👥 [COPY-AUTO] retire {wallet[:10]} : {'; '.join(match['reasons'])}")
                 ct["wallets"].pop(wallet, None)
 
