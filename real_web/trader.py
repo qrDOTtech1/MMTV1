@@ -1055,9 +1055,22 @@ PREOPEN_IMPROVE_TICK = 0.01       # 0 = poser au bid ; 0.01 = prendre la tete de
 PREOPEN_MAX_COMBINED = 0.98       # releve de 0.96 : le bid+1 remonte mecaniquement le combine
 PREOPEN_MIN_LEAD_S = 60           # ne pas poser a moins d'1min de l'ouverture
 PREOPEN_MAX_LEAD_S = 900          # ni plus de 15min avant (carnet pas encore forme)
-PREOPEN_BUDGET_FRAC = 0.08        # part du capital investissable
-PREOPEN_BUDGET_MIN = 2.0
-PREOPEN_BUDGET_MAX = 10.0
+# TAILLE (Steven 06/08, "si capital a 20$+ on peut deja mettre plus").
+# Il avait raison, et il y avait en plus une ambiguite : l'ancienne fraction
+# s'appliquait PAR JAMBE, donc le total engage valait le double -- et avec un
+# petit capital elle passait sous le plancher, si bien que c'etait toujours le
+# minimum de 5 parts qui decidait. La taille ne bougeait donc jamais, que le
+# compte soit a 12$ ou a 50$.
+# Ces constantes designent desormais le TOTAL engage sur la fenetre (les deux
+# jambes ensemble), ce qui est la grandeur qu'on veut reellement piloter.
+# Justification du niveau : le mode d'echec de la pre-ouverture est benin --
+# une seule jambe remplie coute le spread (~0.09$ mesure sur 4.71$ engages,
+# soit ~2%), position soldee AVANT l'ouverture, jamais de pari subi. C'est
+# tres different de l'arb decale ou l'echec coute 100%. On peut donc engager
+# une part nettement plus grande du capital.
+PREOPEN_TOTAL_FRAC = 0.35         # 35% du capital investissable, les 2 jambes
+PREOPEN_BUDGET_MIN = 4.7          # ~5 parts a 0.47 x2 : le vrai plancher CLOB
+PREOPEN_BUDGET_MAX = 40.0
 PREOPEN_CANCEL_BEFORE_S = 30      # a T-30s : on annule ce qui n'est pas rempli
 # BANDE D'ENTREE RESSERREE (Steven 06/08). Mesure sur 279 fenetres du type
 # "arb decale" (jambe 1 entre 0.30 et 0.60), taux de completion et resultat
@@ -4447,8 +4460,11 @@ class MultiTrader:
         return PREOPEN_ENABLED and PREOPEN_EXCLUSIVE and sym in PREOPEN_SYMBOLS
 
     def _preopen_budget(self):
+        """TOTAL a engager sur la fenetre (les DEUX jambes ensemble).
+        Cf. PREOPEN_TOTAL_FRAC : cette valeur designe bien le total, pas
+        le montant par jambe comme dans la version precedente."""
         return round(
-            min(PREOPEN_BUDGET_MAX, max(PREOPEN_BUDGET_MIN, self._investable() * PREOPEN_BUDGET_FRAC)),
+            min(PREOPEN_BUDGET_MAX, max(PREOPEN_BUDGET_MIN, self._investable() * PREOPEN_TOTAL_FRAC)),
             2,
         )
 
@@ -4618,7 +4634,10 @@ class MultiTrader:
             # -> les poses a 4.26 parts etaient rejetees en 400. On part donc
             # de MIN_ORDER_SIZE_SHARES et on arrondit AU-DESSUS.
             budget = self._preopen_budget()
-            shares = round(max(MIN_ORDER_SIZE_SHARES, budget / max(0.01, comb / 2)) + 0.01, 2)
+            # budget = TOTAL des 2 jambes, et le cout total vaut
+            # shares * comb -> shares = budget / comb (avant : budget etait
+            # pris par jambe, ce qui engageait le double du montant annonce).
+            shares = round(max(MIN_ORDER_SIZE_SHARES, budget / max(0.01, comb)) + 0.01, 2)
             besoin = round(shares * comb, 2)
             if besoin > self._investable():
                 self._tlog(
