@@ -1031,7 +1031,18 @@ STAGGER_ENABLED = True
 # petites tailles et le perimetre restreint.
 PREOPEN_ENABLED = True
 PREOPEN_SYMBOLS = ("DOGE",)       # perimetre du test ; ETH/BTC gardent l'arb a l'ouverture
-PREOPEN_MAX_COMBINED = 0.96       # somme des 2 bids posees : au-dela ca ne vaut pas le risque
+# AMELIORATION DU BID (Steven 06/08, apres 6 fenetres a zero remplissage) :
+# poses PILE au meilleur bid, on entrait dans une file de 30 a 67 parts et on
+# ne se remplissait jamais -- pre-ouverture personne ne traverse le carnet,
+# il n'y a que des market makers qui posent. En ajoutant 1 tick (0.01) on
+# devient MEILLEUR bid, donc PREMIER servi des qu'un vendeur se presente.
+# Cout : le combine passe de ~0.95 a ~0.97, soit +3% au lieu de +5%. Ca
+# reste tres superieur a la prise directe (-5.2% apres frais), et c'est le
+# seul moyen de trancher : si on ne se remplit toujours pas en tete de file,
+# c'est qu'il n'y a AUCUN flux vendeur avant l'ouverture, et aucun prix ne
+# nous remplira.
+PREOPEN_IMPROVE_TICK = 0.01       # 0 = poser au bid ; 0.01 = prendre la tete de file
+PREOPEN_MAX_COMBINED = 0.98       # releve de 0.96 : le bid+1 remonte mecaniquement le combine
 PREOPEN_MIN_LEAD_S = 60           # ne pas poser a moins d'1min de l'ouverture
 PREOPEN_MAX_LEAD_S = 900          # ni plus de 15min avant (carnet pas encore forme)
 PREOPEN_BUDGET_FRAC = 0.08        # part du capital investissable
@@ -4531,10 +4542,19 @@ class MultiTrader:
             for tid in token_ids:
                 b = self._live.get_book_sync(tid)
                 bb = b["bids"][0][0] if b and b.get("bids") else None
+                aa = b["asks"][0][0] if b and b.get("asks") else None
                 if bb is None:
                     bids = []
                     break
-                bids.append(bb)
+                # TETE DE FILE (Steven 06/08) : on ameliore le meilleur bid
+                # d'un tick pour etre servi en PREMIER. Garde-fou essentiel :
+                # ne JAMAIS atteindre l'ask, sinon l'ordre traverse le carnet
+                # et on redevient TAKER -- ce qui ferait perdre les 4.2% de
+                # frais economises, toute la raison d'etre du mecanisme.
+                px = round(bb + PREOPEN_IMPROVE_TICK, 2)
+                if aa is not None and px >= aa:
+                    px = bb          # pas la place d'ameliorer, on reste au bid
+                bids.append(px)
             if len(bids) != 2:
                 continue
             comb = round(sum(bids), 4)
