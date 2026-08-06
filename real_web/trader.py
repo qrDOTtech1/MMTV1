@@ -252,6 +252,29 @@ HARD_CAP_USD = 16.0  # cout max d'un trade (releve 10->16, Steven 22/07 : plein 
 # Une paire d'arb normale coute ~5$ (5 parts x combined ~1.0) -> 8$ laisse la
 # marge d'une paire complete + un ajustement, mais jamais un doublement.
 MAX_MARKET_EXPOSURE_USD = 8.0
+# ── PLAFONDS PROPORTIONNELS AU CAPITAL (Steven 06/08, "on peut retirer les
+# plafonds de nos strategies gagnantes ? ou pas ?").
+# Reponse mesuree : ne PAS les retirer, mais les faire GRANDIR avec le
+# capital -- un plafond fixe en dollars devient absurde dans les deux sens
+# (8$ sur un compte de 20$ = 40% du capital sur un seul marche ; 8$ sur un
+# compte de 500$ = plus rien du tout).
+#
+# Les deux strategies gagnantes ne se valent PAS pour autant :
+#
+#  - ARB VERROUILLE : quand min(parts) > cout, le profit est garanti par
+#    ARITHMETIQUE, pas par statistique -- aucune variance. La seule vraie
+#    limite est la profondeur du carnet et le risque d'ECHEC D'EXECUTION
+#    (c'est lui qui a coute -10$ le 05/08, pas l'arb). Donc plafond genereux.
+#
+#  - NEAR-CERTAIN : edge mince (+1.6% de ROI mesure sur 182 jambes, WR 95%).
+#    Kelly plein dirait 23% du capital, MAIS avec n=182 le WR reel est a
+#    +/-3.2 points pres, et a 92% le Kelly devient NEGATIF (-25%). L'edge
+#    n'est pas assez certain pour miser gros : on applique un quart de Kelly
+#    (~6%), ce qui reste robuste meme si le vrai WR est plus bas que mesure.
+MAX_MARKET_EXPOSURE_FRAC = 0.25   # arb : 25% du capital investissable par marche
+NEARCERT_BUDGET_FRAC = 0.06       # near-certain : ~1/4 de Kelly, prudent car edge mince
+MAX_MARKET_EXPOSURE_CEIL = 60.0   # garde-fou absolu tant que la strategie n'est pas
+NEARCERT_BUDGET_CEIL = 20.0       # validee sur gros volume -- a relever plus tard
 MAX_FRACTION = 0.40  # ... et au plus 40% du capital investissable (releve 0.30->0.40)
 MIN_BUDGET_USD = 1.0
 PAPER_START_BAL = 20.0  # solde papier de depart (par marche paper)
@@ -2041,16 +2064,52 @@ class MultiTrader:
         d = mk.setdefault("slug_spent", {})
         d[slug] = round(d.get(slug, 0.0) + usd, 2)
 
+    def _investable(self):
+        """Capital reellement engageable = cash - plancher. Base de tous les
+        plafonds proportionnels (Steven 06/08)."""
+        cash, _ = self._read_cash()
+        if cash is None:
+            return 0.0
+        return max(0.0, cash - self.floor())
+
+    def _max_market_exposure(self):
+        """Plafond d'exposition par marche, PROPORTIONNEL au capital.
+        Grandit avec le compte au lieu de rester fige (cf. commentaire de
+        MAX_MARKET_EXPOSURE_FRAC). Le plancher fixe reste actif pour ne pas
+        bloquer les petits comptes, le plafond absolu pour ne pas concentrer
+        tout le capital sur une seule fenetre de 5 minutes."""
+        return round(
+            min(
+                MAX_MARKET_EXPOSURE_CEIL,
+                max(MAX_MARKET_EXPOSURE_USD, self._investable() * MAX_MARKET_EXPOSURE_FRAC),
+            ),
+            2,
+        )
+
+    def _nearcert_budget(self):
+        """Mise near-certain, PROPORTIONNELLE au capital mais volontairement
+        prudente (~1/4 de Kelly) : l'edge mesure est mince (+1.6%) et le WR
+        reel est incertain a +/-3.2 points sur 182 jambes -- a 92% de WR le
+        Kelly devient negatif. On ne mise donc jamais gros dessus."""
+        return round(
+            min(
+                NEARCERT_BUDGET_CEIL,
+                max(NEARCERT_BUDGET_USD, self._investable() * NEARCERT_BUDGET_FRAC),
+            ),
+            2,
+        )
+
     def _exposure_ok(self, sym, mk, slug, add_usd):
-        """Refuse un achat qui ferait depasser MAX_MARKET_EXPOSURE_USD sur ce
+        """Refuse un achat qui ferait depasser le plafond d'exposition de ce
         marche. Filet STRUCTUREL contre les boucles de re-entree : peu importe
         quel bug ou quelle strategie relance l'achat, le cumul par fenetre est
         borne. Retourne (ok: bool, detail: str)."""
         spent = self._slug_spent(mk, slug)
-        if spent + (add_usd or 0.0) <= MAX_MARKET_EXPOSURE_USD:
+        _cap = self._max_market_exposure()
+        if spent + (add_usd or 0.0) <= _cap:
             return True, ""
         return False, (
-            f"expo={spent:.2f}$+{(add_usd or 0.0):.2f}$ > max={MAX_MARKET_EXPOSURE_USD:.2f}$"
+            f"expo={spent:.2f}$+{(add_usd or 0.0):.2f}$ > max={_cap:.2f}$"
         )
 
     def _record_abort(self, sym, mk):
@@ -4087,7 +4146,7 @@ class MultiTrader:
         if cash is None:
             return False
         investable = max(0.0, cash - self.floor())
-        budget = round(min(NEARCERT_BUDGET_USD, investable), 2)
+        budget = round(min(self._nearcert_budget(), investable), 2)
         budget = max(budget, round(MIN_SELL_SHARES * ask, 2))
         if budget > investable or budget < MIN_BUDGET_USD:
             return False
