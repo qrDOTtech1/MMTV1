@@ -743,6 +743,37 @@ POLY_FEE_SAFETY = 0.003         # marge : mieux vaut rater un arb que le perdre
 # par PART, donc seul min(parts) est un arb. 1.05 laisse passer un arrondi sans
 # laisser passer un vrai desequilibre. Mesure sur 80 arbs reels : equilibres
 # +0.62% de ROI, au-dela de 1.30x -14.03%.
+# ── ARB MAKER EN FENETRE OUVERTE (Steven 06/08) ─────────────────────────
+# Voir _manage_maker_open pour le raisonnement complet. Calibration issue du
+# backtest sur 694 fenetres reelles (566k transactions publiques) : en posant
+# a P des DEUX cotes, part des fenetres ou une vente a P ou moins survient de
+# chaque cote (taille >= 4 parts), donc ou nos deux ordres pouvaient etre
+# servis -- 5 marches a 12 fenetres/heure = 60 fenetres/heure :
+#     pose 0.49+0.49 = 0.98 -> 64.6% des fenetres, marge  +2.0%
+#     pose 0.48+0.48 = 0.96 -> 62.5% des fenetres, marge  +4.0%
+#     pose 0.46+0.46 = 0.92 -> 58.5% des fenetres, marge  +8.0%
+#     pose 0.44+0.44 = 0.88 -> 53.5% des fenetres, marge +12.0%
+# On retient 0.46 : descendre de 0.49 a 0.46 quadruple la marge en ne coutant
+# que 6 points de taux de service. En dessous, le taux chute plus vite.
+#
+# CE CHIFFRE EST UN MAJORANT et je le sais : une vente a 0.46 prouve que des
+# ordres a 0.46 ont ete servis, pas que ce serait le notre -- il peut y avoir
+# 40 parts devant nous dans la file. Le journal makeropen_hist mesurera le
+# taux de remplissage REEL, seule facon de trancher. Le risque est borne : une
+# pose non servie ne coute rien (verifie on-chain), et une jambe seule est
+# soldee avant la fin de fenetre.
+MAKER_OPEN_ENABLED = True
+# BTC pour demarrer : de loin le plus gros flux vendeur, et la pre-ouverture
+# occupe deja DOGE de facon exclusive.
+MAKER_OPEN_SYMBOLS = ("BTC",)
+MAKER_OPEN_PRICE = 0.46           # prix de pose, identique des deux cotes
+MAKER_OPEN_MAX_COMBINED = 0.94    # garde-fou : au-dela on ne pose pas
+MAKER_OPEN_MIN_REMAIN_S = 120     # sous 2 min restantes, trop tard pour etre servi
+MAKER_OPEN_CANCEL_BEFORE_S = 45   # a T-45s : on annule et on solde une jambe seule
+MAKER_OPEN_TOTAL_FRAC = 0.35      # TOTAL des 2 jambes, en part de l'investissable
+MAKER_OPEN_BUDGET_MIN = 4.7
+MAKER_OPEN_BUDGET_MAX = 40.0
+
 PAIR_MAX_IMBALANCE = 1.05
 PAIR_COMPLETION_MAX_COMBINED = 0.95
 # ── ZONE DE COUVERTURE TOLEREE (Steven 05/08, decision explicite) ──────
@@ -3048,6 +3079,12 @@ class MultiTrader:
                         self._manage_preopen(sym)
                     except Exception as e:
                         self._tlog(f"fastexit_preopen_err_{sym}", f"💥 [FAST-EXIT] {sym} pre-ouverture erreur: {e}")
+                    # MAKER EN FENETRE OUVERTE : meme raison que la
+                    # pre-ouverture, il agit quand mk["open"] est vide.
+                    try:
+                        self._manage_maker_open(sym)
+                    except Exception as e:
+                        self._tlog(f"fastexit_makeropen_err_{sym}", f"💥 [FAST-EXIT] {sym} maker-ouvert erreur: {e}")
                     if not self.state["markets"][sym]["open"]:
                         continue
                     try:
@@ -4984,6 +5021,270 @@ class MultiTrader:
             st[slug] = posted
             self._save()
             return
+
+    def _maker_open_state(self, mk):
+        return mk.setdefault("maker_open", {})
+
+    def _manage_maker_open(self, sym):
+        """ARB MAKER EN FENETRE OUVERTE (Steven 06/08).
+
+        C'est la pre-ouverture de Steven, appliquee la ou se trouve reellement
+        la liquidite. Le raisonnement vient du backtest sur 694 fenetres :
+
+          - en PRENEUR, l'arb est structurellement perdant : les frais des deux
+            jambes (0.0455 x min(p,1-p) chacune, soit ~4.4% de la mise) mangent
+            la marge d'arb (4%). Point mort a 0.956, et seules 2.7% des
+            fenetres offrent mieux -> 1.6 arb/h, corrobore par nos 1.3/h reels.
+          - en APPORTEUR les frais sont NULS (verifie on-chain : 9% de nos
+            transactions ont un ecart prix x parts exactement nul, ce sont les
+            remplissages maker), et une pose non servie ne coute rien du tout
+            (l'historique on-chain ne contient que des TRADE et des REDEEM,
+            jamais d'ORDER ni de CANCEL).
+
+        Le flux vendeur avant ouverture est trop maigre pour ca : sur BTC, des
+        ventes des DEUX cotes n'existent que dans 7% des fenetres. Une fois la
+        fenetre OUVERTE, en revanche, en posant a 0.46 des deux cotes les deux
+        jambes sont servies dans 58.5% des fenetres, pour 8% de marge brute.
+
+        Le verrou n'exige PAS la simultaneite : acheter Up a 0.46 a la 10e
+        seconde et Down a 0.46 a la 200e donne quand meme un combine de 0.92.
+
+        L'INCONNUE, que seul le reel peut trancher : notre place dans la file.
+        Une vente a 0.46 prouve que des ordres a 0.46 ont ete servis, pas que
+        ce serait le notre. D'ou le journal des tentatives, qui mesurera le
+        taux de remplissage effectif. Le risque est borne : ce qui n'est pas
+        servi ne coute rien, et une jambe seule est soldee avant la fin."""
+        if not MAKER_OPEN_ENABLED or sym not in MAKER_OPEN_SYMBOLS:
+            return
+        if self.state["modes"].get(sym) != "real":
+            return
+        mk = self.state["markets"][sym]
+        st = self._maker_open_state(mk)
+        now = time.time()
+
+        # ── SUIVI DES ORDRES POSES ──────────────────────────────────────
+        for slug in list(st.keys()):
+            e = st[slug]
+            reste = e.get("fin_ts", 0) - now
+            fills = {}
+            for cote in ("a", "b"):
+                leg = e.get(cote) or {}
+                tid = leg.get("token_id")
+                if not tid:
+                    continue
+                held = self._live.position_size(tid)
+                fills[cote] = max(0.0, held if held and held > 0 else 0.0)
+            fa, fb = fills.get("a", 0.0), fills.get("b", 0.0)
+
+            if fa > 0.01 and fb > 0.01:
+                # LES DEUX SERVIS -> arb verrouille, sans le moindre frais.
+                for cote in ("a", "b"):
+                    oid = (e.get(cote) or {}).get("order_id")
+                    if oid:
+                        self._live.cancel_order(oid)
+                for cote in ("a", "b"):
+                    leg = e[cote]
+                    tid = leg.get("token_id")
+                    held = self._live.position_size(tid)
+                    fills[cote] = max(0.0, held if held and held > 0 else 0.0)
+                fa, fb = fills.get("a", 0.0), fills.get("b", 0.0)
+                if not (fa > 0.01 and fb > 0.01):
+                    continue
+                for cote in ("a", "b"):
+                    leg = e[cote]
+                    n = fills[cote]
+                    mk["open"][f"{slug}|{leg['side']}"] = {
+                        "symbol": sym, "slug": slug, "side": leg["side"], "mode": "real",
+                        # strat 'bothside' A DESSEIN : tout nouveau strat doit
+                        # etre ajoute a la main dans les filtres de
+                        # _manage_pnl_tier_exits sous peine de perdre toute
+                        # gestion TP/SL. On marque l'origine a cote.
+                        "strat": "bothside", "maker_open": True,
+                        "token_id": leg["token_id"], "entry_price": leg["price"],
+                        "filled_shares": round(n, 2),
+                        "cost": round(n * leg["price"], 2),
+                        "start_ts": e.get("debut_ts"), "pair": None,
+                        "end_ts": e.get("fin_ts"), "opened_ts": now, "buffer": 0.0,
+                    }
+                    self._add_slug_spent(mk, slug, round(n * leg["price"], 2))
+                pa, pb = e["a"]["price"], e["b"]["price"]
+                self._log(
+                    f"🎉 [MAKER-OUVERT] {sym} {slug} LES DEUX JAMBES SERVIES "
+                    f"{pa:.3f}+{pb:.3f}={pa + pb:.3f} ({fa:.2f}/{fb:.2f} parts) "
+                    f"-- apporteur, ZERO frais"
+                )
+                # _tag_pair_lock solde tout excedent de parts (cf. la-bas)
+                self._tag_pair_lock(
+                    mk["open"].get(f"{slug}|{e['a']['side']}"),
+                    mk["open"].get(f"{slug}|{e['b']['side']}"),
+                    pa + pb, tag=f" {sym} {slug} MAKER-OUVERT",
+                )
+                self._maker_open_record(sym, slug, "les_deux", combine=round(pa + pb, 4),
+                                        parts=round(min(fa, fb), 2), prix=pa)
+                st.pop(slug, None)
+                self._save()
+                continue
+
+            # tant qu'il reste du temps, on laisse courir : la 2e jambe peut
+            # arriver bien plus tard dans la fenetre, le verrou n'exige pas la
+            # simultaneite.
+            if reste > MAKER_OPEN_CANCEL_BEFORE_S:
+                continue
+
+            # ── FIN DE FENETRE : on annule ce qui dort ──
+            for cote in ("a", "b"):
+                oid = (e.get(cote) or {}).get("order_id")
+                if oid and not fills.get(cote, 0) > 0.01:
+                    self._live.cancel_order(oid)
+            if fa <= 0.01 and fb <= 0.01:
+                self._tlog(
+                    f"makeropen_rien_{sym}",
+                    f"⭕ [MAKER-OUVERT] {sym} {slug} aucun remplissage -> annule, "
+                    f"cout ZERO",
+                )
+                self._maker_open_record(sym, slug, "aucun", combine=None, parts=0, prix=None)
+                # une fenetre traitee ne doit jamais etre reposee : le garde
+                # MAKER_OPEN_MIN_REMAIN_S y suffit aujourd'hui, ce verrou
+                # explicite evite qu'un futur changement de constante ne
+                # rouvre la porte a une reprise en boucle sur la meme fenetre.
+                mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                st.pop(slug, None)
+                self._save()
+                continue
+
+            # UNE SEULE servie : on la solde avant la resolution. C'est la
+            # difference decisive avec l'arb decale, qui la gardait : une jambe
+            # nue portee a resolution vaut EXACTEMENT -100% quand elle perd,
+            # mesure sur 51 cas sur 51.
+            cote = "a" if fa > 0.01 else "b"
+            leg = e[cote]
+            n = fills[cote]
+            self._log(
+                f"⚠️ [MAKER-OUVERT] {sym} {slug} une seule jambe servie "
+                f"({leg['side']} {n:.2f} parts @ {leg['price']:.3f}) -> on solde avant la fin"
+            )
+            vendu = self._sell_orphan(
+                leg["token_id"], round(n, 2),
+                f" {sym} {slug} {leg['side']} MAKER-OUVERT-SOLO",
+                entry_price=leg["price"], symbol=sym, slug=slug, side=leg["side"],
+            )
+            if vendu < n - 0.01:
+                mk["open"][f"{slug}|{leg['side']}"] = {
+                    "symbol": sym, "slug": slug, "side": leg["side"], "mode": "real",
+                    "strat": "orphan", "token_id": leg["token_id"],
+                    "entry_price": leg["price"], "filled_shares": round(n - vendu, 2),
+                    "cost": round((n - vendu) * leg["price"], 2),
+                    "start_ts": e.get("debut_ts"), "pair": None,
+                    "end_ts": e.get("fin_ts"), "opened_ts": now,
+                    "buffer": 0.0, "must_close": True,
+                }
+            self._maker_open_record(sym, slug, "une_seule", combine=None,
+                                    parts=round(n, 2), prix=leg["price"], vendu=round(vendu, 2))
+            mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+            st.pop(slug, None)
+            self._save()
+
+        # ── POSE SUR LA FENETRE EN COURS ────────────────────────────────
+        if st:
+            return                      # une seule fenetre a la fois
+        debut = int(now // 300) * 300
+        fin = debut + 300
+        reste = fin - now
+        if reste < MAKER_OPEN_MIN_REMAIN_S:
+            return                      # trop tard pour esperer etre servi
+        slug = f"{sym.lower()}-updown-5m-{debut}"
+        if any(k.startswith(f"{slug}|") for k in mk["open"]):
+            return                      # deja une position sur cette fenetre
+        if mk.setdefault("makeropen_cooldown", {}).get(slug, 0) > now:
+            return
+        meta = self._market_meta(slug)
+        if not meta:
+            return
+        outcomes, token_ids = meta
+
+        prix = []
+        for tid in token_ids:
+            b = self._live.get_book_sync(tid)
+            aa = b["asks"][0][0] if b and b.get("asks") else None
+            if aa is None:
+                return
+            # JAMAIS AU-DESSUS DE L'ASK : un achat limite qui atteint l'ask
+            # traverse le carnet et nous rend PRENEUR -- ce qui reperdrait
+            # exactement les frais que ce mecanisme existe pour eviter.
+            if MAKER_OPEN_PRICE >= aa:
+                self._tlog(
+                    f"makeropen_cher_{sym}",
+                    f"⏸️ [MAKER-OUVERT] {sym} {slug} l'ask est deja a {aa:.3f}, "
+                    f"poser a {MAKER_OPEN_PRICE:.2f} nous rendrait PRENEUR -> on ne pose pas",
+                )
+                return
+            prix.append(MAKER_OPEN_PRICE)
+        comb = round(sum(prix), 4)
+        if comb > MAKER_OPEN_MAX_COMBINED:
+            return
+
+        budget = self._maker_open_budget()
+        parts = round(max(MIN_ORDER_SIZE_SHARES, budget / max(0.01, comb)) + 0.01, 2)
+        besoin = round(parts * comb, 2)
+        if besoin > self._investable():
+            self._tlog(
+                f"makeropen_fonds_{sym}",
+                f"⛔ [MAKER-OUVERT] {sym} {slug} il faut {besoin:.2f}$ pour les 2 jambes, "
+                f"{self._investable():.2f}$ dispo -> on ne pose pas ce qu'on ne peut pas honorer",
+            )
+            return
+        ok_exp, _ = self._exposure_ok(sym, mk, slug, besoin)
+        if not ok_exp:
+            return
+
+        self._log(
+            f"📮 [MAKER-OUVERT] {sym} {slug} {reste:.0f}s restantes | pose 2 ordres "
+            f"PASSIFS {outcomes[0]}@{prix[0]:.3f} + {outcomes[1]}@{prix[1]:.3f} = {comb:.3f} "
+            f"({parts} parts, {besoin:.2f}$) -> +{(1 - comb) * 100:.1f}% si les 2 sont servis"
+        )
+        pose = {}
+        for i, (side, tid) in enumerate(zip(outcomes, token_ids)):
+            r = self._live.post_limit_buy(tid, prix[i], parts)
+            pose["a" if i == 0 else "b"] = {
+                "side": side, "token_id": tid, "price": prix[i],
+                "order_id": r.get("order_id"), "ok": bool(r.get("success")),
+            }
+            if not r.get("success"):
+                _err = str(r.get("error") or "")
+                _cause = _err.split("error_message=")[-1] if "error_message=" in _err else _err
+                self._log(
+                    f"⚠️ [MAKER-OUVERT] {sym} {slug} {side} @ {prix[i]:.3f} x{parts} "
+                    f"refuse : {_cause[:300]}"
+                )
+        if not all(v.get("ok") for v in pose.values()):
+            for v in pose.values():
+                if v.get("order_id"):
+                    self._live.cancel_order(v["order_id"])
+            mk.setdefault("makeropen_cooldown", {})[slug] = now + 60
+            self._log(f"⭕ [MAKER-OUVERT] {sym} {slug} pose incomplete -> tout annule")
+            self._maker_open_record(sym, slug, "refuse", combine=comb, parts=0, prix=None)
+            return
+        pose["debut_ts"] = debut
+        pose["fin_ts"] = fin
+        st[slug] = pose
+        self._save()
+
+    def _maker_open_budget(self):
+        return round(
+            min(MAKER_OPEN_BUDGET_MAX,
+                max(MAKER_OPEN_BUDGET_MIN, self._investable() * MAKER_OPEN_TOTAL_FRAC)),
+            2,
+        )
+
+    def _maker_open_record(self, sym, slug, issue, **kw):
+        """Journal des tentatives, meme raison qu'en pre-ouverture : les echecs
+        ne coutent rien, donc ils sont INVISIBLES dans le PnL. Le taux de
+        remplissage -- la seule vraie inconnue de ce mecanisme -- ne peut se
+        lire que dans ce journal."""
+        h = self.state.setdefault("makeropen_hist", [])
+        h.append({"ts": time.time(), "symbol": sym, "slug": slug, "issue": issue, **kw})
+        if len(h) > 400:
+            del h[: len(h) - 400]
 
     def _manage_stagger(self, sym):
         """ARB DECALE, suite : complete la paire des que le verrou est

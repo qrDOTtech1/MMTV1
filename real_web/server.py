@@ -1027,6 +1027,32 @@ def api_arb_quality():
         "recent": hist[:60],
     }
 
+    # ── MAKER EN FENETRE OUVERTE ────────────────────────────────────────
+    # Meme logique que la pre-ouverture : les tentatives non servies ne
+    # coutent rien, donc elles sont INVISIBLES dans le PnL. Le taux de
+    # remplissage -- la seule vraie inconnue du mecanisme, celle de notre
+    # place dans la file d'attente -- ne se lit que dans ce journal.
+    mo = list(trader.state.get("makeropen_hist", []))
+    mo.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+    mo_issues = {}
+    for r in mo:
+        mo_issues[r.get("issue")] = mo_issues.get(r.get("issue"), 0) + 1
+    mo_n = len(mo)
+    mo_ok = mo_issues.get("les_deux", 0)
+    preopen["maker_open"] = {
+        "enabled": bool(getattr(trader_mod, "MAKER_OPEN_ENABLED", False)),
+        "symbols": list(getattr(trader_mod, "MAKER_OPEN_SYMBOLS", ())),
+        "prix": float(getattr(trader_mod, "MAKER_OPEN_PRICE", 0.46)),
+        "attempts": mo_n,
+        "locked": mo_ok,
+        "solo": mo_issues.get("une_seule", 0),
+        "free_misses": mo_issues.get("aucun", 0) + mo_issues.get("refuse", 0),
+        "fill_rate_pct": round(100 * mo_ok / mo_n, 1) if mo_n else None,
+        "cost_of_misses": 0.0,
+        "recent": mo[:60],
+    }
+
+
     return jsonify(
         {
             "ok": True,
