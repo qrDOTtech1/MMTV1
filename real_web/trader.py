@@ -1031,6 +1031,16 @@ STAGGER_ENABLED = True
 # petites tailles et le perimetre restreint.
 PREOPEN_ENABLED = True
 PREOPEN_SYMBOLS = ("DOGE",)       # perimetre du test ; ETH/BTC gardent l'arb a l'ouverture
+# EXCLUSIVITE (Steven 06/08, "protection pour que DOGE n'ouvre pas de
+# position et se concentre sur la pre-ouverture") : sur ces symboles, AUCUNE
+# autre strategie n'a le droit d'ouvrir. Mesure qui l'a motive : sur la
+# fenetre doge-1785993000, la pre-ouverture avait fait son travail
+# proprement (une seule jambe remplie -> soldee avant l'ouverture, -0.08$ de
+# spread), puis l'arb decale a ouvert PAR-DESSUS 5s apres l'ouverture et a
+# perdu -0.91$. Les deux mecanismes se marchaient dessus.
+# N'affecte QUE la prise de position : la gestion des positions existantes
+# (TP/SL, fermeture des jambes nues) reste entiere.
+PREOPEN_EXCLUSIVE = True
 # AMELIORATION DU BID (Steven 06/08, apres 6 fenetres a zero remplissage) :
 # poses PILE au meilleur bid, on entrait dans une file de 30 a 67 parts et on
 # ne se remplissait jamais -- pre-ouverture personne ne traverse le carnet,
@@ -4291,6 +4301,9 @@ class MultiTrader:
 
         Voir les constantes STAGGER_* pour le raisonnement complet et les
         mesures. Ne s'active que si aucun arb simultane n'etait possible."""
+        if self._preopen_only(sym):
+            return False   # symbole reserve a la pre-ouverture
+
         if not STAGGER_ENABLED or mode != "real":
             return False
         now = synced_now()
@@ -4398,6 +4411,12 @@ class MultiTrader:
             f"-> en attente du verrou (cible : autre cote < {besoin:.3f})"
         )
         return True
+
+    def _preopen_only(self, sym):
+        """True si ce symbole est reserve a la pre-ouverture (Steven 06/08).
+        Empeche toute AUTRE strategie d'y ouvrir une position -- les deux
+        mecanismes se marchaient dessus (cf. PREOPEN_EXCLUSIVE)."""
+        return PREOPEN_ENABLED and PREOPEN_EXCLUSIVE and sym in PREOPEN_SYMBOLS
 
     def _preopen_budget(self):
         return round(
@@ -4760,6 +4779,9 @@ class MultiTrader:
         L'edge est MINCE (+1.6%). Il ne survit que si on ne paie pas plus cher
         que la bande et qu'on ne le dilue pas : mise fixe, une seule tentative
         par fenetre, et confirmation Binance exigee en plus du prix."""
+        if self._preopen_only(sym):
+            return False   # symbole reserve a la pre-ouverture
+
         from core.btc_updown import _binance_price, _strike_at
 
         if not NEARCERT_ENABLED or mode != "real":
@@ -4851,6 +4873,9 @@ class MultiTrader:
         n'a jamais ete teste, c'est le filtre Binance strict a l'entree
         (0.25% d'ecart au strike, pas juste "devant"). C'est une hypothese a
         mesurer, pas un edge etabli -- d'ou la taille volontairement petite."""
+        if self._preopen_only(sym):
+            return False   # symbole reserve a la pre-ouverture
+
         from core.btc_updown import _binance_price, _strike_at
 
         if not FAV_ENABLED:
@@ -7738,6 +7763,22 @@ class MultiTrader:
             1 for side in outcomes
             if (mk["open"].get(f"{slug}|{side}") or {}).get("strat") in ("bothside", "swing")
         )
+
+        # EXCLUSIVITE PRE-OUVERTURE (Steven 06/08) : sur un symbole reserve,
+        # ce chemin (arb both-side a l'ouverture, arb decale, FIRST-LEG,
+        # HEDGE-NEAR...) n'ouvre RIEN. C'est lui qui ouvrait par-dessus la
+        # pre-ouverture -- mesure sur doge-1785993000 : la pre-ouverture avait
+        # solde proprement (-0.08$ de spread), puis ce chemin a ouvert 5s
+        # apres l'ouverture et perdu -0.91$.
+        # On ne coupe QUE l'ouverture : si des jambes sont deja tenues, on
+        # laisse la fonction s'executer pour qu'elles restent gerees.
+        if self._preopen_only(sym) and legs_held == 0:
+            self._tlog(
+                f"preopen_excl_{sym}",
+                f"⏸️ [PRE-OUVERTURE] {sym} reserve a la pre-ouverture -> "
+                f"aucune ouverture a l'ouverture du marche",
+            )
+            return False
 
         # ── COMBINED HISTORY (Steven 26/07) :跟踪每个slug的combined历史 ──
         # Le combined oscille pendant la fenêtre 5min. Un snapshot à T peut
