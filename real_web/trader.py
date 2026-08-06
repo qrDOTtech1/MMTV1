@@ -700,7 +700,28 @@ INSTANT_ARB_MAX_COMBINED = 0.99  # au-dela : pas assez de marge garantie
 # quelques dollars, ce capital immobilise est ce qui empeche de prendre le
 # vrai arb suivant. On complete donc UNIQUEMENT si ca verrouille vraiment ;
 # sinon la jambe part en must_close (cf. "zero jambe nue").
-PAIR_COMPLETION_MAX_COMBINED = 0.99
+# ── FRAIS POLYMARKET (Steven 06/08, decouverts en analysant un "verrou"
+# qui n'en etait pas). Le bot n'a JAMAIS compte les frais : il loggait
+# "gain garanti +0.09$" sur une paire qui, on-chain, coutait 4.72$ pour un
+# payout de 4.65$ -- soit une PERTE de 0.07$.
+#
+# Barème officiel du marche (champ feeSchedule de l'API Gamma) :
+#   {'rate': 0.07, 'takerOnly': True, 'rebateRate': 0.2, 'exponent': 1}
+# Formule : frais = rate * min(p, 1-p) * parts  (maximum au milieu, nul aux
+# extremes -- c'est pour ca que le near-certain a 0.96 paie tres peu).
+#
+# TAUX REEL DE CE COMPTE : 0.042 mesure sur 338 achats a prix central
+# (badge Polymarket = -40% du bareme public, stable sur 24h). On garde une
+# petite marge de securite car le taux varie legerement (p25-p75 :
+# 0.036-0.048) et un badge peut changer de palier.
+POLY_FEE_RATE = 0.048           # taux prudent (p75 mesure), pas la mediane
+POLY_FEE_SAFETY = 0.003         # marge : mieux vaut rater un arb que le perdre
+
+# Seuil de verrou AVANT frais. Avec 2 jambes sous 0.50 les frais valent
+# rate*C, donc le vrai seuil de rentabilite est 1/(1+rate) = 0.954 a 0.048.
+# On ne s'en sert plus comme critere principal (cf. _pair_net_after_fees qui
+# calcule le cout EXACT jambe par jambe), mais comme premier filtre grossier.
+PAIR_COMPLETION_MAX_COMBINED = 0.95
 # ── ZONE DE COUVERTURE TOLEREE (Steven 05/08, decision explicite) ──────
 # Cas reel qui a motive ce palier : 13:20:47 achat Up 4.976 @ 0.410, puis
 # 6 SECONDES plus tard achat Down 4.919 @ 0.620 -> combine 1.030. Le prix
@@ -2042,6 +2063,40 @@ class MultiTrader:
         return False
 
     # ── VERROU REEL D'UNE PAIRE (Steven 05/08) ──────────────────────────
+    @staticmethod
+    def _poly_fee(price, shares):
+        """Frais Polymarket : rate * min(p, 1-p) * parts (formule officielle,
+        champ feeSchedule de l'API). Maximum au milieu du carnet, quasi nul
+        aux extremes -- c'est pour ca que le near-certain a 0.96 paie tres peu
+        alors qu'une paire a 0.50/0.50 paie plein pot."""
+        try:
+            p = float(price)
+            n = float(shares)
+        except (TypeError, ValueError):
+            return 0.0
+        if n <= 0 or not (0 < p < 1):
+            return 0.0
+        return (POLY_FEE_RATE + POLY_FEE_SAFETY) * min(p, 1 - p) * n
+
+    def _pair_net_after_fees(self, px_a, sh_a, px_b, sh_b):
+        """Gain net GARANTI d'une paire, FRAIS INCLUS.
+
+        C'est le seul critere qui compte : le payout du pire cas est
+        min(parts_a, parts_b) et le cout inclut les frais des DEUX jambes.
+        Sans ca, le bot loggait "gain garanti +0.09$" sur une paire qui
+        perdait 0.07$ une fois les frais payes (constate on-chain le 06/08 :
+        DOGE 4.65 parts a 0.430 + 4.65 a 0.550, annonce 4.56$ de cout, reel
+        4.72$)."""
+        try:
+            payout = min(float(sh_a), float(sh_b))
+        except (TypeError, ValueError):
+            return -999.0
+        cout = (
+            float(px_a) * float(sh_a) + self._poly_fee(px_a, sh_a)
+            + float(px_b) * float(sh_b) + self._poly_fee(px_b, sh_b)
+        )
+        return round(payout - cout, 4)
+
     def _pair_is_locked(self, shares_a, cost_a, shares_b, cost_b):
         """Une paire n'est un arb GARANTI que si le payout du PIRE cas couvre
         le cout total. Sur un marche binaire le gagnant paie 1$ PAR PART, donc
@@ -2070,10 +2125,18 @@ class MultiTrader:
         position surveillee qu'un faux arb abandonne a la resolution."""
         if not pos_a or not pos_b:
             return False
-        locked, margin = self._pair_is_locked(
-            pos_a.get("filled_shares"), pos_a.get("cost"),
-            pos_b.get("filled_shares"), pos_b.get("cost"),
+        # FRAIS INCLUS (Steven 06/08) : _pair_is_locked compare payout et cout
+        # BRUTS. Or les frais Polymarket (rate * min(p,1-p) * parts) ne sont
+        # pas dans "cost" -- d'ou un "gain garanti +0.09$" annonce sur une
+        # paire qui perdait 0.07$ reellement. On recalcule le net frais inclus
+        # a partir des prix d'entree, et on n'accorde is_risk_free que si ce
+        # net est POSITIF : une paire qui perd apres frais doit rester geree
+        # en TP/SL, pas etre tenue jusqu'a resolution comme un profit acquis.
+        margin = self._pair_net_after_fees(
+            pos_a.get("entry_price"), pos_a.get("filled_shares"),
+            pos_b.get("entry_price"), pos_b.get("filled_shares"),
         )
+        locked = margin > 0
         for _p in (pos_a, pos_b):
             _p["arb_combined"] = round(combined, 4) if combined else None
             _p["arb_edge"] = round(1 - combined, 4) if combined else None
@@ -4279,15 +4342,19 @@ class MultiTrader:
             if oask is None:
                 continue
             comb = entry + oask
-            if comb >= STAGGER_COMPLETE_MAX:
+            # VERROU CALCULE FRAIS INCLUS (Steven 06/08) : le combine seul ne
+            # suffit pas -- a 0.98 la paire est PERDANTE une fois les frais
+            # payes (mesure : cout reel = combine * 1.048 sur ce compte). On
+            # exige donc un gain net positif, calcule jambe par jambe.
+            need = round(shares, 2)
+            net = self._pair_net_after_fees(entry, shares, oask, need)
+            if net <= 0:
                 self._tlog(
                     f"stagwait_{key}",
                     f"⏳ [ARB-DECALE] {sym} {slug} attente : {entry:.3f}+{oask:.3f}={comb:.3f} "
-                    f"(verrou a {STAGGER_COMPLETE_MAX}, {secs_left:.0f}s restantes)",
+                    f"-> net APRES FRAIS {net:+.3f}$ (il faut > 0), {secs_left:.0f}s restantes",
                 )
                 continue
-            # PARTS EGALES : c'est min(parts) qui determine le payout garanti.
-            need = round(shares, 2)
             cost = round(need * oask, 2)
             cash, _ = self._read_cash(max_age=0)
             if cash is None:
@@ -4303,8 +4370,9 @@ class MultiTrader:
             if not ok_exp:
                 continue
             self._log(
-                f"🔓 [ARB-DECALE] {sym} {slug} VERROU ATTEIGNABLE {entry:.3f}+{oask:.3f}="
-                f"{comb:.3f} -> achat jambe2 {other} {need} parts ({cost:.2f}$)"
+                f"🔓 [ARB-DECALE] {sym} {slug} VERROU {entry:.3f}+{oask:.3f}={comb:.3f} "
+                f"-> gain net APRES FRAIS {net:+.3f}$ | achat jambe2 {other} "
+                f"{need} parts ({cost:.2f}$)"
             )
             with self._order_lock:
                 res = self._live.snipe_buy_limit_exact(otid, oask, need)
