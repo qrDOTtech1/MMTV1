@@ -35,6 +35,7 @@ PAIRS = {
     "SOL": "solusdt",
     "XRP": "xrpusdt",
     "DOGE": "dogeusdt",
+    "BNB": "bnbusdt",
 }
 STALE_S = 3.0  # au-dela, une valeur est jugee perimee -> l'appelant fallback REST
 

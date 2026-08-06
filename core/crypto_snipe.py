@@ -25,6 +25,7 @@ CRYPTO_MAP = {
     "solana": "SOL", "sol": "SOL",
     "dogecoin": "DOGE", "doge": "DOGE",
     "xrp": "XRP", "ripple": "XRP",
+    "binance-coin": "BNB", "bnb": "BNB",
 }
 
 _price_cache: dict = {}

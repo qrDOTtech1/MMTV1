@@ -41,6 +41,9 @@ SYMS = {
     "ripple": ("XRP", "XRPUSDT"),
     "dogecoin": ("DOGE", "DOGEUSDT"),
     "doge": ("DOGE", "DOGEUSDT"),
+    # BNB ajoute 06/08 : paire BNBUSDT verifiee cotee sur Binance.
+    "binance-coin": ("BNB", "BNBUSDT"),
+    "bnb": ("BNB", "BNBUSDT"),
 }
 
 # ── SYNCHRO HORLOGE (decouverte 21/07) ──
@@ -95,7 +98,10 @@ _poly_strike_cache: dict = {}  # slug -> priceToBeat (strike officiel Chainlink/
 # plus volatils : mesure du 21/07 -> ETH x1.24, SOL x1.27, XRP x1.27, DOGE x1.19
 # par rapport a BTC. La marge exigee est donc mise a l'echelle de la volatilite
 # REELLE de chaque actif, pour un niveau de securite EQUIVALENT partout.
-_vol_ratio: dict = {"BTC": 1.0, "ETH": 1.24, "SOL": 1.27, "XRP": 1.27, "DOGE": 1.19}
+# BNB mesure a 1.34x BTC le 06/08 (60 bougies 1min) ; valeur de depart,
+# _measure_vol_ratios la recalcule ensuite periodiquement comme les autres.
+_vol_ratio: dict = {"BTC": 1.0, "ETH": 1.24, "SOL": 1.27, "XRP": 1.27, "DOGE": 1.19,
+                    "BNB": 1.34}
 _vol_lock = threading.Lock()
 
 # ── CONVICTION MINIMALE PAR MARCHE (22/07) ──
@@ -106,7 +112,8 @@ _vol_lock = threading.Lock()
 # que 5 pas de cotation = quasi du BRUIT de cotation, pas un vrai signal.
 # On exige donc que XRP depasse la marge d'une marge confortable.
 # BTC reste a 1.0 (aucun changement -> son 21W/0L n'est pas touche).
-_MIN_CONVICTION: dict = {"BTC": 1.0, "ETH": 1.0, "SOL": 1.0, "XRP": 1.6, "DOGE": 1.0}
+_MIN_CONVICTION: dict = {"BTC": 1.0, "ETH": 1.0, "SOL": 1.0, "XRP": 1.6, "DOGE": 1.0,
+                         "BNB": 1.0}
 
 
 def _measure_vol_ratios():
@@ -121,6 +128,7 @@ def _measure_vol_ratios():
         "SOL": "SOLUSDT",
         "XRP": "XRPUSDT",
         "DOGE": "DOGEUSDT",
+        "BNB": "BNBUSDT",
     }
     out = {}
     for sym, pair in pairs.items():
@@ -168,7 +176,7 @@ def _measure_sigma5m():
 
     pairs = {
         "BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT",
-        "XRP": "XRPUSDT", "DOGE": "DOGEUSDT",
+        "XRP": "XRPUSDT", "DOGE": "DOGEUSDT", "BNB": "BNBUSDT",
     }
     out = {}
     for sym, pair in pairs.items():
@@ -214,7 +222,7 @@ def probability_above_strike(pair, current_price, strike, secs_remaining):
         return None
     sym = None
     for s, p in (("BTC", "BTCUSDT"), ("ETH", "ETHUSDT"), ("SOL", "SOLUSDT"),
-                 ("XRP", "XRPUSDT"), ("DOGE", "DOGEUSDT")):
+                 ("XRP", "XRPUSDT"), ("DOGE", "DOGEUSDT"), ("BNB", "BNBUSDT")):
         if p == pair:
             sym = s
             break

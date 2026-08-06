@@ -1207,7 +1207,18 @@ STAGGER_BUDGET_FRAC = 0.10        # part du capital investissable
 STAGGER_BUDGET_MIN = 2.0
 STAGGER_BUDGET_MAX = 12.0
 
-NEARCERT_ENABLED = True
+# EN PAUSE sur decision de Steven (06/08). Il avait d'abord choisi de le garder
+# ("il fait gagner peu mais il fait gagner"), puis demande la pause pour ne
+# laisser tourner que l'arb instantane et la pre-ouverture.
+#
+# Ce que dit la mesure, pour le jour ou on le rallumera : la regle NAIVE
+# "acheter tout ce qui depasse 0.97 et porter a resolution" est perdante sur
+# 694 fenetres -- 95.7% de reussite, mais a 0.98 paye le prix est deja juste,
+# ROI -1.74%, et ca reste negatif a tous les ecarts de carnet testes. Nos
+# propres near-certain mesuraient +1.6%, l'ecart venant probablement du fait
+# que le bot CHOISIT ses moments et qu'une partie des remplissages etaient
+# maker. C'est cette selection-la qu'il faudra isoler avant de rallumer.
+NEARCERT_ENABLED = False
 NEARCERT_MIN_PRICE = 0.95
 NEARCERT_MAX_PRICE = 0.98
 NEARCERT_MAX_SECS = 120   # tard dans la fenetre = issue deja largement jouee
@@ -1297,7 +1308,13 @@ STOP_WINDOW_REMAIN_SECS = 30  # secondes restantes -> stop si perdant
 STOP_UNREALIZED_PCT = 0.30  # -30% du cout en < 30s -> abort
 STOP_MARKET_SPEED = 0.20  # mouvement > 0.20 en < 3s -> vente
 
-SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+# BNB ajoute 06/08 (Steven, "ajoute les nouveaux marches"). Verifie avant
+# branchement : marche 5m present sur les 3 prochaines fenetres, carnet a
+# ~13000 parts de profondeur (comparable a SOL/XRP/DOGE), et surtout paire
+# BNBUSDT cotee sur Binance -- sans flux de prix le bot serait aveugle.
+# HYPE a ete ECARTE pour cette raison : le marche Polymarket existe mais il
+# n'y a aucune paire HYPE sur Binance (HYPER* est un autre jeton).
+SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"]
 # SOL/XRP/DOGE ajoutes 21/07 en PAPER uniquement : on collecte des donnees par
 # marche (chacun a sa propre volatilite -> ses propres seuils, cf. ETH qui bouge
 # trop peu pour les marges calibrees BTC) avant d'envisager le reel.
@@ -1307,6 +1324,13 @@ DEFAULT_MODES = {
     "SOL": "paper",
     "XRP": "paper",
     "DOGE": "paper",
+    # BNB en REEL des le depart (Steven 06/08, demande explicite d'augmenter le
+    # volume) : le laisser en paper n'aurait produit aucun trade, donc aucun
+    # volume supplementaire. C'est defendable ici parce que l'arb instantane est
+    # purement arithmetique -- il compare les deux prix d'un meme marche et
+    # n'exige rien du comportement du sous-jacent. Basculable depuis le
+    # tableau de bord si tu veux l'observer en paper d'abord.
+    "BNB": "real",
 }
 # strategie par marche : "hold" = pari tenu jusqu'a resolution (BTC) ;
 # "swing" = achete le contrat pas cher pendant le bruit et REVEND avant
@@ -1321,6 +1345,7 @@ DEFAULT_STRATS = {
     "SOL": "hold",
     "XRP": "hold",
     "DOGE": "hold",
+    "BNB": "hold",
 }
 # parametres swing (paper)
 SWING_MIN_EDGE_PCT = (
@@ -2591,7 +2616,7 @@ class MultiTrader:
         """Determine le tier du setup (fragile/normal/premium)."""
         from core.btc_updown import momentum as _momentum
 
-        mom = _momentum(sym) if sym in ("BTC", "ETH", "SOL", "XRP", "DOGE") else None
+        mom = _momentum(sym) if sym in ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB") else None
         confirms = mom and mom.get("confirms", False) if mom else False
 
         if (
@@ -4413,7 +4438,10 @@ class MultiTrader:
         "ETH": 1.0,
         "SOL": 1.15,
         "XRP": 1.15,
+        # BNB : volatilite mesuree 1.34x celle de BTC sur 60 bougies 1min,
+        # entre ETH (1.55) et BTC -> stop legerement elargi.
         "DOGE": 1.2,
+        "BNB": 1.1,
     }
 
     # ── REJECTION LOGGING STRUCTURE (Steven 25/07) : format machine-parseable ──
