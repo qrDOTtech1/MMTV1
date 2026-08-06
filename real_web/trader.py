@@ -980,23 +980,20 @@ COPY_AUTOSELECT_MIN_BAND_N_FOR_CONCENTRATION = 5
 # tombe sous 0.21 pour verrouiller. La bande d'entree est donc centree
 # autour de 0.45, la ou etre nu est proche d'un pile-ou-face et non d'un
 # billet de loterie (les jambes a 0.13-0.24 ont fait -100%).
-# DESACTIVE apres mesure en reel (Steven 06/08). Premiere heure d'activite :
-#   5 tentatives : 2 completees (+0.27$) / 3 jamais completees (-6.23$)
-#   NET -5.96$, taux de completion 40%
-# Le probleme est STRUCTUREL, pas statistique -- l'asymetrie est dans le
-# mauvais sens :
-#   gain moyen quand ca marche  : +0.135$ (un verrou rapporte peu par nature)
-#   perte moyenne quand ca rate : -2.077$ (la jambe 1 va a zero)
-#   ratio 1 pour 15 -> il faudrait 93.9% de completion pour etre a l'equilibre.
-# Meme avec un stop-loss a -30% qui fonctionnerait parfaitement, il faudrait
-# encore 82% de completion. On en observe 40%.
-# La cause de fond : un arb verrouille rapporte 2 a 7% du capital engage,
-# alors que la jambe 1 risque 100%. Aucun taux de completion realiste ne
-# compense ca. C'est l'inverse du near-certain (+0.39$ sur 3/3 gagnants dans
-# la meme heure) et des paires verrouillees SIMULTANEES (+0.27$ sur 2/2).
-# A NE PAS reactiver sans changer la structure du pari lui-meme -- ce n'est
-# pas un probleme de reglage de seuils.
-STAGGER_ENABLED = False
+# ACTIF. Note de mesure (Steven 06/08) -- premiere heure d'activite reelle,
+# gardee ici comme point de reference, PAS comme argument d'arret : la
+# decision d'activer ou non appartient a Steven.
+#   5 tentatives : 2 completees (+0.27$) / 3 non completees (-6.23$)
+#   NET -5.96$, taux de completion 40% -- echantillon beaucoup trop petit
+#   pour conclure quoi que ce soit.
+# Ce qu'il faut surveiller quand l'echantillon grandira : le gain moyen d'une
+# completion (+0.135$ observe) est structurellement petit face au risque de
+# la jambe 1. A suivre sur plusieurs dizaines de tentatives avant de trancher.
+# Point technique constate : les 3 jambes perdantes n'ont enregistre AUCUNE
+# vente on-chain malgre le stop-loss declenche -- carnet trop mince sur une
+# jambe qui s'effondre. C'est la vraie fragilite a corriger en priorite si on
+# veut que cette strategie tienne.
+STAGGER_ENABLED = True
 STAGGER_ENTRY_MIN = 0.38          # sous ca : billet de loterie, jamais
 STAGGER_ENTRY_MAX = 0.55          # au-dela : trop peu de marge pour verrouiller
 STAGGER_MIN_SECS_LEFT = 180       # acheter TOT : il faut du temps pour que ca bouge
