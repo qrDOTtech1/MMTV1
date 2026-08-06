@@ -383,8 +383,16 @@ def killswitch_reset():
     manuellement les symboles voulus."""
     trader.state["killswitch_triggered"] = None
     trader._global_consec_losses = 0
+    # REFERENCE DE SESSION (Steven 06/08, trouve en surveillant l'apres-depot) :
+    # _session_start_cash est capture au 1er read de solde reussi et n'etait
+    # JAMAIS remis a zero. Apres un depot, il gardait donc la valeur d'AVANT
+    # (constate : 0.63$ memorise alors que le compte etait remonte a 22.18$)
+    # -> la garde "perte max de session" se mesurait depuis 0.63$, donc le
+    # solde aurait du devenir NEGATIF pour la declencher : protection morte.
+    # On la reancre sur le solde courant a chaque reset.
+    trader._session_start_cash = None
     trader._save()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "session_baseline": "reancree au prochain read de solde"})
 
 
 
