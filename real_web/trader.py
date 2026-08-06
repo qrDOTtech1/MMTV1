@@ -7898,6 +7898,45 @@ class MultiTrader:
             # reelles [0.01, 0.99] -> la jambe favorite echouait a 100%, TOUJOURS,
             # empechant tout le mecanisme FAVORITE_BUDGET_MULT de jamais s'executer).
             _max_entry = 0.99 if side == fav_side else max_entry
+            # ── PLAFOND PAR JAMBE DERIVE DE L'ECONOMIE DE LA PAIRE ──────
+            # BUG RACINE (Steven 06/08, trouve en analysant la chute de 14$ a
+            # 0.63$). Chaine complete :
+            #   1. risk_free=True sur un symbole -> fav_side = None (change
+            #      hier soir : "pas d'appel a fav_side en risk free") ;
+            #   2. ligne au-dessus : `0.99 if side == fav_side else max_entry`
+            #      -> avec fav_side None, AUCUN cote ne correspond, les DEUX
+            #      jambes heritent de BOTH_SIDE_MAX_ENTRY = 0.52 ;
+            #   3. une paire somme toujours a ~1.00 -> un cote est TOUJOURS
+            #      au-dessus de 0.52 -> cette jambe ne peut JAMAIS etre
+            #      achetee, quel que soit l'edge ;
+            #   4. seule la jambe bon marche se remplit -> jambe nue
+            #      systematique, tenue jusqu'a zero.
+            # Mesure : 6 jambes seules sous 0.50, -10.02$ pour 12.32$ engages
+            # (ROI -81.4%) = 74% de la perte de la session, pendant que les
+            # arbs faisaient +19.5% et le near-certain +3.0%.
+            # BOTH_SIDE_MAX_ENTRY (0.52) est un vestige de l'ANCIENNE
+            # strategie hedge "acheter le cote pas cher". Pour un arb, seul le
+            # COMBINE compte -- une paire 0.34/0.62 = 0.96 est excellente, et
+            # l'ancien plafond la rendait impossible. Le gate BOTHSIDE-SEQ
+            # au-dessus a DEJA valide le combine ; on derive donc le plafond
+            # de la paire elle-meme au lieu d'une constante sans rapport.
+            _other_ask = None
+            for _os in outcomes:
+                if _os != side:
+                    _oq = quotes.get(_os)
+                    _other_ask = _oq[1] if _oq else None
+                    break
+            if _other_ask is not None:
+                _econ_cap = round(PAIR_COMPLETION_HEDGE_MAX - _other_ask, 3)
+                if _econ_cap > _max_entry:
+                    self._tlog(
+                        f"econcap_{sym}",
+                        f"🔓 [PAIRE-CAP] {sym} {slug} {side} plafond {_max_entry:.3f} "
+                        f"-> {min(0.99, _econ_cap):.3f} (derive de la paire, l'autre "
+                        f"cote est a {_other_ask:.3f} -- l'ancien plafond bloquait "
+                        f"cette jambe et laissait l'autre a nu)",
+                    )
+                    _max_entry = min(0.99, _econ_cap)
             # ── PLAFOND DE LA 2e JAMBE ADOSSE AU PRIX REEL DE LA 1re ──────
             # (Steven 05/08) Le plafond etait FIXE (0.99 sur la jambe favorite,
             # max_entry sinon) et ne dependait PAS de ce qu'avait coute la
@@ -8749,6 +8788,33 @@ class MultiTrader:
                 if mk["open"][k].get("slug") == slug
                 and mk["open"][k].get("strat") == "bothside"
             )
+            # ── JAMBE NUE BON MARCHE = BILLET DE LOTERIE (Steven 06/08) ──
+            # La regle existait deja dans _manage_orphans, mais celui-ci ne
+            # traite QUE strat=="orphan". Une jambe restee en strat=="bothside"
+            # (paire dont la 2e jambe n'a jamais pu se remplir, et dont
+            # l'unwind a echoue sans que le strat soit bascule) passe par ICI,
+            # ou la regle etait absente -> elle etait tenue jusqu'a resolution.
+            # Mesure sur la session : 6 jambes seules sous 0.50, -10.02$ pour
+            # 12.32$ engages (ROI -81.4%), soit 74% de la perte totale de la
+            # session -- alors que les arbs faisaient +19.5% et le near-certain
+            # +3.0% sur la meme periode. 4 de ces 6 jambes n'ont JAMAIS ete
+            # revendues. C'est le poste de perte n1, et de loin.
+            if (
+                pos.get("strat") == "bothside"
+                and both_legs_held < 2
+                and not pos.get("must_close")
+            ):
+                _nu_px = self._live_price(pos.get("token_id"), None, pos.get("side"))
+                if _nu_px is not None and _nu_px < ORPHAN_KEEP_MIN_PRICE:
+                    pos["strat"] = "orphan"
+                    pos["must_close"] = True
+                    self._tlog(
+                        f"nakedcheap_{key}",
+                        f"⛔ [JAMBE-NUE-BON-MARCHE] {sym} {slug} {pos.get('side')} "
+                        f"@ {_nu_px:.3f} < {ORPHAN_KEEP_MIN_PRICE} et paire jamais completee "
+                        f"-> billet de loterie, marquee A FERMER",
+                    )
+                    continue
             if both_legs_held >= 2:
                 # ── SPREAD-BASED EXIT V8.0 : coupe la jambe perdante tôt ──
                 # Quand l'autre jambe performe mieux de >10%, cette jambe est probablement
