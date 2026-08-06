@@ -927,6 +927,49 @@ COPY_AUTOSELECT_MAX_LOTTERY_SHARE = 0.40
 COPY_AUTOSELECT_MAX_CONCENTRATION = 0.60
 COPY_AUTOSELECT_MIN_BAND_N_FOR_CONCENTRATION = 5
 
+# ── ARB DECALE (Steven 06/08, "on fabrique notre propre combined ask") ──
+# Idee de Steven, validee par SES donnees : on achete la jambe BASSE des
+# l'ouverture de la fenetre, puis on attend que le cote oppose descende
+# assez pour verrouiller. "Acheter a 45c et attendre l'autre a descendre,
+# c'est comme si on fabriquait notre comb ask."
+#
+# CE QUE DISENT LES DONNEES (tout l'historique, 227 paires) :
+#   ecart entre jambes | bons PRIX (nominal<1) | REELLEMENT verrouille | desequilibre
+#   simultane <=2s     |        43%            |         43%           |    1.00x
+#   decale 2-15s       |        32%            |         11%           |    1.42x
+#   decale 15-60s      |        39%            |         16%           |    1.60x
+#   decale >60s        |        47%  <-- MEILLEUR |       6%           |    2.51x
+# L'arb decale TROUVE les meilleurs prix (47%, mieux que le simultane) mais
+# n'en verrouillait que 6%. TOUT l'ecart vient du desequilibre de parts
+# (2.51x) : la 2e jambe etait dimensionnee en DOLLARS, or le prix a bouge
+# entre les deux achats. Ce n'est donc pas la methode qui etait mauvaise,
+# c'est son execution.
+#
+# POURQUOI CA VAUT LE COUP MAINTENANT : le combine ASK ne descend jamais
+# sous 1.00 (mesure : minimum 1.000 sur 172 releves) -> l'arb simultane en
+# prise directe est quasi impossible. Mais le combine BID est a 0.979 en
+# moyenne (jusqu'a 0.930 sur DOGE). L'argent est sous 1.00, il faut juste
+# ne pas payer le spread deux fois.
+#
+# LES DEUX PROTECTIONS QUI MANQUAIENT (causes des pertes d'hier) :
+#  1. parts EGALES sur la 2e jambe (target_shares, plus de budget en $) ;
+#  2. jambe 1 FERMABLE : si le combine ne redescend pas, on solde au lieu de
+#     tenir jusqu'a zero (-81% de ROI mesure sur les jambes nues gardees).
+# Et on ne part JAMAIS d'une jambe chere : a 0.79 il faudrait que l'autre
+# tombe sous 0.21 pour verrouiller. La bande d'entree est donc centree
+# autour de 0.45, la ou etre nu est proche d'un pile-ou-face et non d'un
+# billet de loterie (les jambes a 0.13-0.24 ont fait -100%).
+STAGGER_ENABLED = True
+STAGGER_ENTRY_MIN = 0.38          # sous ca : billet de loterie, jamais
+STAGGER_ENTRY_MAX = 0.55          # au-dela : trop peu de marge pour verrouiller
+STAGGER_MIN_SECS_LEFT = 180       # acheter TOT : il faut du temps pour que ca bouge
+STAGGER_COMPLETE_MAX = 0.99       # verrou reel exige pour completer
+STAGGER_GIVEUP_SECS = 50          # sans verrou a ce stade -> on solde la jambe 1
+STAGGER_STOP_LOSS = 0.30          # jambe 1 qui perd 30% -> on coupe sans attendre
+STAGGER_BUDGET_FRAC = 0.10        # part du capital investissable
+STAGGER_BUDGET_MIN = 2.0
+STAGGER_BUDGET_MAX = 12.0
+
 NEARCERT_ENABLED = True
 NEARCERT_MIN_PRICE = 0.95
 NEARCERT_MAX_PRICE = 0.98
@@ -2681,6 +2724,11 @@ class MultiTrader:
                         self._manage_reinforce(sym)
                     except Exception as e:
                         self._tlog(f"fastexit_reinf_err_{sym}", f"💥 [FAST-EXIT] {sym} renfort erreur: {e}")
+                    # ARB DECALE : completion / abandon de la jambe 1
+                    try:
+                        self._manage_stagger(sym)
+                    except Exception as e:
+                        self._tlog(f"fastexit_stag_err_{sym}", f"💥 [FAST-EXIT] {sym} arb-decale erreur: {e}")
             except Exception as e:
                 self._log(f"💥 [FAST-EXIT] erreur boucle: {e}")
             time.sleep(FAST_EXIT_POLL_S)
@@ -4089,6 +4137,214 @@ class MultiTrader:
         elif secs_left > 120:
             mult *= 1.08
         return round(base_stop * mult, 3)
+
+    def _stagger_budget(self):
+        """Mise de la jambe 1 d'un arb decale, proportionnelle au capital."""
+        return round(
+            min(STAGGER_BUDGET_MAX, max(STAGGER_BUDGET_MIN, self._investable() * STAGGER_BUDGET_FRAC)),
+            2,
+        )
+
+    def _try_stagger_entry(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+        """ARB DECALE, jambe 1 (Steven 06/08). Achete le cote BAS tot dans la
+        fenetre, en pariant que le cote oppose descendra assez pour verrouiller
+        avant la resolution -- "on fabrique notre propre combined".
+
+        Voir les constantes STAGGER_* pour le raisonnement complet et les
+        mesures. Ne s'active que si aucun arb simultane n'etait possible."""
+        if not STAGGER_ENABLED or mode != "real":
+            return False
+        now = synced_now()
+        secs_left = p.get("end_ts", now) - now
+        if secs_left < STAGGER_MIN_SECS_LEFT:
+            return False                      # trop tard pour esperer un mouvement
+        if mk.setdefault("stagger_tried", {}).get(slug):
+            return False                      # une seule tentative par fenetre
+        if any(k.startswith(f"{slug}|") for k in mk["open"]):
+            return False                      # deja une position sur ce marche
+
+        # on prend le cote le MOINS cher, et seulement dans la bande utile
+        cands = []
+        for side in outcomes:
+            q = quotes.get(side)
+            ask = q[1] if q else None
+            if ask is not None:
+                cands.append((ask, side))
+        if len(cands) != 2:
+            return False
+        cands.sort()
+        ask, side = cands[0]
+        other_ask = cands[1][0]
+        if not (STAGGER_ENTRY_MIN <= ask <= STAGGER_ENTRY_MAX):
+            return False
+        # marge a parcourir : de combien l'autre cote doit-il baisser ?
+        besoin = round(STAGGER_COMPLETE_MAX - ask, 3)
+        if other_ask <= besoin:
+            return False   # deja verrouillable -> c'est un arb simultane, pas notre role
+
+        cash, _ = self._read_cash(max_age=0)
+        if cash is None:
+            return False
+        investable = max(0.0, cash - self.floor())
+        budget = round(min(self._stagger_budget(), investable), 2)
+        budget = max(budget, round(MIN_SELL_SHARES * ask, 2))
+        if budget > investable or budget < MIN_BUDGET_USD:
+            return False
+        ok_exp, why_exp = self._exposure_ok(sym, mk, slug, budget)
+        if not ok_exp:
+            return False
+
+        mk["stagger_tried"][slug] = time.time()
+        tid = token_ids[outcomes.index(side)]
+        self._log(
+            f"🎲 [ARB-DECALE] {sym} {slug} jambe1 {side} @ {ask:.3f} budget={budget:.2f}$ "
+            f"-- l'autre cote est a {other_ask:.3f}, il doit descendre sous {besoin:.3f} "
+            f"pour verrouiller ({secs_left:.0f}s devant)"
+        )
+        with self._order_lock:
+            res = self._live.snipe_buy_market(tid, round(ask + 0.02, 2), budget)
+        filled = res.get("filled_shares", 0.0)
+        if filled <= 0:
+            self._log(f"⚠️ [ARB-DECALE] {sym} {slug} jambe1 non remplie ({res.get('error', '')})")
+            return False
+        avg = res.get("avg_cost") or ask
+        self._add_slug_spent(mk, slug, round(filled * avg, 2))
+        mk["open"][f"{slug}|{side}"] = {
+            "symbol": sym, "slug": slug, "side": side, "mode": "real",
+            # strat "stagger" : gere EXCLUSIVEMENT par _manage_stagger tant que
+            # la paire n'est pas completee (ni bothside ni pnl_tier_exits n'y
+            # touchent -- ils filtrent sur leur propre strat).
+            "strat": "stagger", "token_id": tid, "entry_price": avg,
+            "filled_shares": filled, "cost": round(filled * avg, 2),
+            "start_ts": p["start_ts"], "pair": p.get("pair"), "end_ts": p["end_ts"],
+            "opened_ts": time.time(), "buffer": 0.0,
+            "stagger_need_below": besoin,
+        }
+        self._log(
+            f"✅ [ARB-DECALE] {sym} {slug} jambe1 {side} {filled} parts @ {avg:.3f} "
+            f"-> en attente du verrou (cible : autre cote < {besoin:.3f})"
+        )
+        return True
+
+    def _manage_stagger(self, sym):
+        """ARB DECALE, suite : complete la paire des que le verrou est
+        atteignable, coupe si la jambe 1 decroche, et SOLDE si la fenetre se
+        termine sans verrou -- jamais de jambe nue tenue jusqu'a zero (c'est
+        ce qui a coute -81% de ROI sur les jambes nues gardees)."""
+        mk = self.state["markets"][sym]
+        if self.state["modes"].get(sym) != "real":
+            return
+        now = synced_now()
+        for key, pos in list(mk["open"].items()):
+            if pos.get("strat") != "stagger" or pos.get("mode") != "real":
+                continue
+            slug = pos.get("slug")
+            secs_left = pos.get("end_ts", now) - now
+            shares = pos.get("filled_shares", 0)
+            if shares <= 0:
+                del mk["open"][key]
+                continue
+            entry = pos.get("entry_price") or 0
+            # ── 1) STOP-LOSS : la jambe 1 decroche franchement ──
+            cur = self._live_price(pos.get("token_id"), None, pos.get("side"))
+            if cur is not None and entry > 0 and (entry - cur) / entry >= STAGGER_STOP_LOSS:
+                pos["strat"] = "orphan"
+                pos["must_close"] = True
+                self._log(
+                    f"🛑 [ARB-DECALE] {sym} {slug} jambe1 {pos['side']} {entry:.3f}->{cur:.3f} "
+                    f"(-{100 * (entry - cur) / entry:.0f}%) -> on coupe, pas d'attente"
+                )
+                continue
+            # ── 2) FIN DE FENETRE sans verrou -> on solde ──
+            if secs_left <= STAGGER_GIVEUP_SECS:
+                pos["strat"] = "orphan"
+                pos["must_close"] = True
+                self._log(
+                    f"⌛ [ARB-DECALE] {sym} {slug} {pos['side']} verrou jamais atteint "
+                    f"({secs_left:.0f}s restantes) -> on solde la jambe 1"
+                )
+                continue
+            # ── 3) VERROU ATTEIGNABLE ? -> on complete en parts EGALES ──
+            m = self._market_meta(slug)
+            if not m:
+                continue
+            outcomes, token_ids = m
+            other = [o for o in outcomes if o != pos.get("side")]
+            if not other:
+                continue
+            other = other[0]
+            otid = token_ids[outcomes.index(other)]
+            book = self._live.get_book_sync(otid)
+            oask = book["asks"][0][0] if book and book.get("asks") else None
+            if oask is None:
+                continue
+            comb = entry + oask
+            if comb >= STAGGER_COMPLETE_MAX:
+                self._tlog(
+                    f"stagwait_{key}",
+                    f"⏳ [ARB-DECALE] {sym} {slug} attente : {entry:.3f}+{oask:.3f}={comb:.3f} "
+                    f"(verrou a {STAGGER_COMPLETE_MAX}, {secs_left:.0f}s restantes)",
+                )
+                continue
+            # PARTS EGALES : c'est min(parts) qui determine le payout garanti.
+            need = round(shares, 2)
+            cost = round(need * oask, 2)
+            cash, _ = self._read_cash(max_age=0)
+            if cash is None:
+                continue
+            if cost > max(0.0, cash - self.floor()):
+                self._tlog(
+                    f"stagcash_{key}",
+                    f"⛔ [ARB-DECALE] {sym} {slug} verrou possible a {comb:.3f} mais "
+                    f"capital insuffisant ({cost:.2f}$ requis)",
+                )
+                continue
+            ok_exp, why_exp = self._exposure_ok(sym, mk, slug, cost)
+            if not ok_exp:
+                continue
+            self._log(
+                f"🔓 [ARB-DECALE] {sym} {slug} VERROU ATTEIGNABLE {entry:.3f}+{oask:.3f}="
+                f"{comb:.3f} -> achat jambe2 {other} {need} parts ({cost:.2f}$)"
+            )
+            with self._order_lock:
+                res = self._live.snipe_buy_limit_exact(otid, oask, need)
+            filled = res.get("filled_shares", 0.0)
+            if filled <= 0:
+                self._tlog(
+                    f"stagfail_{key}",
+                    f"⚠️ [ARB-DECALE] {sym} {slug} jambe2 non remplie ({res.get('error', '')}) "
+                    f"-> on retentera au prochain cycle",
+                )
+                continue
+            avg = res.get("avg_cost") or oask
+            self._add_slug_spent(mk, slug, round(filled * avg, 2))
+            mk["open"][f"{slug}|{other}"] = {
+                "symbol": sym, "slug": slug, "side": other, "mode": "real",
+                "strat": "bothside", "token_id": otid, "entry_price": avg,
+                "filled_shares": filled, "cost": round(filled * avg, 2),
+                "start_ts": pos.get("start_ts"), "pair": pos.get("pair"),
+                "end_ts": pos.get("end_ts"), "opened_ts": time.time(), "buffer": 0.0,
+            }
+            pos["strat"] = "bothside"   # la paire existe : gestion normale reprend
+            # verrou verifie sur les fills REELS, comme partout ailleurs
+            self._tag_pair_lock(pos, mk["open"][f"{slug}|{other}"], comb,
+                                tag=f" {sym} {slug} ARB-DECALE")
+
+    def _market_meta(self, slug):
+        """(outcomes, token_ids) d'un slug, via le cache marche partage."""
+        from core.btc_updown import _fetch_one_market
+
+        m = _fetch_one_market(slug)
+        if not m:
+            return None
+        try:
+            outcomes = json.loads(m.get("outcomes") or "[]")
+            token_ids = json.loads(m.get("clobTokenIds") or "[]")
+        except Exception:
+            return None
+        if len(outcomes) != 2 or len(token_ids) != 2:
+            return None
+        return outcomes, token_ids
 
     def _try_near_certain(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
         """NEAR-CERTAIN : achat d'un cote quasi-acquis, tard dans la fenetre.
@@ -7605,7 +7861,12 @@ class MultiTrader:
                     # Voir les constantes FAV_* pour ce que disent les donnees.
                     # NEAR-CERTAIN d'abord (seule strategie directionnelle
                     # validee par l'historique), FAV ensuite (desactive).
-                    if not self._try_near_certain(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+                    # ARB DECALE en premier : il vise TOT dans la fenetre
+                    # (>=180s), la ou le near-certain vise la fin (<=120s)
+                    # -- ils ne se marchent donc jamais dessus.
+                    if self._try_stagger_entry(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+                        pass
+                    elif not self._try_near_certain(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
                         self._try_favorite(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug)
                     return legs_held > 0
                 in_cd, cd_reason = self._in_cooldown(sym, slug, mk)
