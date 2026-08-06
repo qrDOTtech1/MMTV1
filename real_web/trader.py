@@ -1091,7 +1091,20 @@ PREOPEN_MAX_IMBALANCE = 1.05
 # pertes. Les deux tranches basses concentrent -47.87$ a elles seules, soit
 # la moitie de la perte totale, pour un tiers des fenetres. On remonte donc
 # le plancher de 0.38 a 0.44.
-STAGGER_ENTRY_MIN = 0.44          # sous ca : moins de completions ET plus de pertes
+# PLANCHER ABAISSE A 0.40 (mesure du 06/08, arbs VRAIMENT decales seulement --
+# les paires completees en moins de 10s sont des arbs simultanes et ont ete
+# retirees, sinon elles gonflent artificiellement les tranches basses) :
+#     entree sous 0.40   : 14 fenetres, 21% verrouillees
+#     entree 0.40-0.43   : 21 fenetres, 52% verrouillees   <-- la MEILLEURE
+#     entree 0.44-0.49   : 34 fenetres, 35% verrouillees
+#     entree 0.50 et +   : 35 fenetres, 26% verrouillees
+#
+# Le plancher a 0.44 excluait donc la meilleure tranche. La bande 0.40-0.49
+# prise en bloc verrouille a 42% contre 21% en dessous et 26% au-dessus : c'est
+# cette comparaison-la qui est solide (55 fenetres contre 14 et 35). L'ecart
+# entre 0.40-0.43 et 0.44-0.49 pris separement, lui, n'est PAS significatif --
+# on garde donc toute la bande plutot que de sur-ajuster sur 21 echantillons.
+STAGGER_ENTRY_MIN = 0.40
 # PLAFOND SOUS 0.50 (Steven 06/08 : "il faut les acheter en dessous de 50c !!").
 #
 # J'avais monte ce plafond a 0.58 en optimisant la SURVIE DIRECTIONNELLE de la
@@ -1127,7 +1140,26 @@ STAGGER_GIVEUP_SECS = 50          # filet de fin de fenetre (garde en secours)
 # Sortir tot coute 15-20% ; attendre coute 50-65%. Le stop-loss en pourcentage
 # ne suffit pas sur un marche qui bouge par sauts : entre deux cycles il a
 # deja traverse le seuil. Une limite de TEMPS, elle, ne peut pas etre sautee.
-STAGGER_MAX_WAIT_S = 45           # sans verrou 45s apres la jambe 1 -> on solde
+# DELAI MAX POUR COMPLETER, 45 -> 60s. Sur 109 paires completees, 92% arrivent
+# dans les 60 secondes, et la tranche 30-60s est la MEILLEURE (84% de verrous).
+# A 45s on coupait donc en plein dans le creneau le plus rentable. Au-dela de
+# 60s en revanche, plus que 33% de verrous : ces completions tardives ne sont
+# pas des arbs, c'est de la moyenne a la baisse sur une jambe perdante.
+STAGGER_MAX_WAIT_S = 60           # sans verrou 60s apres la jambe 1 -> on solde
+# FENETRE D'ENTREE (n'existait pas : on pouvait ouvrir une jambe 1 a n'importe
+# quel moment des 5 minutes). Arbs vraiment decales, par moment d'entree :
+#     0-15s apres l'ouverture : 34 fenetres, 44% verrouillees
+#     apres 15s               : 65 fenetres, 26% verrouillees
+# L'edge du decale vient de l'oscillation autour de 0.50 juste apres
+# l'ouverture ; passe ce moment une tendance s'est formee et le cote oppose ne
+# revient plus. Les 3 pertes ETH de ce matin sont entrees a +48s, +80s et
+# +105s, aucune n'a jamais eu de 2e jambe.
+#
+# HONNETETE SUR CE CHIFFRE : 44% contre 26% n'est significatif qu'a la limite
+# (z=1.8) et la degradation n'est pas monotone (la tranche 15-45s tombe a 14%,
+# puis remonte a 30% ensuite) -- c'est le reglage le moins solide des trois.
+# 20s plutot que 15 pour ne pas sur-ajuster sur une frontiere aussi incertaine.
+STAGGER_MAX_LEAD_S = 20
 STAGGER_STOP_LOSS = 0.30          # jambe 1 qui perd 30% -> on coupe sans attendre
 STAGGER_BUDGET_FRAC = 0.10        # part du capital investissable
 STAGGER_BUDGET_MIN = 2.0
@@ -4374,6 +4406,19 @@ class MultiTrader:
         secs_left = p.get("end_ts", now) - now
         if secs_left < STAGGER_MIN_SECS_LEFT:
             return False                      # trop tard pour esperer un mouvement
+        # ENTREE SEULEMENT EN DEBUT DE FENETRE (cf. STAGGER_MAX_LEAD_S). Le
+        # start_ts est l'ouverture du marche ; on refuse d'ouvrir une jambe 1
+        # une fois la tendance formee.
+        _open_ts = p.get("start_ts") or (p.get("end_ts", now) - 300)
+        _lead = now - _open_ts
+        if _lead > STAGGER_MAX_LEAD_S:
+            self._tlog(
+                f"stagger_tard_{sym}",
+                f"⏱️ [ARB-DECALE] {sym} {slug} ouverture il y a {_lead:.0f}s > "
+                f"{STAGGER_MAX_LEAD_S}s -> trop tard, la tendance est formee "
+                f"(44% de verrous avant 15s contre 26% apres)",
+            )
+            return False
         if mk.setdefault("stagger_tried", {}).get(slug):
             return False                      # une seule tentative par fenetre
         if any(k.startswith(f"{slug}|") for k in mk["open"]):
@@ -4866,17 +4911,19 @@ class MultiTrader:
                     f"(-{100 * (entry - cur) / entry:.0f}%) -> on coupe, pas d'attente"
                 )
                 continue
-            # ── 2) LIMITE DE TEMPS : 82% des completions arrivent en <40s ──
-            # (mediane 12s). Passe ce delai le marche a choisi son camp et la
-            # completion n'arrive quasiment jamais -- on portait le risque
-            # pour rien, parfois 250s. Voir STAGGER_MAX_WAIT_S.
+            # ── 2) LIMITE DE TEMPS ──
+            # Mesure a jour (06/08, 109 paires completees) : mediane 9s, 92%
+            # des completions arrivent dans les 60s. Passe ce delai le marche a
+            # choisi son camp : il reste 33% de verrous seulement, autrement dit
+            # les completions tardives ne sont plus des arbs mais de la moyenne
+            # a la baisse sur une jambe perdante. Voir STAGGER_MAX_WAIT_S.
             _age = time.time() - (pos.get("opened_ts") or 0)
             if _age >= STAGGER_MAX_WAIT_S:
                 pos["strat"] = "orphan"
                 pos["must_close"] = True
                 self._log(
                     f"⏱️ [ARB-DECALE] {sym} {slug} {pos['side']} pas de verrou apres "
-                    f"{_age:.0f}s (82% des completions arrivent en <40s) "
+                    f"{_age:.0f}s (92% des completions arrivent en <60s) "
                     f"-> on solde maintenant, tant que le prix tient"
                 )
                 continue
