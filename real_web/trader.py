@@ -994,6 +994,50 @@ COPY_AUTOSELECT_MIN_BAND_N_FOR_CONCENTRATION = 5
 # jambe qui s'effondre. C'est la vraie fragilite a corriger en priorite si on
 # veut que cette strategie tienne.
 STAGGER_ENABLED = True
+
+# ── ARB PRE-OUVERTURE EN MAKER (Steven 06/08) ──────────────────────────
+# On POSE les deux jambes (ordres GTC passifs) sur une fenetre 5min PAS
+# ENCORE OUVERTE, a un prix dont la somme verrouille l'arb. Si les deux se
+# remplissent -> profit garanti. Si une seule -> on annule l'autre et on a
+# plusieurs minutes pour solder, la fenetre n'ayant pas commence.
+#
+# CE QUI REND CA POSSIBLE -- deux mesures independantes :
+#
+# 1) LES ORDRES MAKER NE PAIENT AUCUN FRAIS. Le bareme dit
+#    takerOnly: True, et l'historique le confirme sans ambiguite : sur 851
+#    achats a base de frais fiable, la distribution est parfaitement
+#    BIMODALE -- 90 trades a 0.000 de frais, 761 a ~0.042, et ZERO trade
+#    entre 0.005 et 0.030. Ce n'est ni de l'arrondi ni un gradient : soit on
+#    prend (et on paie 4.2%), soit on pose (et on ne paie rien). Le bot
+#    prenait dans 89% des cas.
+#
+# 2) LE CARNET PRE-OUVERTURE EST LARGE SUR LES MARCHES PEU LIQUIDES.
+#    Mesure sur 32 releves des fenetres +5min et +10min :
+#      DOGE : combine bid 0.940 (stable 0.940-0.970), 84% des releves
+#             sous 0.95, profondeur mediane 66 parts
+#      XRP  : combine bid 0.980, JAMAIS sous 0.95 (0/32)
+#      BTC  : combine bid 0.990, fige
+#    Avant ouverture, les market makers tiennent 0.51/0.50 sur les gros
+#    marches, mais laissent un spread de 6 centimes par cote sur DOGE.
+#
+# ECONOMIE : poser a 0.47/0.47 = combine 0.94, zero frais -> +6.4% garanti.
+# A comparer avec ce que fait le bot aujourd'hui : prendre a l'ask a 1.010
+# PLUS 4.2% de frais = -5.2%.
+#
+# L'INCONNUE ASSUMEE : le taux de remplissage. Poser a 0.47 quand 66 parts
+# y sont deja, c'est entrer dans une file d'attente -- on ne se remplit que
+# si un vendeur descend jusqu'a nous. Aucune donnee existante ne permet de
+# l'estimer : c'est precisement ce que ce test doit mesurer. D'ou les
+# petites tailles et le perimetre restreint.
+PREOPEN_ENABLED = True
+PREOPEN_SYMBOLS = ("DOGE",)       # perimetre du test ; ETH/BTC gardent l'arb a l'ouverture
+PREOPEN_MAX_COMBINED = 0.96       # somme des 2 bids posees : au-dela ca ne vaut pas le risque
+PREOPEN_MIN_LEAD_S = 60           # ne pas poser a moins d'1min de l'ouverture
+PREOPEN_MAX_LEAD_S = 900          # ni plus de 15min avant (carnet pas encore forme)
+PREOPEN_BUDGET_FRAC = 0.08        # part du capital investissable
+PREOPEN_BUDGET_MIN = 2.0
+PREOPEN_BUDGET_MAX = 10.0
+PREOPEN_CANCEL_BEFORE_S = 30      # a T-30s : on annule ce qui n'est pas rempli
 STAGGER_ENTRY_MIN = 0.38          # sous ca : billet de loterie, jamais
 STAGGER_ENTRY_MAX = 0.55          # au-dela : trop peu de marge pour verrouiller
 STAGGER_MIN_SECS_LEFT = 180       # acheter TOT : il faut du temps pour que ca bouge
@@ -2779,6 +2823,14 @@ class MultiTrader:
                     # modes) -> positions paper jamais coupees, meme a -90%.
                     if mode not in ("real", "paper"):
                         continue
+                    # PRE-OUVERTURE (Steven 06/08) : DOIT tourner AVANT le
+                    # filtre ci-dessous -- il pose des ordres sur une fenetre
+                    # pas encore ouverte, donc precisement quand mk["open"]
+                    # est VIDE. Le placer apres revenait a ne jamais l'appeler.
+                    try:
+                        self._manage_preopen(sym)
+                    except Exception as e:
+                        self._tlog(f"fastexit_preopen_err_{sym}", f"💥 [FAST-EXIT] {sym} pre-ouverture erreur: {e}")
                     if not self.state["markets"][sym]["open"]:
                         continue
                     try:
@@ -4335,6 +4387,205 @@ class MultiTrader:
             f"-> en attente du verrou (cible : autre cote < {besoin:.3f})"
         )
         return True
+
+    def _preopen_budget(self):
+        return round(
+            min(PREOPEN_BUDGET_MAX, max(PREOPEN_BUDGET_MIN, self._investable() * PREOPEN_BUDGET_FRAC)),
+            2,
+        )
+
+    def _preopen_state(self, mk):
+        return mk.setdefault("preopen", {})
+
+    def _manage_preopen(self, sym):
+        """ARB PRE-OUVERTURE EN MAKER (Steven 06/08).
+
+        Deux phases, gerees a chaque cycle :
+          A. POSE  -- sur une fenetre pas encore ouverte, si le combine des
+             deux meilleurs bids verrouille, on POSE un achat GTC passif de
+             chaque cote (maker -> zero frais).
+          B. SUIVI -- on regarde ce qui s'est rempli. Les deux : arb
+             verrouille sans frais. Une seule : on annule l'autre et on solde
+             la jambe avant l'ouverture. Aucune : on annule tout a T-30s.
+
+        Voir les constantes PREOPEN_* pour les mesures qui justifient tout ca."""
+        if not PREOPEN_ENABLED or sym not in PREOPEN_SYMBOLS:
+            return
+        if self.state["modes"].get(sym) != "real":
+            return
+        mk = self.state["markets"][sym]
+        st = self._preopen_state(mk)
+        now = time.time()
+
+        # ── B. SUIVI DES ORDRES DEJA POSES ──────────────────────────────
+        for slug in list(st.keys()):
+            e = st[slug]
+            lead = e.get("open_ts", 0) - now
+            fills = {}
+            for side in ("a", "b"):
+                leg = e.get(side) or {}
+                tid = leg.get("token_id")
+                if not tid:
+                    continue
+                held = self._live.position_size(tid)
+                fills[side] = max(0.0, held if held and held > 0 else 0.0)
+            fa, fb = fills.get("a", 0.0), fills.get("b", 0.0)
+            got_a, got_b = fa > 0.01, fb > 0.01
+
+            if got_a and got_b:
+                # LES DEUX REMPLIS -> arb verrouille, on enregistre et on sort
+                for side in ("a", "b"):
+                    leg = e[side]
+                    n = fills[side]
+                    mk["open"][f"{slug}|{leg['side']}"] = {
+                        "symbol": sym, "slug": slug, "side": leg["side"], "mode": "real",
+                        "strat": "bothside", "token_id": leg["token_id"],
+                        "entry_price": leg["price"], "filled_shares": round(n, 2),
+                        "cost": round(n * leg["price"], 2),
+                        "start_ts": e.get("open_ts"), "pair": None,
+                        "end_ts": e.get("open_ts", now) + 300,
+                        "opened_ts": now, "buffer": 0.0,
+                    }
+                    self._add_slug_spent(mk, slug, round(n * leg["price"], 2))
+                pa, pb = e["a"]["price"], e["b"]["price"]
+                self._log(
+                    f"🎉 [PRE-OUVERTURE] {sym} {slug} LES DEUX JAMBES REMPLIES "
+                    f"{pa:.3f}+{pb:.3f}={pa + pb:.3f} ({fa:.2f}/{fb:.2f} parts) "
+                    f"-- maker, ZERO frais"
+                )
+                self._tag_pair_lock(
+                    mk["open"].get(f"{slug}|{e['a']['side']}"),
+                    mk["open"].get(f"{slug}|{e['b']['side']}"),
+                    pa + pb, tag=f" {sym} {slug} PRE-OUVERTURE",
+                )
+                st.pop(slug, None)
+                self._save()
+                continue
+
+            # pas encore les deux : on laisse courir tant qu'on a le temps
+            if lead > PREOPEN_CANCEL_BEFORE_S:
+                continue
+
+            # ── T-30s : on ne peut plus attendre ──
+            for side in ("a", "b"):
+                oid = (e.get(side) or {}).get("order_id")
+                if oid and not fills.get(side, 0) > 0.01:
+                    self._live.cancel_order(oid)
+            if not got_a and not got_b:
+                self._tlog(
+                    f"preopen_none_{sym}",
+                    f"⭕ [PRE-OUVERTURE] {sym} {slug} aucun remplissage -> ordres annules, "
+                    f"rien engage",
+                )
+                st.pop(slug, None)
+                self._save()
+                continue
+
+            # UNE SEULE remplie : on la solde AVANT l'ouverture (pas de pari
+            # directionnel subi -- c'est toute la difference avec l'arb decale).
+            side = "a" if got_a else "b"
+            leg = e[side]
+            n = fills[side]
+            self._log(
+                f"⚠️ [PRE-OUVERTURE] {sym} {slug} une seule jambe remplie "
+                f"({leg['side']} {n:.2f} parts @ {leg['price']:.3f}) -> on solde avant l'ouverture"
+            )
+            sold = self._sell_orphan(
+                leg["token_id"], round(n, 2),
+                f" {sym} {slug} {leg['side']} PRE-OUVERTURE-SOLO",
+                entry_price=leg["price"], symbol=sym, slug=slug, side=leg["side"],
+            )
+            if sold < n - 0.01:
+                # invendable pour l'instant -> on la track pour gestion normale
+                mk["open"][f"{slug}|{leg['side']}"] = {
+                    "symbol": sym, "slug": slug, "side": leg["side"], "mode": "real",
+                    "strat": "orphan", "token_id": leg["token_id"],
+                    "entry_price": leg["price"], "filled_shares": round(n - sold, 2),
+                    "cost": round((n - sold) * leg["price"], 2),
+                    "start_ts": e.get("open_ts"), "pair": None,
+                    "end_ts": e.get("open_ts", now) + 300,
+                    "opened_ts": now, "buffer": 0.0, "must_close": True,
+                }
+            st.pop(slug, None)
+            self._save()
+
+        # ── A. POSE SUR UNE NOUVELLE FENETRE ────────────────────────────
+        if len(st) >= 1:
+            return                      # une seule fenetre en cours a la fois
+        base = int(now // 300) * 300
+        for off in (300, 600):
+            open_ts = base + off
+            lead = open_ts - now
+            if not (PREOPEN_MIN_LEAD_S <= lead <= PREOPEN_MAX_LEAD_S):
+                continue
+            slug = f"{sym.lower()}-updown-5m-{open_ts}"
+            if slug in st or any(k.startswith(f"{slug}|") for k in mk["open"]):
+                continue
+            meta = self._market_meta(slug)
+            if not meta:
+                continue
+            outcomes, token_ids = meta
+            bids = []
+            for tid in token_ids:
+                b = self._live.get_book_sync(tid)
+                bb = b["bids"][0][0] if b and b.get("bids") else None
+                if bb is None:
+                    bids = []
+                    break
+                bids.append(bb)
+            if len(bids) != 2:
+                continue
+            comb = round(sum(bids), 4)
+            if comb > PREOPEN_MAX_COMBINED:
+                self._tlog(
+                    f"preopen_wide_{sym}",
+                    f"⏸️ [PRE-OUVERTURE] {sym} {slug} combine bid {comb:.3f} > "
+                    f"{PREOPEN_MAX_COMBINED} -> pas assez de marge, on ne pose pas",
+                )
+                continue
+            budget = self._preopen_budget()
+            shares = round(max(MIN_SELL_SHARES, budget / max(0.01, comb / 2)), 2)
+            besoin = round(shares * comb, 2)
+            if besoin > self._investable():
+                self._tlog(
+                    f"preopen_funds_{sym}",
+                    f"⛔ [PRE-OUVERTURE] {sym} {slug} il faut {besoin:.2f}$ pour les 2 jambes, "
+                    f"{self._investable():.2f}$ dispo -> on ne pose pas ce qu'on ne peut pas honorer",
+                )
+                continue
+            ok_exp, why = self._exposure_ok(sym, mk, slug, besoin)
+            if not ok_exp:
+                continue
+
+            self._log(
+                f"📮 [PRE-OUVERTURE] {sym} {slug} ouvre dans {lead:.0f}s | "
+                f"pose 2 ordres MAKER {outcomes[0]}@{bids[0]:.3f} + {outcomes[1]}@{bids[1]:.3f} "
+                f"= {comb:.3f} ({shares} parts, {besoin:.2f}$) -> +{(1 - comb) * 100:.1f}% si les 2 passent"
+            )
+            posted = {}
+            for i, (side, tid) in enumerate(zip(outcomes, token_ids)):
+                r = self._live.post_limit_buy(tid, bids[i], shares)
+                posted["a" if i == 0 else "b"] = {
+                    "side": side, "token_id": tid, "price": bids[i],
+                    "order_id": r.get("order_id"), "ok": bool(r.get("success")),
+                }
+                if not r.get("success"):
+                    self._log(
+                        f"⚠️ [PRE-OUVERTURE] {sym} {slug} {side} ordre refuse : "
+                        f"{str(r.get('error'))[:120]}"
+                    )
+            # si un des deux n'a pas ete accepte, on annule l'autre tout de suite
+            if not all(v.get("ok") for v in posted.values()):
+                for v in posted.values():
+                    if v.get("order_id"):
+                        self._live.cancel_order(v["order_id"])
+                self._log(f"⭕ [PRE-OUVERTURE] {sym} {slug} pose incomplete -> tout annule")
+                continue
+            posted["open_ts"] = open_ts
+            posted["posted_ts"] = now
+            st[slug] = posted
+            self._save()
+            return
 
     def _manage_stagger(self, sym):
         """ARB DECALE, suite : complete la paire des que le verrou est
