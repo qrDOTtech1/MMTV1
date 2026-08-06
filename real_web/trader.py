@@ -681,7 +681,24 @@ TIER_SIZE_ULTRA = 2.00  # $ par jambe (marche ultra liquide + edge > 15%)
 # doit PAS rester plafonne aux petits tiers fixes ($0.50-2/jambe) quand du
 # capital dort : on scale la taille sur le capital dispo, PLANCHER a
 # MIN_ORDER_SIZE_SHARES (5 parts), tant que combined < INSTANT_ARB_MAX_COMBINED.
-INSTANT_ARB_MAX_COMBINED = 0.99  # au-dela : pas assez de marge garantie
+# SEUIL RAMENE SOUS LE POINT MORT (Steven 06/08, apres backtest).
+#
+# 0.99 etait la MEME erreur que STAGGER_COMPLETE_MAX : un combine de 0.99 laisse
+# 1.0% de marge brute, alors que les frais taker des deux jambes en coutent
+# ~4.4% (0.0455 x min(p,1-p) sur chaque jambe, soit ~0.044 par part a 0.48/0.51).
+# Le point mort est a 0.956 -- tout arb conclu au-dessus perd de l'argent en
+# etant pourtant un vrai arb. Verifie sur nos executions reelles :
+#     combine 0.96-0.98 -> ROI -20.12%   |   combine >= 1.00 -> ROI -4.43%
+#
+# COUT DE CE RESSERRAGE, mesure sur 694 fenetres (occasion comptee seulement si
+# le PIRE prix d'achat de chaque cote dans la seconde suffit deja) :
+#     seuil 0.99  -> 11.0% des fenetres, 6.6 arbs/h, marge moyenne +3.6% (perdant)
+#     seuil 0.956 ->  2.7% des fenetres, 1.6 arbs/h, marge moyenne +7.7%
+#     seuil 0.95  ->  2.2% des fenetres, 1.3 arbs/h, marge moyenne +9.2%
+# Cette estimation est corroboree par nos executions reelles : 1.3 arb/h mesure
+# sur 63 heures, contre 1.6 predit. Les 8 arbs/h demandes n'existent pas au-dela
+# du point mort ; on les "obtient" uniquement en achetant des perdants.
+INSTANT_ARB_MAX_COMBINED = 0.95
 # ── PLAFOND DE COMPLETION D'UNE PAIRE (Steven 05/08) ────────────────────
 # S'applique a TOUS les chemins qui completent une paire deja entamee
 # (FORCE-PAIR, ORPHAN-PAIR, HEDGE-NEAR). Avant, ces chemins toleraient un
@@ -721,6 +738,12 @@ POLY_FEE_SAFETY = 0.003         # marge : mieux vaut rater un arb que le perdre
 # rate*C, donc le vrai seuil de rentabilite est 1/(1+rate) = 0.954 a 0.048.
 # On ne s'en sert plus comme critere principal (cf. _pair_net_after_fees qui
 # calcule le cout EXACT jambe par jambe), mais comme premier filtre grossier.
+# Ecart de parts tolere entre les 2 jambes d'une paire. Au-dela, l'excedent de
+# la grosse jambe n'est couvert par rien et doit etre solde : le gagnant paie 1$
+# par PART, donc seul min(parts) est un arb. 1.05 laisse passer un arrondi sans
+# laisser passer un vrai desequilibre. Mesure sur 80 arbs reels : equilibres
+# +0.62% de ROI, au-dela de 1.30x -14.03%.
+PAIR_MAX_IMBALANCE = 1.05
 PAIR_COMPLETION_MAX_COMBINED = 0.95
 # ── ZONE DE COUVERTURE TOLEREE (Steven 05/08, decision explicite) ──────
 # Cas reel qui a motive ce palier : 13:20:47 achat Up 4.976 @ 0.410, puis
@@ -993,7 +1016,26 @@ COPY_AUTOSELECT_MIN_BAND_N_FOR_CONCENTRATION = 5
 # vente on-chain malgre le stop-loss declenche -- carnet trop mince sur une
 # jambe qui s'effondre. C'est la vraie fragilite a corriger en priorite si on
 # veut que cette strategie tienne.
-STAGGER_ENABLED = True
+# COUPE SUR DECISION DE STEVEN (06/08), apres backtest sur 694 fenetres reelles
+# (566k transactions publiques, BTC/ETH/XRP/SOL).
+#
+# L'arb decale perd de l'argent en TAKER, et ce resultat est solide : negatif
+# dans 15 cellules de parametres sur 15, IC95 [-5.97% ; -2.71%], t = -5.35, et
+# il survit a un rejeu qui n'utilise PAS la reconstruction 1-p mais les vrais
+# prints des deux carnets.
+#
+# La raison n'est pas les frais, contrairement a ce que j'avais d'abord conclu.
+# Quand une entree expire sans verrou elle vaut EXACTEMENT -100%, sur 51 cas
+# sur 51 : si notre jambe est gagnante son prix doit TRAVERSER le seuil de
+# verrouillage pour monter vers 1, donc on verrouille toujours avant --  seuls
+# les perdants atteignent l'expiration. Le pari reel est donc :
+#     89% du temps +6.7%   |   11% du temps -100%   ->  -5% d'esperance
+# Aucun reglage de frais, de seuil ou de timing ne corrige une asymetrie pareille.
+#
+# La version maker n'est PAS une alternative : mesuree a -0.37% sur donnees
+# propres, IC95 [-2.07% ; +1.09%], indiscernable de zero. Le +1.36% que j'avais
+# annonce etait un optimum in-sample sur 384 combinaisons essayees.
+STAGGER_ENABLED = False
 
 # ── ARB PRE-OUVERTURE EN MAKER (Steven 06/08) ──────────────────────────
 # On POSE les deux jambes (ordres GTC passifs) sur une fenetre 5min PAS
@@ -2306,9 +2348,42 @@ class MultiTrader:
         # a partir des prix d'entree, et on n'accorde is_risk_free que si ce
         # net est POSITIF : une paire qui perd apres frais doit rester geree
         # en TP/SL, pas etre tenue jusqu'a resolution comme un profit acquis.
+        # DESEQUILIBRE DE PARTS = LA PREMIERE SOURCE DE PERTE (Steven 06/08).
+        # Mesure sur nos 80 arbs instantanes reels (63 heures) :
+        #     parts equilibrees <=1.05x : 28 arbs, ROI  +0.62%
+        #     1.05 a 1.30x              : 15 arbs, ROI  -5.14%
+        #     au-dela de 1.30x          : 37 arbs, ROI -14.03%
+        # 46% de nos arbs sont severement desequilibres et portent 89% des
+        # pertes totales. C'est mecanique : le gagnant paie 1$ par PART, donc
+        # seul min(parts) est couvert -- l'excedent de la grosse jambe est un
+        # pari directionnel nu, pas de l'arb.
+        #
+        # On MARQUE l'excedent ici, on ne le vend PAS : _tag_pair_lock est
+        # appele depuis des chemins qui detiennent deja _order_lock, et
+        # _sell_orphan prend ce meme verrou non reentrant -- vendre ici
+        # bloquerait le bot. La vente est faite par la boucle de sortie, qui
+        # appelle deja _sell_orphan hors verrou.
+        _sa = pos_a.get("filled_shares") or 0
+        _sb = pos_b.get("filled_shares") or 0
+        if _sa > 0 and _sb > 0:
+            _imb = max(_sa, _sb) / min(_sa, _sb)
+            if _imb > PAIR_MAX_IMBALANCE:
+                _gros = pos_a if _sa > _sb else pos_b
+                _exc = round(abs(_sa - _sb), 2)
+                if _exc >= MIN_SELL_SHARES:
+                    _gros["excedent_a_solder"] = _exc
+                    self._log(
+                        f"⚖️ [DESEQUILIBRE]{tag} {_sa:.2f} contre {_sb:.2f} parts "
+                        f"({_imb:.2f}x) -> {_exc:.2f} parts en trop sur "
+                        f"{_gros.get('side')}, a solder : non couvertes par l'arb"
+                    )
+        # le verrou se juge sur les parts REELLEMENT appariees, donc apres
+        # deduction de l'excedent qui va etre solde
+        _eff_a = _sa - (pos_a.get("excedent_a_solder") or 0)
+        _eff_b = _sb - (pos_b.get("excedent_a_solder") or 0)
         margin = self._pair_net_after_fees(
-            pos_a.get("entry_price"), pos_a.get("filled_shares"),
-            pos_b.get("entry_price"), pos_b.get("filled_shares"),
+            pos_a.get("entry_price"), _eff_a,
+            pos_b.get("entry_price"), _eff_b,
         )
         locked = margin > 0
         for _p in (pos_a, pos_b):
@@ -9632,6 +9707,28 @@ class MultiTrader:
                 # le SPREAD-EXIT. Couper la jambe perdante d'une paire encore
                 # tenue retire precisement ce qui borne la perte -- mesure a
                 # -8.60$ sur deux fenetres. Voir _hedge_would_break.
+                # EXCEDENT NON COUVERT (marque par _tag_pair_lock, voir la-bas
+                # pour la mesure). On le solde AVANT toute autre decision : ces
+                # parts ne font pas partie de l'arb, les garder est un pari nu.
+                _exc = pos.get("excedent_a_solder") or 0
+                if _exc >= MIN_SELL_SHARES:
+                    _v = self._sell_orphan(
+                        pos["token_id"], round(min(_exc, pos.get("filled_shares") or 0), 2),
+                        f" {sym} {slug} {pos['side']} EXCEDENT-NON-COUVERT",
+                        entry_price=pos.get("entry_price"), symbol=sym, slug=slug,
+                        side=pos.get("side"),
+                    )
+                    if _v > 0:
+                        pos["filled_shares"] = round((pos["filled_shares"] or 0) - _v, 2)
+                        pos["cost"] = round((pos.get("cost") or 0)
+                                            - _v * (pos.get("entry_price") or 0), 2)
+                        self._log(
+                            f"⚖️ [DESEQUILIBRE] {sym} {slug} {pos['side']} {_v:.2f} parts "
+                            f"en trop soldees -> la paire revient a des parts egales"
+                        )
+                    pos["excedent_a_solder"] = round(max(0.0, _exc - _v), 2)
+                    self._save()
+                    continue
                 if self._hedge_would_break(mk, slug, pos.get("side"), cur, pos.get("entry_price")):
                     self._tlog(
                         f"slhedge_{key}",
