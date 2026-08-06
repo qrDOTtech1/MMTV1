@@ -4266,6 +4266,40 @@ class MultiTrader:
         budget = max(budget, round(MIN_SELL_SHARES * ask, 2))
         if budget > investable or budget < MIN_BUDGET_USD:
             return False
+
+        # ── RESERVATION DU CAPITAL DE LA JAMBE 2 (Steven 06/08) ──────────
+        # CAUSE REELLE des non-completions, diagnostiquee par Steven : "on
+        # n'avait pas assez de fonds pour ouvrir toutes les legs dont on avait
+        # besoin, sinon a chaque ouverture de marche on a systematiquement
+        # reussi a creer l'arb".
+        # Verifie sur les 3 echecs de la premiere heure : SOL ouverte avec
+        # 20.25$ en caisse (completion possible), mais DOGE et XRP ouvertes
+        # SIMULTANEMENT avec 5.47$ -> les deux jambes 1 ont consomme 4.16$, il
+        # restait 1.31$ alors qu'il fallait ~2.10$ pour completer UNE seule
+        # d'entre elles. Le bot se mettait lui-meme dans l'impossibilite de
+        # finir : ce n'etait pas la strategie, c'etait l'absence de reserve.
+        # Desormais on n'engage une jambe 1 QUE si le capital de la jambe 2
+        # est deja disponible, RESERVES COMPRIS pour les staggers deja en
+        # attente sur d'autres marches.
+        shares_prev = round(budget / ask, 2)
+        besoin_leg2 = round(shares_prev * besoin, 2)   # pire cas de completion
+        deja_reserve = 0.0
+        for _k, _p in mk["open"].items():
+            if _p.get("strat") == "stagger" and _p.get("mode") == "real":
+                deja_reserve += (_p.get("filled_shares") or 0) * (
+                    _p.get("stagger_need_below") or 0
+                )
+        besoin_total = round(budget + besoin_leg2 + deja_reserve, 2)
+        if besoin_total > investable:
+            self._tlog(
+                f"stagfunds_{sym}",
+                f"⛔ [ARB-DECALE] {sym} {slug} pas de reserve pour la jambe 2 : "
+                f"jambe1 {budget:.2f}$ + jambe2 ~{besoin_leg2:.2f}$ "
+                f"+ {deja_reserve:.2f}$ deja reserves = {besoin_total:.2f}$ "
+                f"> {investable:.2f}$ dispo -> on n'ouvre pas ce qu'on ne pourra pas finir",
+            )
+            return False
+
         ok_exp, why_exp = self._exposure_ok(sym, mk, slug, budget)
         if not ok_exp:
             return False
