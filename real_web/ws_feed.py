@@ -21,7 +21,11 @@ import threading
 import time
 import logging
 
-from websocket import create_connection
+from websocket import (
+    WebSocketConnectionClosedException,
+    WebSocketTimeoutException,
+    create_connection,
+)
 
 BINANCE_WS = "wss://stream.binance.com:9443/stream"
 POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -386,6 +390,7 @@ class WSFeed:
                 self._poly_sub = set(wanted)
                 ws.settimeout(5.0)
                 last_check = time.time()
+                last_msg = time.time()
                 while True:
                     # re-subscribe si de nouveaux tokens sont demandes
                     if time.time() - last_check > 2.0:
@@ -396,10 +401,28 @@ class WSFeed:
                             raise ConnectionError(
                                 "resub"
                             )  # relance avec la liste complete
+                    # CHIEN DE GARDE (Steven 06/08) : si plus AUCUN message
+                    # n'arrive pendant 20s alors qu'on suit des marches 5min
+                    # tres actifs, la connexion est morte meme si l'objet ws
+                    # ne le signale pas encore -> on force la reconnexion.
+                    if time.time() - last_msg > 20.0:
+                        raise ConnectionError("flux silencieux 20s")
                     try:
                         raw = ws.recv()
-                    except Exception:
-                        continue  # timeout de recv -> reboucle (permet le re-check)
+                        last_msg = time.time()
+                    except WebSocketTimeoutException:
+                        continue  # timeout normal -> reboucle (permet le re-check)
+                    except (WebSocketConnectionClosedException, OSError) as e:
+                        # BUG CORRIGE (Steven 06/08, "on peut etre plus
+                        # rapide ?") : l'ancien `except Exception: continue`
+                        # attrapait AUSSI la connexion fermee -> la boucle
+                        # tournait a l'infini sans jamais se reconnecter.
+                        # Symptome mesure en prod : books_total=34 mais
+                        # books_fresh=0 -- les carnets recus une seule fois a
+                        # la connexion, plus aucune mise a jour ensuite, donc
+                        # TOUTES les lectures de prix retombaient sur le REST
+                        # (~1s de retard) au lieu du WS (<100ms).
+                        raise ConnectionError(f"connexion fermee: {e}")
                     if not raw:
                         continue
                     msgs = json.loads(raw)
