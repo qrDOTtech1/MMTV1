@@ -1059,11 +1059,39 @@ PREOPEN_BUDGET_FRAC = 0.08        # part du capital investissable
 PREOPEN_BUDGET_MIN = 2.0
 PREOPEN_BUDGET_MAX = 10.0
 PREOPEN_CANCEL_BEFORE_S = 30      # a T-30s : on annule ce qui n'est pas rempli
-STAGGER_ENTRY_MIN = 0.38          # sous ca : billet de loterie, jamais
-STAGGER_ENTRY_MAX = 0.55          # au-dela : trop peu de marge pour verrouiller
+# BANDE D'ENTREE RESSERREE (Steven 06/08). Mesure sur 279 fenetres du type
+# "arb decale" (jambe 1 entre 0.30 et 0.60), taux de completion et resultat
+# net par tranche de prix d'entree :
+#     0.30-0.35 :  34 fenetres, 44% completees, net -22.65$
+#     0.35-0.40 :  41 fenetres, 51% completees, net -25.22$
+#     0.40-0.45 :  73 fenetres, 70% completees, net -18.58$
+#     0.45-0.50 :  57 fenetres, 74% completees, net -11.60$   <- meilleur
+#     0.50-0.55 :  55 fenetres, 69% completees, net -12.42$
+#     0.55-0.60 :  19 fenetres, 63% completees, net  -5.43$
+# Entrer sous 0.44 est doublement mauvais : moins de completions ET plus de
+# pertes. Les deux tranches basses concentrent -47.87$ a elles seules, soit
+# la moitie de la perte totale, pour un tiers des fenetres. On remonte donc
+# le plancher de 0.38 a 0.44.
+STAGGER_ENTRY_MIN = 0.44          # sous ca : moins de completions ET plus de pertes
+STAGGER_ENTRY_MAX = 0.58          # legerement releve : les tranches hautes tiennent mieux
 STAGGER_MIN_SECS_LEFT = 180       # acheter TOT : il faut du temps pour que ca bouge
 STAGGER_COMPLETE_MAX = 0.99       # verrou reel exige pour completer
-STAGGER_GIVEUP_SECS = 50          # sans verrou a ce stade -> on solde la jambe 1
+STAGGER_GIVEUP_SECS = 50          # filet de fin de fenetre (garde en secours)
+# SORTIE ANTICIPEE PAR LE TEMPS (Steven 06/08) -- l'amelioration la plus
+# importante. Mesure sur 179 completions reussies : le delai entre la jambe 1
+# et la completion est de 12s en MEDIANE, et 82% arrivent en moins de 40s
+# (p90 = 79s). Passe ce delai, la completion n'arrive quasiment jamais : le
+# marche a deja choisi son camp.
+# Or on tenait la jambe 1 jusqu'a STAGGER_GIVEUP_SECS (50s de la fin), soit
+# jusqu'a 250 SECONDES de risque porte pour rien. Et sur ces marches le prix
+# s'effondre vite :
+#     btc-1785984300 : 0.500 -> 0.330 en 27s
+#     oge-1785991800 : 0.490 -> 0.210 en 74s
+#     oge-1785988800 : 0.500 -> 0.170 en 30s
+# Sortir tot coute 15-20% ; attendre coute 50-65%. Le stop-loss en pourcentage
+# ne suffit pas sur un marche qui bouge par sauts : entre deux cycles il a
+# deja traverse le seuil. Une limite de TEMPS, elle, ne peut pas etre sautee.
+STAGGER_MAX_WAIT_S = 45           # sans verrou 45s apres la jambe 1 -> on solde
 STAGGER_STOP_LOSS = 0.30          # jambe 1 qui perd 30% -> on coupe sans attendre
 STAGGER_BUDGET_FRAC = 0.10        # part du capital investissable
 STAGGER_BUDGET_MIN = 2.0
@@ -4671,7 +4699,21 @@ class MultiTrader:
                     f"(-{100 * (entry - cur) / entry:.0f}%) -> on coupe, pas d'attente"
                 )
                 continue
-            # ── 2) FIN DE FENETRE sans verrou -> on solde ──
+            # ── 2) LIMITE DE TEMPS : 82% des completions arrivent en <40s ──
+            # (mediane 12s). Passe ce delai le marche a choisi son camp et la
+            # completion n'arrive quasiment jamais -- on portait le risque
+            # pour rien, parfois 250s. Voir STAGGER_MAX_WAIT_S.
+            _age = time.time() - (pos.get("opened_ts") or 0)
+            if _age >= STAGGER_MAX_WAIT_S:
+                pos["strat"] = "orphan"
+                pos["must_close"] = True
+                self._log(
+                    f"⏱️ [ARB-DECALE] {sym} {slug} {pos['side']} pas de verrou apres "
+                    f"{_age:.0f}s (82% des completions arrivent en <40s) "
+                    f"-> on solde maintenant, tant que le prix tient"
+                )
+                continue
+            # ── 2bis) FILET DE FIN DE FENETRE (secours) ──
             if secs_left <= STAGGER_GIVEUP_SECS:
                 pos["strat"] = "orphan"
                 pos["must_close"] = True
