@@ -1072,6 +1072,12 @@ PREOPEN_TOTAL_FRAC = 0.35         # 35% du capital investissable, les 2 jambes
 PREOPEN_BUDGET_MIN = 4.7          # ~5 parts a 0.47 x2 : le vrai plancher CLOB
 PREOPEN_BUDGET_MAX = 40.0
 PREOPEN_CANCEL_BEFORE_S = 30      # a T-30s : on annule ce qui n'est pas rempli
+# Au-dela de cet ecart entre les 2 jambes on ne verrouille PAS tout de suite :
+# on laisse la petite jambe se remplir, et a T-30s on solde l'excedent de la
+# grosse. Mesure (Steven 06/08) : sur 5 fenetres pre-ouverture, les 4 a 1.00x
+# gagnent toutes (+0.90$ / 19.14$), la seule a 2.03x perd -0.71$. 1.05 tolere
+# un arrondi de part sans tolerer un vrai desequilibre.
+PREOPEN_MAX_IMBALANCE = 1.05
 # BANDE D'ENTREE RESSERREE (Steven 06/08). Mesure sur 279 fenetres du type
 # "arb decale" (jambe 1 entre 0.30 et 0.60), taux de completion et resultat
 # net par tranche de prix d'entree :
@@ -4533,7 +4539,74 @@ class MultiTrader:
             got_a, got_b = fa > 0.01, fb > 0.01
 
             if got_a and got_b:
-                # LES DEUX REMPLIS -> arb verrouille, on enregistre et on sort
+                # DESEQUILIBRE = LE SEUL DEFAUT D'EXECUTION QUI COUTE
+                # (Steven 06/08). Mesure sur les 5 fenetres pre-ouverture :
+                # les 4 a parts equilibrees (1.00x) sont 4 gagnantes sur 4,
+                # +0.90$ pour 19.14$ engages ; la SEULE perdante (-0.71$) est
+                # la seule desequilibree (2.03x). Le gagnant paie 1$ par PART,
+                # donc seul min(parts) est couvert -- l'excedent de la grosse
+                # jambe est un pari directionnel nu, pas de l'arb.
+                #
+                # Avant, ce bloc verrouillait des le MOINDRE remplissage des
+                # deux cotes, y compris 2.51 contre 5.09 parts, et laissait en
+                # plus les ordres vivants apres avoir enregistre les tailles.
+                # Desormais : tant qu'il reste du temps, on laisse la petite
+                # jambe se remplir ; a T-30s on fige et on solde l'excedent.
+                imb = max(fa, fb) / max(0.01, min(fa, fb))
+                if imb > PREOPEN_MAX_IMBALANCE and lead > PREOPEN_CANCEL_BEFORE_S:
+                    self._tlog(
+                        f"preopen_imb_{sym}",
+                        f"⏳ [PRE-OUVERTURE] {sym} {slug} remplissage inegal "
+                        f"({fa:.2f}/{fb:.2f} parts, {imb:.2f}x) -> on laisse la petite "
+                        f"jambe se remplir, encore {lead:.0f}s",
+                    )
+                    continue
+
+                # on FIGE avant d'enregistrer : sans ca les ordres restaient
+                # vivants et continuaient a remplir apres coup, en dehors de
+                # toute comptabilite.
+                for side in ("a", "b"):
+                    oid = (e.get(side) or {}).get("order_id")
+                    if oid:
+                        self._live.cancel_order(oid)
+                for side in ("a", "b"):
+                    leg = e.get(side) or {}
+                    tid = leg.get("token_id")
+                    if tid:
+                        held = self._live.position_size(tid)
+                        fills[side] = max(0.0, held if held and held > 0 else 0.0)
+                fa, fb = fills.get("a", 0.0), fills.get("b", 0.0)
+                if not (fa > 0.01 and fb > 0.01):
+                    continue        # relu apres annulation : on repasse par le cas normal
+
+                # EXCEDENT : on ramene les deux jambes a la meme taille. Ce qui
+                # depasse min(parts) n'est couvert par rien, on le solde.
+                gros = "a" if fa > fb else "b"
+                excedent = round(abs(fa - fb), 2)
+                if excedent >= MIN_SELL_SHARES:
+                    legx = e[gros]
+                    vendu = self._sell_orphan(
+                        legx["token_id"], excedent,
+                        f" {sym} {slug} {legx['side']} PRE-OUVERTURE-EXCEDENT",
+                        entry_price=legx["price"], symbol=sym, slug=slug, side=legx["side"],
+                    )
+                    self._log(
+                        f"⚖️ [PRE-OUVERTURE] {sym} {slug} excedent {excedent:.2f} parts sur "
+                        f"{legx['side']} -> {vendu:.2f} soldees, les 2 jambes reviennent a "
+                        f"{min(fa, fb):.2f} parts (l'excedent n'etait couvert par rien)"
+                    )
+                    fills[gros] = round(fills[gros] - vendu, 2)
+                    fa, fb = fills.get("a", 0.0), fills.get("b", 0.0)
+                elif excedent > 0.01:
+                    # sous le plancher de vente : on garde, le risque porte sur
+                    # moins d'une part, ca ne vaut pas un aller-retour de spread.
+                    self._tlog(
+                        f"preopen_dust_{sym}",
+                        f"[PRE-OUVERTURE] {sym} {slug} excedent {excedent:.2f} parts sous le "
+                        f"plancher de vente -> conserve, risque negligeable",
+                    )
+
+                # arb verrouille, on enregistre et on sort
                 for side in ("a", "b"):
                     leg = e[side]
                     n = fills[side]
