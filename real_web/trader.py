@@ -4521,6 +4521,8 @@ class MultiTrader:
             slug = f"{sym.lower()}-updown-5m-{open_ts}"
             if slug in st or any(k.startswith(f"{slug}|") for k in mk["open"]):
                 continue
+            if mk.setdefault("preopen_cooldown", {}).get(slug, 0) > now:
+                continue
             meta = self._market_meta(slug)
             if not meta:
                 continue
@@ -4543,8 +4545,13 @@ class MultiTrader:
                     f"{PREOPEN_MAX_COMBINED} -> pas assez de marge, on ne pose pas",
                 )
                 continue
+            # TAILLE MINIMUM (Steven 06/08, ordres refuses en prod) : j'avais
+            # utilise MIN_SELL_SHARES (1.0), qui est le plancher de VENTE.
+            # Polymarket impose orderMinSize = 5 parts sur les ordres LIMITE
+            # -> les poses a 4.26 parts etaient rejetees en 400. On part donc
+            # de MIN_ORDER_SIZE_SHARES et on arrondit AU-DESSUS.
             budget = self._preopen_budget()
-            shares = round(max(MIN_SELL_SHARES, budget / max(0.01, comb / 2)), 2)
+            shares = round(max(MIN_ORDER_SIZE_SHARES, budget / max(0.01, comb / 2)) + 0.01, 2)
             besoin = round(shares * comb, 2)
             if besoin > self._investable():
                 self._tlog(
@@ -4570,15 +4577,24 @@ class MultiTrader:
                     "order_id": r.get("order_id"), "ok": bool(r.get("success")),
                 }
                 if not r.get("success"):
+                    # message COMPLET : les 120 premiers caracteres ne
+                    # contenaient que le hash de l'ordre, pas la cause.
+                    _err = str(r.get("error") or "")
+                    _cause = _err.split("error_message=")[-1] if "error_message=" in _err else _err
                     self._log(
-                        f"⚠️ [PRE-OUVERTURE] {sym} {slug} {side} ordre refuse : "
-                        f"{str(r.get('error'))[:120]}"
+                        f"⚠️ [PRE-OUVERTURE] {sym} {slug} {side} @ {bids[i]:.3f} "
+                        f"x{shares} parts ordre refuse : {_cause[:300]}"
                     )
             # si un des deux n'a pas ete accepte, on annule l'autre tout de suite
             if not all(v.get("ok") for v in posted.values()):
                 for v in posted.values():
                     if v.get("order_id"):
                         self._live.cancel_order(v["order_id"])
+                # COOLDOWN (Steven 06/08) : sans lui le bot reposait toutes les
+                # 2s et spammait l'API de commandes rejetees. Une pose qui
+                # echoue echoue en general pour une raison persistante
+                # (taille, solde, marche pas pret) -> on laisse passer du temps.
+                mk.setdefault("preopen_cooldown", {})[slug] = now + 60
                 self._log(f"⭕ [PRE-OUVERTURE] {sym} {slug} pose incomplete -> tout annule")
                 continue
             posted["open_ts"] = open_ts
