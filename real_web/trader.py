@@ -9055,17 +9055,34 @@ class MultiTrader:
                 real_max = (
                     REAL_MAX_COMBINED if mode == "real" else BOTH_SIDE_COMBINED_MAX
                 )
-                # COMBINED HISTORY GATE (Steven 26/07) : si le combined actuel
-                # est au-dessus du seuil MAIS le meilleur récent était en dessous,
-                # on sait que le prix oscille -> on autorise l'entrée.
-                if combined > real_max and _comb_best <= real_max:
-                    self._tlog(
-                        f"osc_allow_{sym}",
-                        f"📊 [OSC-GATE] {sym} {slug} comb={combined:.3f} > {real_max:.3f} "
-                        f"MAIS best_recent={_comb_best:.3f} <= {real_max:.3f} -> OSCILLATION",
-                    )
-                    combined = _comb_best  # utilise le meilleur observed pour sizing
+                # BUG CORRIGE (Steven 07/08, "ETH a ouvert une paire a comb=1.010
+                # en pensant payer 0.950"). L'ancien "COMBINED HISTORY GATE"
+                # ecrasait `combined` par _comb_best (une valeur RECENTE mais
+                # perimee) des que le prix ACTUEL depassait le seuil, puis
+                # laissait passer la suite (sizing + post) sur cette valeur
+                # fictive -- alors que `leg_data` (les prix REELS utilises pour
+                # poster les ordres) restait, lui, sur le prix ACTUEL, moins bon.
+                # Le bot achetait donc au prix reel tout en croyant avoir eu le
+                # meilleur prix recent -> paires ouvertes a un combine garanti
+                # perdant (ex. Up@0.49+Down@0.52=1.01 le 07/08 sur ETH), rattrapees
+                # seulement en aval par _tag_pair_lock (qui, lui, recalcule
+                # correctement depuis les VRAIS entry_price -- c'est ce qui a
+                # empeche que la position soit traitee comme un arb garanti,
+                # mais n'empechait pas l'entree elle-meme).
+                #
+                # `quotes` est fige UNE SEULE FOIS avant cette boucle de 3
+                # tentatives (jamais rafraichi entre les essais) : la "seconde
+                # chance" que ce garde-fou pretendait offrir n'existait donc pas
+                # reellement -- chaque retry relisait le meme instantane. Le
+                # supprimer ne fait perdre aucune vraie occasion de rattrapage,
+                # ca supprime seulement la decision prise sur un prix qui
+                # n'etait plus d'actualite.
                 if combined > real_max:
+                    self._tlog(
+                        f"osc_reject_{sym}",
+                        f"📊 [PRIX-TROP-HAUT] {sym} {slug} comb={combined:.3f} > {real_max:.3f} "
+                        f"(meilleur recent {_comb_best:.3f}) -> abandon, prix actuel fait foi",
+                    )
                     break
                 target_shares, tier_label = self._edge_based_sizing(
                     sym,
