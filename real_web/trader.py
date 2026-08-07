@@ -798,6 +798,41 @@ MAKER_OPEN_PRICE = 0.35           # prix de pose, identique des deux cotes
 MAKER_OPEN_MAX_COMBINED = 0.94    # garde-fou : au-dela on ne pose pas
 MAKER_OPEN_MIN_REMAIN_S = 120     # sous 2 min restantes, trop tard pour etre servi
 MAKER_OPEN_CANCEL_BEFORE_S = 45   # a T-45s : on annule et on solde une jambe seule
+# TP SUR JAMBE SEULE (Steven 07/08, "utiliser signal quand on tient 1 leg et
+# qu'on voit que le marche ne bouge pas assez vite de l'autre cote -> TP
+# maximal et se retirer sans poser l'autre").
+#
+# Sans ca, une jambe seule attend passivement jusqu'a MAKER_OPEN_CANCEL_BEFORE_S
+# quoi qu'il arrive -- et si elle est en train de PERDRE, son prix s'effondre
+# bien avant cette echeance (mesure la nuit du 06/08 : deja pres de zero vers
+# t=150-200s alors qu'on ne vendait qu'a t=255s). Si elle est en train de
+# GAGNER en revanche, la garder est la bonne decision : le cote oppose descend
+# en meme temps, ce qui remplit naturellement notre 2e ordre -> c'est ce qui
+# fabrique les verrous a zero frais. D'ou un TP, jamais un stop-loss : on ne
+# coupe jamais une jambe qui baisse (teste et rejete, casse plus de verrous
+# qu'il n'evite de pertes), on prend seulement un profit sur celle qui monte
+# suffisamment, AVANT que le cutoff n'attende pour rien.
+#
+# Backteste sur 519 fenetres BTC + 65 ETH (566k transactions publiques),
+# ordre chronologique strict (un verrou qui arriverait APRES le declenchement
+# du TP compte comme sacrifie, pas comme un bonus gratuit) :
+#     sans TP   -> BTC ROI -1.15% a +3.63% | ETH ROI -7.22% a +9.63%
+#     TP x1.8   -> BTC ROI +2.66% a +6.73% | ETH ROI -2.26% a +11.26%
+# Ameliore dans les 8 decoupages testes (par symbole ET par moitie temporelle
+# ancienne/recente), jamais degrade. Le TP se declenche en moyenne 30-36s
+# apres le remplissage (P10 15s, P90 130s) -- un vrai mouvement, pas du bruit
+# de carnet en quelques millisecondes, largement dans la capacite de reaction
+# du bot (verification toutes les 2-3s). x1.8 retenu : sous x1.5 la strategie
+# devient franchement mauvaise (sacrifie trop de vrais verrous pour du bruit
+# qui n'aurait jamais tenu), au-dela de x2.2 le TP ne se declenche presque
+# jamais et on retombe sur le comportement actuel.
+#
+# RESTE UN RISQUE CONNU : sur ETH seul, en hypothese de remplissage
+# conservatrice, le pire cas mesure reste negatif (-2.26%, contre -7.22% sans
+# TP -- ameliore mais pas gagnant). Echantillon ETH 8x plus petit que BTC (65
+# vs 519 fenetres) : le signe de son edge reste incertain, contrairement a BTC.
+MAKER_OPEN_TP_MULT = 1.8
+MAKER_OPEN_TP_MIN_HOLD_S = 15
 MAKER_OPEN_TOTAL_FRAC = 0.35      # TOTAL des 2 jambes, en part de l'investissable
 MAKER_OPEN_BUDGET_MIN = 4.7
 MAKER_OPEN_BUDGET_MAX = 40.0
@@ -5149,6 +5184,55 @@ class MultiTrader:
                 )
                 self._maker_open_record(sym, slug, "les_deux", combine=round(pa + pb, 4),
                                         parts=round(min(fa, fb), 2), prix=pa)
+                st.pop(slug, None)
+                self._save()
+                continue
+
+            # TP SUR JAMBE SEULE (voir MAKER_OPEN_TP_MULT). Exactement une
+            # jambe est remplie a ce stade (le cas "les deux" est deja sorti
+            # plus haut). On horodate le PREMIER instant ou on la voit remplie
+            # (une seule fois -- ne pas ecraser a chaque cycle), et si elle a
+            # suffisamment monte apres un delai minimal anti-bruit, on prend
+            # le profit et on ABANDONNE la tentative sur l'autre cote, comme
+            # demande : plus la peine d'esperer completer la paire.
+            cote_seule = "a" if fa > 0.01 else "b"
+            leg_seule = e[cote_seule]
+            if "fill_ts" not in leg_seule:
+                leg_seule["fill_ts"] = now
+            _hold_s = now - leg_seule["fill_ts"]
+            _cur = self._live_price(leg_seule["token_id"], None, leg_seule["side"])
+            _tp_seuil = leg_seule["price"] * MAKER_OPEN_TP_MULT
+            if _cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil:
+                n_tp = fills[cote_seule]
+                autre_seule = "b" if cote_seule == "a" else "a"
+                oid_autre = (e.get(autre_seule) or {}).get("order_id")
+                if oid_autre:
+                    self._live.cancel_order(oid_autre)
+                self._log(
+                    f"💰 [MAKER-OUVERT-TP] {sym} {slug} {leg_seule['side']} "
+                    f"{leg_seule['price']:.3f}->{_cur:.3f} (+{100*(_cur/leg_seule['price']-1):.0f}%) "
+                    f"apres {_hold_s:.0f}s -> on prend le profit, on abandonne l'autre cote"
+                )
+                vendu_tp = self._sell_orphan(
+                    leg_seule["token_id"], round(n_tp, 2),
+                    f" {sym} {slug} {leg_seule['side']} MAKER-OUVERT-TP",
+                    entry_price=leg_seule["price"], symbol=sym, slug=slug,
+                    side=leg_seule["side"],
+                )
+                if vendu_tp < n_tp - 0.01:
+                    mk["open"][f"{slug}|{leg_seule['side']}"] = {
+                        "symbol": sym, "slug": slug, "side": leg_seule["side"], "mode": "real",
+                        "strat": "orphan", "token_id": leg_seule["token_id"],
+                        "entry_price": leg_seule["price"], "filled_shares": round(n_tp - vendu_tp, 2),
+                        "cost": round((n_tp - vendu_tp) * leg_seule["price"], 2),
+                        "start_ts": e.get("debut_ts"), "pair": None,
+                        "end_ts": e.get("fin_ts"), "opened_ts": now,
+                        "buffer": 0.0, "must_close": True,
+                    }
+                self._maker_open_record(sym, slug, "tp", combine=None,
+                                        parts=round(n_tp, 2), prix=leg_seule["price"],
+                                        vendu=round(vendu_tp, 2), sortie=round(_cur, 4))
+                mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
                 st.pop(slug, None)
                 self._save()
                 continue

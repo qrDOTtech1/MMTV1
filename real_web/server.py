@@ -1046,6 +1046,10 @@ def api_arb_quality():
         "attempts": mo_n,
         "locked": mo_ok,
         "solo": mo_issues.get("une_seule", 0),
+        # TP (Steven 07/08) : jambe seule vendue sur profit avant le cutoff,
+        # comptee a part -- ni un verrou (0 frais garanti), ni un abandon
+        # sans espoir (une_seule), une sortie volontaire sur gain.
+        "tp": mo_issues.get("tp", 0),
         "free_misses": mo_issues.get("aucun", 0) + mo_issues.get("refuse", 0),
         "fill_rate_pct": round(100 * mo_ok / mo_n, 1) if mo_n else None,
         "cost_of_misses": 0.0,
