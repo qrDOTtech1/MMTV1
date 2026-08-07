@@ -5205,9 +5205,54 @@ class MultiTrader:
             if _cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil:
                 n_tp = fills[cote_seule]
                 autre_seule = "b" if cote_seule == "a" else "a"
-                oid_autre = (e.get(autre_seule) or {}).get("order_id")
+                leg_autre = e[autre_seule]
+                oid_autre = (leg_autre or {}).get("order_id")
                 if oid_autre:
                     self._live.cancel_order(oid_autre)
+                # RE-VERIFICATION (Steven 07/08, "si on a les 2 leg pas de tp") :
+                # entre la decision de prendre le TP et l'annulation qui arrive
+                # REELLEMENT a l'echange, l'autre ordre peut se faire remplir
+                # par le marche -- on tiendrait alors un vrai verrou sans le
+                # savoir, et le vendre serait PIRE que de le garder. Meme
+                # pattern deja utilise juste au-dessus pour la branche "les
+                # deux" : on ne fait jamais confiance a un etat lu AVANT
+                # l'annulation, on relit la verite juste avant d'agir.
+                _held_autre = (
+                    self._live.position_size(leg_autre.get("token_id"))
+                    if leg_autre.get("token_id") else 0.0
+                )
+                if _held_autre and _held_autre > 0.01:
+                    self._log(
+                        f"🔒 [MAKER-OUVERT-TP-RATTRAPE] {sym} {slug} l'autre cote "
+                        f"({leg_autre['side']}) s'est rempli pendant l'annulation -> "
+                        f"on garde les 2 jambes, VERROU au lieu du TP"
+                    )
+                    n_autre = round(_held_autre, 2)
+                    for cote, n in ((cote_seule, n_tp), (autre_seule, n_autre)):
+                        leg = e[cote]
+                        mk["open"][f"{slug}|{leg['side']}"] = {
+                            "symbol": sym, "slug": slug, "side": leg["side"], "mode": "real",
+                            "strat": "bothside", "maker_open": True,
+                            "token_id": leg["token_id"], "entry_price": leg["price"],
+                            "filled_shares": round(n, 2), "cost": round(n * leg["price"], 2),
+                            "start_ts": e.get("debut_ts"), "pair": None,
+                            "end_ts": e.get("fin_ts"), "opened_ts": now, "buffer": 0.0,
+                        }
+                        self._add_slug_spent(mk, slug, round(n * leg["price"], 2))
+                    _pa_r, _pb_r = leg_seule["price"], leg_autre["price"]
+                    self._tag_pair_lock(
+                        mk["open"].get(f"{slug}|{leg_seule['side']}"),
+                        mk["open"].get(f"{slug}|{leg_autre['side']}"),
+                        _pa_r + _pb_r, tag=f" {sym} {slug} MAKER-OUVERT-TP-RATTRAPE",
+                    )
+                    self._maker_open_record(
+                        sym, slug, "les_deux", combine=round(_pa_r + _pb_r, 4),
+                        parts=round(min(n_tp, n_autre), 2), prix=_pa_r,
+                    )
+                    mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                    st.pop(slug, None)
+                    self._save()
+                    continue
                 self._log(
                     f"💰 [MAKER-OUVERT-TP] {sym} {slug} {leg_seule['side']} "
                     f"{leg_seule['price']:.3f}->{_cur:.3f} (+{100*(_cur/leg_seule['price']-1):.0f}%) "
