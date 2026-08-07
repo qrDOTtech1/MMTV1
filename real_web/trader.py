@@ -5334,6 +5334,14 @@ class MultiTrader:
                 f"⚠️ [MAKER-OUVERT] {sym} {slug} une seule jambe servie "
                 f"({leg['side']} {n:.2f} parts @ {leg['price']:.3f}) -> on solde avant la fin"
             )
+            # PRIX DE SORTIE CAPTURE POUR LE JOURNAL SEULEMENT (Steven 07/08,
+            # notification sonore gain/perte) : simple LECTURE du meilleur bid,
+            # aucun effet sur la decision -- _sell_orphan relit le sien de son
+            # cote pour l'ordre reel. Sans ca "une_seule" n'avait pas de prix
+            # de sortie enregistre, impossible de calculer un gain/perte a
+            # afficher (contrairement a "tp" qui l'a deja via "sortie").
+            _book_exit = self._live.get_book_sync(leg["token_id"])
+            _px_sortie = _book_exit["bids"][0][0] if _book_exit and _book_exit.get("bids") else None
             vendu = self._sell_orphan(
                 leg["token_id"], round(n, 2),
                 f" {sym} {slug} {leg['side']} MAKER-OUVERT-SOLO",
@@ -5350,7 +5358,8 @@ class MultiTrader:
                     "buffer": 0.0, "must_close": True,
                 }
             self._maker_open_record(sym, slug, "une_seule", combine=None,
-                                    parts=round(n, 2), prix=leg["price"], vendu=round(vendu, 2))
+                                    parts=round(n, 2), prix=leg["price"], vendu=round(vendu, 2),
+                                    sortie=(round(_px_sortie, 4) if _px_sortie is not None else None))
             mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
             st.pop(slug, None)
             self._save()

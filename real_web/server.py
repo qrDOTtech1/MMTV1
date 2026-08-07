@@ -1034,6 +1034,19 @@ def api_arb_quality():
     # place dans la file d'attente -- ne se lit que dans ce journal.
     mo = list(trader.state.get("makeropen_hist", []))
     mo.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+    # NET $ CALCULE UNE SEULE FOIS ICI (Steven 07/08, notification sonore
+    # gain/perte) : le front n'a pas a redevine la formule par type d'issue.
+    #   les_deux : verrou garanti, net = parts x (1 - combine)
+    #   tp / une_seule : vente reelle, net = vendu x (sortie - prix d'entree)
+    #   aucun / refuse : rien engage, net = 0 (verifie on-chain)
+    for r in mo:
+        issue = r.get("issue")
+        if issue == "les_deux" and r.get("combine") is not None and r.get("parts"):
+            r["net"] = round(r["parts"] * (1 - r["combine"]), 4)
+        elif issue in ("tp", "une_seule") and r.get("vendu") and r.get("sortie") is not None and r.get("prix") is not None:
+            r["net"] = round(r["vendu"] * (r["sortie"] - r["prix"]), 4)
+        else:
+            r["net"] = 0.0
     mo_issues = {}
     for r in mo:
         mo_issues[r.get("issue")] = mo_issues.get(r.get("issue"), 0) + 1
