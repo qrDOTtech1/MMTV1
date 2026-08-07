@@ -756,17 +756,45 @@ POLY_FEE_SAFETY = 0.003         # marge : mieux vaut rater un arb que le perdre
 # On retient 0.46 : descendre de 0.49 a 0.46 quadruple la marge en ne coutant
 # que 6 points de taux de service. En dessous, le taux chute plus vite.
 #
-# CE CHIFFRE EST UN MAJORANT et je le sais : une vente a 0.46 prouve que des
-# ordres a 0.46 ont ete servis, pas que ce serait le notre -- il peut y avoir
-# 40 parts devant nous dans la file. Le journal makeropen_hist mesurera le
-# taux de remplissage REEL, seule facon de trancher. Le risque est borne : une
-# pose non servie ne coute rien (verifie on-chain), et une jambe seule est
-# soldee avant la fin de fenetre.
+# CE CHIFFRE ETAIT UN MAJORANT (une vente a 0.46 prouve que des ordres a 0.46
+# ont ete servis, pas que ce serait le notre -- il peut y avoir 40 parts devant
+# nous dans la file). Le journal makeropen_hist a mesure le taux REEL sur la
+# nuit du 06/08 : 80.6% (29/36), tres proche du majorant "any" du backtest
+# (79.8%) -- validation que le modele de remplissage n'etait pas delirant.
+#
+# PRIX 0.46 -> 0.35 (Steven 06/08, apres le vrai probleme trouve cette nuit).
+# Le maker BTC a 0.46 tournait a -10.6% de ROI une fois les jambes seules
+# comptees (elles perdent -95.6% en moyenne, la vente se fait trop tard, quand
+# le prix est deja proche de zero). Deux corrections testees (couper plus tot
+# dans le temps, stop-loss sur le prix) ont ECHOUE : les deux cassent plus de
+# verrous reussis qu'elles ne sauvent de pertes -- une position qui va
+# verrouiller traverse souvent le meme creux de prix qu'une position perdante,
+# rien ne les distingue a l'avance. Ce qui MARCHE, mesure sur 519 fenetres
+# BTC : baisser le prix de pose. A prix egal la marge par verrou ET la perte
+# par echec varient dans le meme sens favorable :
+#     prix 0.46 -> ROI -8.75% (conservateur) / -3.14% (optimiste)
+#     prix 0.35 -> ROI -0.71% (conservateur) / +2.61% (optimiste)
+#     prix 0.33 -> ROI -1.22% (conservateur) / +4.35% (optimiste, le meilleur)
+# 0.35 retenu plutot que l'optimum 0.33 : marge de securite, l'ecart entre les
+# deux est mince et non significatif sur cet echantillon.
+#
+# ETH AJOUTE (meme jour). Meme mecanisme rejoue sur les fenetres ETH
+# historiques, meme sens d'amelioration en baissant le prix :
+#     ETH prix 0.46 -> ROI -14.67% (conservateur) / +0.91% (optimiste)
+#     ETH prix 0.35 -> ROI  -8.46% (conservateur) / +8.79% (optimiste)
+# ATTENTION, echantillon ETH = 65 fenetres contre 519 pour BTC (8x moins) :
+# le SENS du resultat est coherent avec BTC, la MAGNITUDE est peu fiable.
+#
+# RISQUE DE DEPLETION (a garder en tete, non corrige ici) : une simulation
+# conjointe BTC+ETH partageant un solde de 20$ montre le solde tomber sous
+# MAKER_OPEN_BUDGET_MIN (4.7$) en 2 a 4 jours dans TOUS les scenarios testes,
+# apres quoi le bot ne peut plus dimensionner une tentative normale et reste
+# bloque -- le dimensionnement proportionnel (35% de l'investissable) amplifie
+# les series, bonnes et mauvaises. Pas de fix demande sur ce point pour
+# l'instant, juste un fait mesure.
 MAKER_OPEN_ENABLED = True
-# BTC pour demarrer : de loin le plus gros flux vendeur, et la pre-ouverture
-# occupe deja DOGE de facon exclusive.
-MAKER_OPEN_SYMBOLS = ("BTC",)
-MAKER_OPEN_PRICE = 0.46           # prix de pose, identique des deux cotes
+MAKER_OPEN_SYMBOLS = ("BTC", "ETH")
+MAKER_OPEN_PRICE = 0.35           # prix de pose, identique des deux cotes
 MAKER_OPEN_MAX_COMBINED = 0.94    # garde-fou : au-dela on ne pose pas
 MAKER_OPEN_MIN_REMAIN_S = 120     # sous 2 min restantes, trop tard pour etre servi
 MAKER_OPEN_CANCEL_BEFORE_S = 45   # a T-45s : on annule et on solde une jambe seule
