@@ -1126,6 +1126,28 @@ def api_msf_tp_toggle():
     return jsonify({"ok": True, "msf_tp_enabled": on})
 
 
+@app.route("/api/export-snapshots")
+def api_export_snapshots():
+    """Export JSONL a la demande (Steven 08/08, "separer le monde prod
+    Railway/Postgres du monde recherche local pandas/polars/Jupyter") :
+    dump brut d'un historique pour analyse hors-ligne, sans jamais toucher
+    au serveur d'execution. Le disque Railway n'est pas garanti persistant
+    entre 2 deploiements -- cet endpoint (qui lit depuis trader.state, donc
+    Postgres) est la voie fiable pour recuperer cette donnee avant qu'un
+    redeploiement ne purge quoi que ce soit d'ephemere.
+    ?kind=book_snapshots (defaut, features pour le futur gatekeeper ML) ou
+    ?kind=slippage (base de slippage multi-dimensionnelle)."""
+    kind = request.args.get("kind", "book_snapshots")
+    key = {"book_snapshots": "book_snapshot_history", "slippage": "slippage_history"}.get(kind)
+    if key is None:
+        return jsonify({"ok": False, "error": "kind invalide (book_snapshots ou slippage)"}), 400
+    hist = trader.state.get(key, [])
+    lines = "\n".join(json.dumps(r) for r in hist)
+    resp = Response(lines + ("\n" if lines else ""), mimetype="application/x-ndjson")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{kind}.jsonl"'
+    return resp
+
+
 @app.route("/api/slippage-db")
 def api_slippage_db():
     """Base de slippage multi-dimensionnelle (Steven 08/08) : segmente le
