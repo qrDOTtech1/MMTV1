@@ -4446,6 +4446,45 @@ class MultiTrader:
             )
             return True, base["cost"]
 
+    SLIPPAGE_HISTORY_SIZE = 2000
+
+    def _record_slippage(self, symbol, bid, requested_qty, filled_qty):
+        """Enregistre une sortie agressive (TP/cutoff/unwind) pour la base de
+        slippage multi-dimensionnelle (Steven 08/08). Une entree par vente,
+        avec assez de dimensions pour trancher plus tard "a quelle heure/quel
+        niveau de volatilite le coussin de sortie coute le plus cher" -- ce
+        que le filtre horaire backteste plus tot manquait cruellement de
+        donnees pour faire honnetement (5 jours seulement)."""
+        if not symbol:
+            return
+        try:
+            import datetime
+            _dt = datetime.datetime.fromtimestamp(time.time(), tz=datetime.timezone.utc)
+            hour_utc = _dt.hour
+            dow = _dt.weekday()
+        except Exception:
+            hour_utc = dow = None
+        mk = self.state.get("markets", {}).get(symbol) or {}
+        danger = mk.get("danger", 0)
+        posted_price = round(max(0.01, bid - 0.02), 2)  # formule exacte de sell_position(aggressive=True)
+        fill_ratio = round(min(1.0, filled_qty / requested_qty), 3) if requested_qty > 0 else None
+        hist = self.state.setdefault("slippage_history", [])
+        hist.append({
+            "ts": round(time.time(), 1),
+            "symbol": symbol,
+            "hour_utc": hour_utc,
+            "dow": dow,
+            "danger": danger,
+            "bid": round(bid, 4),
+            "posted_price": posted_price,
+            "buffer": round(bid - posted_price, 4),
+            "requested_qty": round(requested_qty, 2),
+            "filled_qty": round(filled_qty, 2),
+            "fill_ratio": fill_ratio,
+        })
+        if len(hist) > self.SLIPPAGE_HISTORY_SIZE:
+            del hist[: len(hist) - self.SLIPPAGE_HISTORY_SIZE]
+
     def _sell_orphan(self, token_id, shares, tag="", entry_price=None, symbol=None, slug=None, side=None):
         """Revend `shares` parts au meilleur bid et VERIFIE ON-CHAIN que la vente
         est reellement passee (Steven 22/07 : plus jamais de vente supposee).
@@ -4526,6 +4565,15 @@ class MultiTrader:
         self._log(
             f"{icon} [VENTE]{tag} {sold}/{round(shares, 2)} parts vendues @ ~{bid:.3f}"
         )
+        # BASE DE SLIPPAGE MULTI-DIMENSIONNELLE (Steven 08/08) : sur une sortie
+        # AGRESSIVE (FAK sous le bid, cf. sell_position), le "cout" reel est le
+        # coussin qu'on a du concéder (bid observe - prix vraiment poste) pour
+        # garantir l'execution, plus le taux de remplissage effectif -- pas un
+        # vrai prix moyen d'execution (l'API ne le renvoie pas ici), mais une
+        # mesure honnete et reproductible du prix qu'on a du payer pour la
+        # vitesse. Segmentee par heure UTC / jour de semaine / volatilite
+        # (danger_score deja calcule ailleurs, reutilise tel quel).
+        self._record_slippage(symbol, bid, shares, sold)
         if entry_price is not None and symbol is not None and sold > 0:
             _pnl = round(sold * (bid - entry_price), 3)
             mk_rec = self.state["markets"].get(symbol)

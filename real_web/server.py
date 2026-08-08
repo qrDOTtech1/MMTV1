@@ -1126,6 +1126,76 @@ def api_msf_tp_toggle():
     return jsonify({"ok": True, "msf_tp_enabled": on})
 
 
+@app.route("/api/slippage-db")
+def api_slippage_db():
+    """Base de slippage multi-dimensionnelle (Steven 08/08) : segmente le
+    "coussin" concede sur les sorties agressives (TP/cutoff/unwind MSF) par
+    heure UTC, jour de semaine, niveau de volatilite (danger_score) et
+    symbole -- pour trancher plus tard, sur assez de donnees, les questions
+    que le filtre horaire backteste plus tot ne pouvait pas trancher
+    honnetement (echantillon de 5 jours seulement)."""
+    hist = list(trader.state.get("slippage_history", []))
+
+    def _agg(rows):
+        n = len(rows)
+        if not n:
+            return {"n": 0}
+        buffers = [r["buffer"] for r in rows if r.get("buffer") is not None]
+        fills = [r["fill_ratio"] for r in rows if r.get("fill_ratio") is not None]
+        req = sum(r.get("requested_qty") or 0 for r in rows)
+        filled = sum(r.get("filled_qty") or 0 for r in rows)
+        return {
+            "n": n,
+            "avg_buffer": round(sum(buffers) / len(buffers), 4) if buffers else None,
+            "avg_fill_ratio_pct": round(100 * sum(fills) / len(fills), 1) if fills else None,
+            "total_requested_qty": round(req, 2),
+            "total_filled_qty": round(filled, 2),
+        }
+
+    by_hour_block = {}
+    for r in hist:
+        h = r.get("hour_utc")
+        if h is None:
+            continue
+        block = f"{(h // 4) * 4:02d}-{((h // 4) * 4 + 4) % 24:02d}h"
+        by_hour_block.setdefault(block, []).append(r)
+
+    by_dow = {}
+    _DOW_LABELS = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
+    for r in hist:
+        d = r.get("dow")
+        if d is None:
+            continue
+        by_dow.setdefault(_DOW_LABELS[d], []).append(r)
+
+    def _danger_bucket(d):
+        d = d or 0
+        if d < 34:
+            return "calme (0-33)"
+        if d < 67:
+            return "modere (34-66)"
+        return "instable (67-100)"
+
+    by_danger = {}
+    for r in hist:
+        by_danger.setdefault(_danger_bucket(r.get("danger")), []).append(r)
+
+    by_symbol = {}
+    for r in hist:
+        by_symbol.setdefault(r.get("symbol") or "?", []).append(r)
+
+    return jsonify({
+        "ok": True,
+        "n_total": len(hist),
+        "overall": _agg(hist),
+        "by_hour_block": {k: _agg(v) for k, v in sorted(by_hour_block.items())},
+        "by_dow": {k: _agg(by_dow.get(k, [])) for k in _DOW_LABELS if k in by_dow},
+        "by_danger": {k: _agg(v) for k, v in by_danger.items()},
+        "by_symbol": {k: _agg(v) for k, v in by_symbol.items()},
+        "recent": hist[-100:][::-1],
+    })
+
+
 @app.route("/api/preopen/tick", methods=["POST"])
 def api_preopen_tick():
     """Regle a chaud l'amelioration du bid en pre-ouverture (Steven 06/08 :
