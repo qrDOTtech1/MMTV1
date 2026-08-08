@@ -4446,6 +4446,43 @@ class MultiTrader:
             )
             return True, base["cost"]
 
+    BOOK_SNAPSHOT_HISTORY_SIZE = 8000
+
+    def _record_book_snapshot(self, symbol, slug, side, book, entry_price, tp_seuil, hold_s, danger, triggered):
+        """Historique brut de carnet pour un futur "gatekeeper" ML (Steven
+        08/08) : QUE des features, aucune decision -- l'idee (proposee par
+        Steven) est un modele leger (regression logistique/arbre) qui
+        validerait a posteriori si les conditions actuelles ressemblent a
+        celles ou le TP a bien tenu, une fois qu'on aura assez de semaines
+        de donnees. Pas assez de volume aujourd'hui pour entrainer quoi que
+        ce soit d'honnete -- ceci ne fait QUE commencer a accumuler."""
+        try:
+            import datetime
+            _dt = datetime.datetime.fromtimestamp(time.time(), tz=datetime.timezone.utc)
+            hour_utc, dow = _dt.hour, _dt.weekday()
+        except Exception:
+            hour_utc = dow = None
+        bids = (book or {}).get("bids") or []
+        asks = (book or {}).get("asks") or []
+        bid_top = bids[0][0] if bids else None
+        ask_top = asks[0][0] if asks else None
+        bid_depth = round(sum(sz for _, sz in bids[:3]), 2) if bids else 0.0
+        ask_depth = round(sum(sz for _, sz in asks[:3]), 2) if asks else 0.0
+        _tot_depth = bid_depth + ask_depth
+        hist = self.state.setdefault("book_snapshot_history", [])
+        hist.append({
+            "ts": round(time.time(), 1), "symbol": symbol, "slug": slug, "side": side,
+            "hour_utc": hour_utc, "dow": dow, "danger": danger,
+            "entry_price": entry_price, "tp_seuil": round(tp_seuil, 4), "hold_s": round(hold_s, 1),
+            "bid_top": bid_top, "ask_top": ask_top,
+            "spread": round(ask_top - bid_top, 4) if (bid_top is not None and ask_top is not None) else None,
+            "bid_depth_top3": bid_depth, "ask_depth_top3": ask_depth,
+            "imbalance_bid_pct": round(100 * bid_depth / _tot_depth, 1) if _tot_depth > 0 else None,
+            "triggered": triggered,
+        })
+        if len(hist) > self.BOOK_SNAPSHOT_HISTORY_SIZE:
+            del hist[: len(hist) - self.BOOK_SNAPSHOT_HISTORY_SIZE]
+
     SLIPPAGE_HISTORY_SIZE = 2000
 
     def _record_slippage(self, symbol, bid, requested_qty, filled_qty):
@@ -5271,6 +5308,74 @@ class MultiTrader:
                 leg_seule["fill_ts"] = now
             _hold_s = now - leg_seule["fill_ts"]
             _tp_seuil = leg_seule["price"] * MAKER_OPEN_TP_MULT
+
+            # ── SUIVI D'UN TP PASSIF DEJA POSTE (Steven 08/08, "sortie MAKER
+            # au lieu d'agressive") : backteste sur 586 fenetres, frais de
+            # sortie inclus -- poster l'ask au lieu de vendre au marche fait
+            # passer le ROI realiste de +0.36% a +1.43% (BTC seul : +0.96% a
+            # +2.15%), parce qu'un fill MAKER ne paie AUCUN frais (~5% economises
+            # a chaque fois qu'un vrai acheteur croise notre ask, contre une
+            # sortie agressive qui paie systematiquement). Un cycle anterieur a
+            # deja poste cet ask -> on verifie juste s'il a ete rempli avant de
+            # re-evaluer quoi que ce soit d'autre.
+            if leg_seule.get("tp_passif_order_id"):
+                _qty_avant = leg_seule.get("tp_passif_qty", 0.0)
+                _n_reste = self._live.position_size(leg_seule["token_id"])
+                _n_reste = _n_reste if _n_reste is not None and _n_reste >= 0 else _qty_avant
+                if _n_reste <= 0.01 or _n_reste <= _qty_avant * 0.03:
+                    # REMPLI EN MAKER -> zero frais, exactement ce que la piste visait.
+                    _vendu_passif = round(max(0.0, _qty_avant - _n_reste), 2)
+                    _px_passif = leg_seule["tp_passif_price"]
+                    self._log(
+                        f"💚 [MAKER-OUVERT-TP-PASSIF] {sym} {slug} {leg_seule['side']} "
+                        f"rempli EN MAKER a {_px_passif:.3f} (zero frais) apres "
+                        f"{now - leg_seule.get('tp_passif_posted_ts', now):.0f}s d'attente passive"
+                    )
+                    self._maker_open_record(
+                        sym, slug, "tp", combine=None, parts=round(_qty_avant, 2),
+                        prix=leg_seule["price"], vendu=_vendu_passif, sortie=_px_passif,
+                        exec_mode="passif",
+                    )
+                    mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                    st.pop(slug, None)
+                    self._save()
+                    continue
+                if reste > MAKER_OPEN_CANCEL_BEFORE_S:
+                    # pas encore rempli, mais il reste du temps -> on laisse
+                    # l'ordre passif ouvert, aucune raison de forcer une sortie
+                    # payante tant que la fenetre n'est pas sur le point de finir.
+                    continue
+                # LA FENETRE SE TERMINE ET LE PASSIF N'A JAMAIS ETE REMPLI ->
+                # repli agressif (paie le frais, comme avant cette piste), pour
+                # ne jamais rester bloque avec une position non geree a la
+                # resolution. Correspond exactement au "cutoff_apres_tp_rate"
+                # du backtest.
+                self._live.cancel_order(leg_seule["tp_passif_order_id"])
+                _n_repli = self._live.position_size(leg_seule["token_id"])
+                _n_repli = round(_n_repli, 2) if _n_repli and _n_repli > 0.01 else 0.0
+                if _n_repli < 0.01:
+                    for _k in ("tp_passif_order_id", "tp_passif_price", "tp_passif_qty", "tp_passif_posted_ts"):
+                        leg_seule.pop(_k, None)
+                    continue
+                self._log(
+                    f"⏰ [MAKER-OUVERT-TP-PASSIF-REPLI] {sym} {slug} {leg_seule['side']} "
+                    f"jamais rempli en maker, fin de fenetre proche -> sortie agressive forcee"
+                )
+                _vendu_repli = self._sell_orphan(
+                    leg_seule["token_id"], _n_repli,
+                    f" {sym} {slug} {leg_seule['side']} MAKER-OUVERT-TP-PASSIF-REPLI",
+                    entry_price=leg_seule["price"], symbol=sym, slug=slug, side=leg_seule["side"],
+                )
+                self._maker_open_record(
+                    sym, slug, "tp", combine=None, parts=_n_repli, prix=leg_seule["price"],
+                    vendu=round(_vendu_repli, 2), sortie=leg_seule.get("tp_passif_price"),
+                    exec_mode="agressif_repli",
+                )
+                mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                st.pop(slug, None)
+                self._save()
+                continue
+
             # INTERRUPTEUR TP (Steven 07/08, MSF) : reglable a chaud depuis le
             # dashboard, sans redeploiement. OFF -> saute directement au
             # comportement d'avant le TP (attente jusqu'au cutoff habituel,
@@ -5294,6 +5399,20 @@ class MultiTrader:
                 # prochain, ou finit par le chemin cutoff habituel).
                 _book_tp = self._live.get_book_sync(leg_seule["token_id"])
                 _cur = _book_tp["bids"][0][0] if _book_tp and _book_tp.get("bids") else None
+                # LOGGING CARNET POUR FUTUR GATEKEEPER ML (Steven 08/08) : on a
+                # deja le carnet en main pour la decision TP, zero appel reseau
+                # supplementaire. Throttle a 1 snapshot/5s par jambe pour ne pas
+                # explaser l'historique -- l'objectif est d'accumuler assez de
+                # semaines de contexte reel (profondeur, imbalance, spread) pour
+                # entrainer plus tard un filtre Go/No-Go, PAS de decider quoi
+                # que ce soit aujourd'hui. Ne touche a aucune decision de trading.
+                if now - leg_seule.get("_snap_ts", 0) >= 5:
+                    leg_seule["_snap_ts"] = now
+                    self._record_book_snapshot(
+                        sym, slug, leg_seule["side"], _book_tp, leg_seule["price"],
+                        _tp_seuil, _hold_s, mk.get("danger", 0),
+                        triggered=bool(_cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil),
+                    )
             if _cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil:
                 # RELECTURE FRAICHE DE LA QUANTITE (Steven 07/08, "24 TP dont
                 # 11 rates a parts=0.0"). `fills[cote_seule]` vient d'une
@@ -5365,10 +5484,33 @@ class MultiTrader:
                     st.pop(slug, None)
                     self._save()
                     continue
+                # SORTIE PASSIVE D'ABORD (Steven 08/08) : au lieu de vendre au
+                # marche (agressif, ~5% de frais taker), on tente de poster un
+                # ASK juste au-dessus du bid observe (1 tick, pour ne jamais
+                # traverser le carnet et redevenir preneur par accident). Si un
+                # vrai acheteur croise cet ask, la vente est MAKER -> zero frais.
+                # Backteste sur 586 fenetres (offset 1 tick) : bat la sortie
+                # agressive dans les 2 modes de remplissage. Repli agressif
+                # immediat si le post lui-meme echoue (jamais de position
+                # laissee sans plan de sortie).
+                _ask_passif = round(_cur + 0.01, 2)
+                _post_passif = self._live.post_limit_sell(leg_seule["token_id"], _ask_passif, round(n_tp, 2))
+                if _post_passif.get("success") and _post_passif.get("order_id"):
+                    leg_seule["tp_passif_order_id"] = _post_passif["order_id"]
+                    leg_seule["tp_passif_price"] = _ask_passif
+                    leg_seule["tp_passif_qty"] = round(n_tp, 2)
+                    leg_seule["tp_passif_posted_ts"] = now
+                    self._log(
+                        f"📮 [MAKER-OUVERT-TP-PASSIF] {sym} {slug} {leg_seule['side']} "
+                        f"{leg_seule['price']:.3f}->{_cur:.3f} (+{100*(_cur/leg_seule['price']-1):.0f}%) "
+                        f"apres {_hold_s:.0f}s -> ask MAKER poste a {_ask_passif:.3f} "
+                        f"(zero frais si rempli), repli agressif si non rempli avant le cutoff"
+                    )
+                    self._save()
+                    continue
                 self._log(
-                    f"💰 [MAKER-OUVERT-TP] {sym} {slug} {leg_seule['side']} "
-                    f"{leg_seule['price']:.3f}->{_cur:.3f} (+{100*(_cur/leg_seule['price']-1):.0f}%) "
-                    f"apres {_hold_s:.0f}s -> on prend le profit, on abandonne l'autre cote"
+                    f"⚠️ [MAKER-OUVERT-TP-PASSIF] {sym} {slug} echec du post ask "
+                    f"({_post_passif.get('error', '?')}) -> repli immediat sur la vente agressive"
                 )
                 vendu_tp = self._sell_orphan(
                     leg_seule["token_id"], round(n_tp, 2),
@@ -5417,7 +5559,8 @@ class MultiTrader:
                     self._add_slug_spent(mk, slug, round(_held_autre_post * leg_autre["price"], 2))
                 self._maker_open_record(sym, slug, "tp", combine=None,
                                         parts=round(n_tp, 2), prix=leg_seule["price"],
-                                        vendu=round(vendu_tp, 2), sortie=round(_cur, 4))
+                                        vendu=round(vendu_tp, 2), sortie=round(_cur, 4),
+                                        exec_mode="agressif_echec_post")
                 mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
                 st.pop(slug, None)
                 self._save()
