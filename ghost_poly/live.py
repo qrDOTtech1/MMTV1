@@ -522,40 +522,42 @@ class PolyLive:
         """Ordre BID maker : GTC au prix demande (PAS agressif -> ne doit
         jamais traverser le book, sinon ce n'est plus du market making mais
         du taking). L'appelant est responsable de verifier bid < best_ask
-        avant d'appeler ceci. Retourne {success, order_id} pour permettre le
-        cancel individuel plus tard (cancel_order)."""
+        avant d'appeler ceci. Retourne {success, order_id, timing} -- timing
+        (Steven 08/08, chrono MSF) inclut le resign Rust, jusqu'ici absent
+        de ce chemin (seul post_limit_pair_no_slippage l'avait)."""
         from py_clob_client_v2 import OrderArgsV2, OrderType
 
-        c = self.client()
         args = OrderArgsV2(
             token_id=token_id, price=round(price, 2), size=round(size, 2), side="BUY"
         )
         try:
-            resp = c.post_order(c.create_order(args), OrderType.GTC)
+            resp, timing = self._signed_post_timed(token_id, args, OrderType.GTC)
             oid = resp.get("orderID") or resp.get("order_id") or resp.get("id")
             return {
                 "success": bool(oid) or resp.get("success", True) is not False,
                 "order_id": oid,
                 "raw": resp,
+                "timing": timing,
             }
         except Exception as e:
             return {"success": False, "error": str(e)[:150], "order_id": None}
 
     def post_limit_sell(self, token_id: str, price: float, size: float) -> dict:
-        """Ordre ASK maker : symmetrique de post_limit_buy, cote SELL."""
+        """Ordre ASK maker : symmetrique de post_limit_buy, cote SELL. Meme
+        chrono/resign Rust que post_limit_buy (Steven 08/08)."""
         from py_clob_client_v2 import OrderArgsV2, OrderType
 
-        c = self.client()
         args = OrderArgsV2(
             token_id=token_id, price=round(price, 2), size=round(size, 2), side="SELL"
         )
         try:
-            resp = c.post_order(c.create_order(args), OrderType.GTC)
+            resp, timing = self._signed_post_timed(token_id, args, OrderType.GTC)
             oid = resp.get("orderID") or resp.get("order_id") or resp.get("id")
             return {
                 "success": bool(oid) or resp.get("success", True) is not False,
                 "order_id": oid,
                 "raw": resp,
+                "timing": timing,
             }
         except Exception as e:
             return {"success": False, "error": str(e)[:150], "order_id": None}
@@ -595,24 +597,29 @@ class PolyLive:
         la vitesse d'execution prime sur le prix -> aggressive=True poste en
         FAK legerement SOUS le bid (garanti de prendre la liquidite dispo
         tout de suite, ou annule net), au lieu d'attendre un match qui peut
-        ne jamais venir."""
-        from py_clob_client_v2 import OrderArgsV2, OrderType
-        from py_clob_client_v2.clob_types import PartialCreateOrderOptions
+        ne jamais venir.
 
-        c = self.client()
+        TIMING + RESIGN RUST (Steven 08/08) : c'est le chemin de sortie de
+        TOUT le TP/cutoff MSF (via _sell_orphan) -- jusqu'ici zero chrono et
+        zero acceleration Rust dessus, contrairement au chemin d'entree
+        bothside qui les avait deja depuis le 04/08."""
+        from py_clob_client_v2 import OrderArgsV2, OrderType
+
         order_type = OrderType.FAK if aggressive else OrderType.GTC
         sell_price = round(max(0.01, price - 0.02), 2) if aggressive else price
         args = OrderArgsV2(token_id=token_id, price=sell_price, size=size, side="SELL")
         try:
-            resp = c.post_order(c.create_order(args), order_type)
+            resp, timing = self._signed_post_timed(token_id, args, order_type)
             if resp and resp.get("success", True) is not False:
+                resp["timing"] = timing
                 return resp
             std_err = str(resp)
         except Exception as e:
             std_err = str(e)
         try:
-            signed = c.create_order(args, PartialCreateOrderOptions(neg_risk=True))
-            return c.post_order(signed, order_type)
+            resp2, timing2 = self._signed_post_timed(token_id, args, order_type, neg_risk=True)
+            resp2["timing"] = timing2
+            return resp2
         except Exception as e:
             return {
                 "success": False,
@@ -1124,6 +1131,45 @@ class PolyLive:
             return order, r.json().get("sign_us")
         except Exception:
             return order, None  # jamais fatal -- Python a deja signe correctement
+
+    def _signed_post_timed(self, token_id: str, args, order_type, neg_risk: bool = False):
+        """Signe et poste UN ordre en chronometrant chaque etape (Steven 08/08,
+        "chronometrer chaque etape" -- jusqu'ici seul post_limit_pair_no_slippage
+        (le chemin bothside) avait ce detail ET le resign Rust ; MSF (entree ET
+        sortie TP/cutoff, via post_limit_buy/post_limit_sell/sell_position)
+        n'en beneficiait pas du tout. Meme sidecar Rust, meme fallback
+        silencieux (voir _resign_via_rust) -- rien de nouveau architecturalement,
+        juste applique la ou ca manquait."""
+        from py_clob_client_v2.clob_types import PartialCreateOrderOptions
+        from py_clob_client_v2.config import get_contract_config
+
+        c = self.client()
+        _t1 = time.time()
+        signed = (
+            c.create_order(args, PartialCreateOrderOptions(neg_risk=True))
+            if neg_risk
+            else c.create_order(args)
+        )
+        _t2 = time.time()
+        _rust_us = None
+        try:
+            _cfg = get_contract_config(137)
+            _is_neg = neg_risk or c.get_neg_risk(token_id)
+            _exch = _cfg.neg_risk_exchange_v2 if _is_neg else _cfg.exchange_v2
+            signed, _rust_us = self._resign_via_rust(signed, _exch)
+        except Exception:
+            pass
+        _t2b = time.time()
+        resp = c.post_order(signed, order_type)
+        _t3 = time.time()
+        timing = {
+            "signature_ms": round((_t2 - _t1) * 1000),
+            "rust_resign_ms": round((_t2b - _t2) * 1000),
+            "rust_used": bool(_rust_us),
+            "post_orders_ms": round((_t3 - _t2b) * 1000),
+            "total_ms": round((_t3 - _t1) * 1000),
+        }
+        return resp, timing
 
     def post_limit_pair_no_slippage(
         self, tid1: str, price1: float, size1: float, tid2: str, price2: float, size2: float

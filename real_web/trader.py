@@ -4488,7 +4488,29 @@ class MultiTrader:
             # plusieurs fois a 0/N vendues apres le delai de verif complet.
             # _sell_orphan sert TOUJOURS a sortir vite (unwind, stop-loss,
             # fin de fenetre) -> la vitesse prime sur le prix ici.
-            self._live.sell_position(token_id, round(bid, 2), round(shares, 2), aggressive=True)
+            _chrono_sell_t0 = time.time()
+            _sell_resp = self._live.sell_position(token_id, round(bid, 2), round(shares, 2), aggressive=True)
+            _chrono_sell_ms = round((time.time() - _chrono_sell_t0) * 1000)
+            # CHRONO SORTIE (Steven 08/08) : c'est le chemin TP/cutoff/unwind
+            # MSF -- jusqu'ici zero mesure, contrairement a l'entree bothside.
+            _tim_sell = (_sell_resp or {}).get("timing") or {}
+            self._log(
+                f"⏱️ [CHRONO-MSF-SORTIE]{tag} total={_chrono_sell_ms}ms "
+                f"sig={_tim_sell.get('signature_ms','?')}ms "
+                f"rust={_tim_sell.get('rust_resign_ms','?')}ms"
+                f"[{'RUST' if _tim_sell.get('rust_used') else 'py'}] "
+                f"post={_tim_sell.get('post_orders_ms','?')}ms"
+            )
+            self.state.setdefault("latency_history", []).append({
+                "ts": _chrono_sell_t0, "symbol": symbol, "strategy": "sell_orphan",
+                "signature_ms": _tim_sell.get("signature_ms"),
+                "rust_resign_ms": _tim_sell.get("rust_resign_ms"),
+                "rust_used": _tim_sell.get("rust_used", False),
+                "post_orders_ms": _tim_sell.get("post_orders_ms"),
+                "total_ms": _tim_sell.get("total_ms"),
+            })
+            if len(self.state["latency_history"]) > 1000:
+                del self.state["latency_history"][: len(self.state["latency_history"]) - 1000]
         # VERIFICATION on-chain du fill (jusqu'a 4s) — une vente postee n'est PAS
         # une vente executee.
         sold = 0.0
@@ -5522,12 +5544,48 @@ class MultiTrader:
             f"({parts} parts, {besoin:.2f}$) -> +{(1 - comb) * 100:.1f}% si les 2 sont servis"
         )
         pose = {}
+        # POSE EN PARALLELE (Steven 08/08, "HTTP/2 = multiplexing, plusieurs
+        # requetes sur la meme connexion sans attendre la reponse de la
+        # precedente") : les 2 jambes etaient postees en SERIE ici (contrairement
+        # au chemin bothside qui les parallelise deja depuis le 04/08) -- rien
+        # n'empechait la jambe B d'attendre bêtement la reponse HTTP de la
+        # jambe A avant meme de commencer a se signer. Meme technique
+        # (ThreadPoolExecutor) que post_limit_pair_no_slippage.
+        from concurrent.futures import ThreadPoolExecutor
+
+        _chrono_t0 = time.time()
+        with ThreadPoolExecutor(max_workers=2) as _ex_msf:
+            _futs_msf = {
+                i: _ex_msf.submit(self._live.post_limit_buy, tid, prix[i], parts)
+                for i, (side, tid) in enumerate(zip(outcomes, token_ids))
+            }
+            _results_msf = {i: f.result() for i, f in _futs_msf.items()}
+        _chrono_t1 = time.time()
+        _chrono_total_ms = round((_chrono_t1 - _chrono_t0) * 1000)
+        _tim_parts = []
         for i, (side, tid) in enumerate(zip(outcomes, token_ids)):
-            r = self._live.post_limit_buy(tid, prix[i], parts)
+            r = _results_msf[i]
             pose["a" if i == 0 else "b"] = {
                 "side": side, "token_id": tid, "price": prix[i],
                 "order_id": r.get("order_id"), "ok": bool(r.get("success")),
             }
+            _tim = r.get("timing") or {}
+            _tim_parts.append(
+                f"{side}:sig={_tim.get('signature_ms','?')}ms "
+                f"rust={_tim.get('rust_resign_ms','?')}ms[{'RUST' if _tim.get('rust_used') else 'py'}] "
+                f"post={_tim.get('post_orders_ms','?')}ms"
+            )
+            # HISTORIQUE STRUCTURE (meme table que /api/latency, une entree par
+            # jambe pour rester dans le schema plat deja lu par les percentiles
+            # p50/p95/p99 existants -- MSF vient enfin alimenter ces stats aussi).
+            self.state.setdefault("latency_history", []).append({
+                "ts": _chrono_t0, "symbol": sym, "strategy": "msf_entry",
+                "signature_ms": _tim.get("signature_ms"),
+                "rust_resign_ms": _tim.get("rust_resign_ms"),
+                "rust_used": _tim.get("rust_used", False),
+                "post_orders_ms": _tim.get("post_orders_ms"),
+                "total_ms": _tim.get("total_ms"),
+            })
             if not r.get("success"):
                 _err = str(r.get("error") or "")
                 _cause = _err.split("error_message=")[-1] if "error_message=" in _err else _err
@@ -5535,6 +5593,12 @@ class MultiTrader:
                     f"⚠️ [MAKER-OUVERT] {sym} {slug} {side} @ {prix[i]:.3f} x{parts} "
                     f"refuse : {_cause[:300]}"
                 )
+        if len(self.state["latency_history"]) > 1000:
+            del self.state["latency_history"][: len(self.state["latency_history"]) - 1000]
+        self._log(
+            f"⏱️ [CHRONO-MSF] {sym} {slug} pose_parallele={_chrono_total_ms}ms "
+            f"({' | '.join(_tim_parts)})"
+        )
         if not all(v.get("ok") for v in pose.values()):
             for v in pose.values():
                 if v.get("order_id"):
