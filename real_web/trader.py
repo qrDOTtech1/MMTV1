@@ -5217,7 +5217,27 @@ class MultiTrader:
             _book_tp = self._live.get_book_sync(leg_seule["token_id"])
             _cur = _book_tp["bids"][0][0] if _book_tp and _book_tp.get("bids") else None
             if _cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil:
-                n_tp = fills[cote_seule]
+                # RELECTURE FRAICHE DE LA QUANTITE (Steven 07/08, "24 TP dont
+                # 11 rates a parts=0.0"). `fills[cote_seule]` vient d'une
+                # lecture faite PLUS TOT dans ce meme cycle -- position_size()
+                # renvoie parfois 0 de facon transitoire (retard cote
+                # Polymarket), et le code faisait confiance a ce zero perime :
+                # _sell_orphan(token, 0, ...) retourne 0 SANS RIEN LOGUER (son
+                # garde `if shares < 0.01: return 0.0` est muet), donc le TP
+                # "se declenchait" au bon prix (sortie correcte dans le
+                # journal) mais ne vendait jamais rien, sans la moindre trace.
+                # On relit ici, juste avant d'agir, et si c'est ENCORE 0 on
+                # abandonne ce cycle plutot que d'enregistrer un TP fantome --
+                # la position reste suivie, on retente au prochain cycle.
+                n_tp = self._live.position_size(leg_seule["token_id"])
+                n_tp = round(n_tp, 2) if n_tp and n_tp > 0.01 else 0.0
+                if n_tp < 0.01:
+                    self._tlog(
+                        f"makeropen_tp_zero_{sym}",
+                        f"⚠️ [MAKER-OUVERT-TP] {sym} {slug} prix TP atteint mais "
+                        f"position_size() renvoie 0 la -> on retente au prochain cycle",
+                    )
+                    continue
                 autre_seule = "b" if cote_seule == "a" else "a"
                 leg_autre = e[autre_seule]
                 oid_autre = (leg_autre or {}).get("order_id")
@@ -5288,6 +5308,35 @@ class MultiTrader:
                         "end_ts": e.get("fin_ts"), "opened_ts": now,
                         "buffer": 0.0, "must_close": True,
                     }
+                # RESIDU DE COURSE (Steven 07/08, "8.97 parts Down oubliees,
+                # perte de 3.14$ invisible"). Meme apres la re-verification
+                # d'avant-vente, l'autre ordre peut encore se remplir dans le
+                # court instant ou _sell_orphan poste et confirme LA NOTRE --
+                # course impossible a fermer a 100% sans garantie atomique de
+                # l'echange. Une DERNIERE lecture ici ne l'empeche pas, mais
+                # evite qu'elle reste invisible : si l'autre cote montre un
+                # remplissage, on la trackee comme orpheline (geree par les
+                # mecanismes de sortie existants) au lieu de l'abandonner.
+                _held_autre_post = (
+                    self._live.position_size(leg_autre.get("token_id"))
+                    if leg_autre.get("token_id") else 0.0
+                )
+                if _held_autre_post and _held_autre_post > 0.01:
+                    self._log(
+                        f"🦺 [MAKER-OUVERT-TP-RESIDU] {sym} {slug} {leg_autre['side']} "
+                        f"{_held_autre_post:.2f} parts remplies pendant la vente TP -> "
+                        f"trackee comme orpheline (n'etait suivie nulle part avant ce fix)"
+                    )
+                    mk["open"][f"{slug}|{leg_autre['side']}"] = {
+                        "symbol": sym, "slug": slug, "side": leg_autre["side"], "mode": "real",
+                        "strat": "orphan", "token_id": leg_autre["token_id"],
+                        "entry_price": leg_autre["price"], "filled_shares": round(_held_autre_post, 2),
+                        "cost": round(_held_autre_post * leg_autre["price"], 2),
+                        "start_ts": e.get("debut_ts"), "pair": None,
+                        "end_ts": e.get("fin_ts"), "opened_ts": now,
+                        "buffer": 0.0, "must_close": True,
+                    }
+                    self._add_slug_spent(mk, slug, round(_held_autre_post * leg_autre["price"], 2))
                 self._maker_open_record(sym, slug, "tp", combine=None,
                                         parts=round(n_tp, 2), prix=leg_seule["price"],
                                         vendu=round(vendu_tp, 2), sortie=round(_cur, 4))
@@ -5329,7 +5378,23 @@ class MultiTrader:
             # mesure sur 51 cas sur 51.
             cote = "a" if fa > 0.01 else "b"
             leg = e[cote]
-            n = fills[cote]
+            # RELECTURE FRAICHE (meme raison que la branche TP juste au-dessus) :
+            # fills[cote] vient d'une lecture plus tot dans ce cycle, et
+            # position_size() peut renvoyer 0 de facon transitoire. Ici les
+            # 2 ordres viennent d'etre annules (bloc juste au-dessus) : si la
+            # relecture est 0, la position est probablement bien la, on
+            # retente au prochain cycle plutot que d'enregistrer une vente
+            # fantome.
+            n = self._live.position_size(leg["token_id"])
+            n = round(n, 2) if n and n > 0.01 else 0.0
+            if n < 0.01:
+                self._tlog(
+                    f"makeropen_solo_zero_{sym}",
+                    f"⚠️ [MAKER-OUVERT] {sym} {slug} position_size() renvoie 0 "
+                    f"la -> on retente au prochain cycle",
+                )
+                continue
+            leg_autre_cutoff = e["b" if cote == "a" else "a"]
             self._log(
                 f"⚠️ [MAKER-OUVERT] {sym} {slug} une seule jambe servie "
                 f"({leg['side']} {n:.2f} parts @ {leg['price']:.3f}) -> on solde avant la fin"
@@ -5357,6 +5422,32 @@ class MultiTrader:
                     "end_ts": e.get("fin_ts"), "opened_ts": now,
                     "buffer": 0.0, "must_close": True,
                 }
+            # RESIDU DE COURSE, meme raison que la branche TP : l'ordre qu'on
+            # vient d'annuler peut s'etre rempli entre l'annulation et la
+            # confirmation de notre propre vente. Sans ce filet, cette jambe
+            # serait invisible -- exactement ce qui est arrive sur
+            # btc-updown-5m-1786133100 (8.97 parts Down, 3.14$ perdus sans
+            # trace).
+            _held_autre_cutoff = (
+                self._live.position_size(leg_autre_cutoff.get("token_id"))
+                if leg_autre_cutoff.get("token_id") else 0.0
+            )
+            if _held_autre_cutoff and _held_autre_cutoff > 0.01:
+                self._log(
+                    f"🦺 [MAKER-OUVERT-RESIDU] {sym} {slug} {leg_autre_cutoff['side']} "
+                    f"{_held_autre_cutoff:.2f} parts remplies pendant la vente -> "
+                    f"trackee comme orpheline"
+                )
+                mk["open"][f"{slug}|{leg_autre_cutoff['side']}"] = {
+                    "symbol": sym, "slug": slug, "side": leg_autre_cutoff["side"], "mode": "real",
+                    "strat": "orphan", "token_id": leg_autre_cutoff["token_id"],
+                    "entry_price": leg_autre_cutoff["price"], "filled_shares": round(_held_autre_cutoff, 2),
+                    "cost": round(_held_autre_cutoff * leg_autre_cutoff["price"], 2),
+                    "start_ts": e.get("debut_ts"), "pair": None,
+                    "end_ts": e.get("fin_ts"), "opened_ts": now,
+                    "buffer": 0.0, "must_close": True,
+                }
+                self._add_slug_spent(mk, slug, round(_held_autre_cutoff * leg_autre_cutoff["price"], 2))
             self._maker_open_record(sym, slug, "une_seule", combine=None,
                                     parts=round(n, 2), prix=leg["price"], vendu=round(vendu, 2),
                                     sortie=(round(_px_sortie, 4) if _px_sortie is not None else None))
