@@ -1052,10 +1052,24 @@ def api_arb_quality():
         mo_issues[r.get("issue")] = mo_issues.get(r.get("issue"), 0) + 1
     mo_n = len(mo)
     mo_ok = mo_issues.get("les_deux", 0)
+    # AGREGATS $ (Steven 07/08, onglet MSF dedie) : calcules sur TOUT
+    # l'historique conserve en memoire (jusqu'a 400 entrees, cf.
+    # _maker_open_record), pas seulement les 60 exposees dans "recent" --
+    # le total doit rester juste meme quand le journal deborde la vue.
+    mo_tp = [r for r in mo if r.get("issue") == "tp"]
+    mo_tp_ok = [r for r in mo_tp if (r.get("vendu") or 0) > 0]
+    mo_tp_rate = [r for r in mo_tp if (r.get("vendu") or 0) == 0 and (r.get("parts") or 0) == 0]
+    mo_solo = [r for r in mo if r.get("issue") == "une_seule"]
+    mo_lock = [r for r in mo if r.get("issue") == "les_deux"]
     preopen["maker_open"] = {
         "enabled": bool(getattr(trader_mod, "MAKER_OPEN_ENABLED", False)),
+        # INTERRUPTEUR TP (Steven 07/08, MSF) : reglable a chaud, voir
+        # /api/msf/tp-toggle. Defaut True si jamais bascule.
+        "msf_tp_enabled": bool(trader.state.get("msf_tp_enabled", True)),
         "symbols": list(getattr(trader_mod, "MAKER_OPEN_SYMBOLS", ())),
         "prix": float(getattr(trader_mod, "MAKER_OPEN_PRICE", 0.46)),
+        "tp_mult": float(getattr(trader_mod, "MAKER_OPEN_TP_MULT", 1.8)),
+        "tp_min_hold_s": float(getattr(trader_mod, "MAKER_OPEN_TP_MIN_HOLD_S", 15)),
         "attempts": mo_n,
         "locked": mo_ok,
         "solo": mo_issues.get("une_seule", 0),
@@ -1063,9 +1077,15 @@ def api_arb_quality():
         # comptee a part -- ni un verrou (0 frais garanti), ni un abandon
         # sans espoir (une_seule), une sortie volontaire sur gain.
         "tp": mo_issues.get("tp", 0),
+        "tp_reussis": len(mo_tp_ok),
+        "tp_rates": len(mo_tp_rate),
         "free_misses": mo_issues.get("aucun", 0) + mo_issues.get("refuse", 0),
         "fill_rate_pct": round(100 * mo_ok / mo_n, 1) if mo_n else None,
         "cost_of_misses": 0.0,
+        "net_total": round(sum(r.get("net") or 0 for r in mo), 2),
+        "net_locked": round(sum(r.get("net") or 0 for r in mo_lock), 2),
+        "net_tp": round(sum(r.get("net") or 0 for r in mo_tp), 2),
+        "net_solo": round(sum(r.get("net") or 0 for r in mo_solo), 2),
         "recent": mo[:60],
     }
 
@@ -1089,6 +1109,21 @@ def api_arb_quality():
             },
         }
     )
+
+
+@app.route("/api/msf/tp-toggle", methods=["POST"])
+def api_msf_tp_toggle():
+    """Interrupteur du TP sur MSF (Maker Sur Fenetre -- Steven 07/08),
+    reglable a chaud depuis le dashboard, sans redeploiement. OFF : la jambe
+    seule attend jusqu'au cutoff habituel (T-45s) comme avant l'existence du
+    TP, sans jamais lire le carnet ni tenter de vendre en cours de route."""
+    try:
+        on = bool((request.get_json(silent=True) or {}).get("on"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "parametre 'on' invalide"}), 400
+    trader.state["msf_tp_enabled"] = on
+    trader._save()
+    return jsonify({"ok": True, "msf_tp_enabled": on})
 
 
 @app.route("/api/preopen/tick", methods=["POST"])

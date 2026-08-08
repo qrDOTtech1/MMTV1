@@ -5201,21 +5201,29 @@ class MultiTrader:
                 leg_seule["fill_ts"] = now
             _hold_s = now - leg_seule["fill_ts"]
             _tp_seuil = leg_seule["price"] * MAKER_OPEN_TP_MULT
-            # PRIX DE DECLENCHEMENT = VRAI BID, PAS _live_price (Steven 07/08).
-            # Incident reel : _live_price se rabat sur le prix de l'ASK SEUL
-            # des que le carnet BID est vide -- un prix auquel personne ne veut
-            # nous acheter. Le TP se declenchait alors sur un prix fantome,
-            # annulait l'autre jambe pour rien, puis echouait a vendre
-            # ("pas de bid, carnet vide", ~27% des tentatives de vente vues en
-            # reel). Backteste sur 519+65 fenetres : ce bug fait chuter le gain
-            # du TP de 78% en scenario conservateur (12.04$/j -> 2.68$/j) ; se
-            # limiter au vrai bid recupere l'essentiel (6.81$/j).
-            # On lit donc le carnet DIRECTEMENT et on n'accepte que le
-            # meilleur BID reel -- si le carnet bid est vide, _cur est None et
-            # le TP ne se declenche simplement pas ce cycle (retente au
-            # prochain, ou finit par le chemin cutoff habituel).
-            _book_tp = self._live.get_book_sync(leg_seule["token_id"])
-            _cur = _book_tp["bids"][0][0] if _book_tp and _book_tp.get("bids") else None
+            # INTERRUPTEUR TP (Steven 07/08, MSF) : reglable a chaud depuis le
+            # dashboard, sans redeploiement. OFF -> saute directement au
+            # comportement d'avant le TP (attente jusqu'au cutoff habituel,
+            # plus bas dans cette meme fonction) -- ni lecture de carnet, ni
+            # decision de vente ici.
+            _msf_tp_on = self.state.get("msf_tp_enabled", True)
+            _cur = None
+            if _msf_tp_on:
+                # PRIX DE DECLENCHEMENT = VRAI BID, PAS _live_price (Steven 07/08).
+                # Incident reel : _live_price se rabat sur le prix de l'ASK SEUL
+                # des que le carnet BID est vide -- un prix auquel personne ne veut
+                # nous acheter. Le TP se declenchait alors sur un prix fantome,
+                # annulait l'autre jambe pour rien, puis echouait a vendre
+                # ("pas de bid, carnet vide", ~27% des tentatives de vente vues en
+                # reel). Backteste sur 519+65 fenetres : ce bug fait chuter le gain
+                # du TP de 78% en scenario conservateur (12.04$/j -> 2.68$/j) ; se
+                # limiter au vrai bid recupere l'essentiel (6.81$/j).
+                # On lit donc le carnet DIRECTEMENT et on n'accepte que le
+                # meilleur BID reel -- si le carnet bid est vide, _cur est None et
+                # le TP ne se declenche simplement pas ce cycle (retente au
+                # prochain, ou finit par le chemin cutoff habituel).
+                _book_tp = self._live.get_book_sync(leg_seule["token_id"])
+                _cur = _book_tp["bids"][0][0] if _book_tp and _book_tp.get("bids") else None
             if _cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil:
                 # RELECTURE FRAICHE DE LA QUANTITE (Steven 07/08, "24 TP dont
                 # 11 rates a parts=0.0"). `fills[cote_seule]` vient d'une
