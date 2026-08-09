@@ -858,6 +858,26 @@ MAKER_OPEN_TOTAL_FRAC = 0.35      # TOTAL des 2 jambes, en part de l'investissab
 MAKER_OPEN_BUDGET_MIN = 4.7
 MAKER_OPEN_BUDGET_MAX = 40.0
 
+# ── MODE CALME MSF (Steven 09/08, "miser sur le perdant ca marchait quand ca
+# croisait, mais quand c'est calme il faut faire l'inverse") ────────────────
+# Le mode CROISEMENT (danger haut) mise sur le perdant a 0.35 : marche qui
+# retombe vite -> TP x1.8. En mode CALME (danger bas), le marche prend une
+# direction SANS croiser : le perdant ne revient JAMAIS et on finit avec la
+# seule jambe perdante (le commentaire MAKER_OPEN_ADAPT_FLOOR le decrit deja).
+# L'inverse : poser des ordres a CALM_MSF_PRICE (0.65, le prix du GAGNANT) des
+# 2 cotes, accepter une couverture jusqu'a CALM_MSF_MAX_COMBINED (1.05, ce
+# n'est plus un arb verrouille mais une paire directionnelle), et COUPER la
+# jambe qui decroche (CALM_MSF_SL_PRICE) au lieu d'attendre le cutoff. Toggle
+# ACTIVE PAR DEFAUT au push (Steven 09/08, "le msf calm mode doit etre active
+# au push sur git") + auto-stop apres 20 trades si ROI < 0.
+CALM_MSF_ENABLED = True
+CALM_MSF_DANGER_MAX = 30           # danger_score < ce seuil -> mode calme
+CALM_MSF_PRICE = 0.65              # prix de pose en mode calme, PLAFOND (le gagnant)
+CALM_MSF_ADAPT_FLOOR = 0.35        # plancher adaptatif : jamais plus bas, sinon on rachete le perdant bradé
+CALM_MSF_MAX_COMBINED = 1.05       # couverture 2 jambes acceptee (pas un arb)
+CALM_MSF_SL_PRICE = 0.40           # coupe la jambe seule quand son bid passe sous ce prix
+CALM_MSF_AUTOSTOP_N = 20           # apres 20 trades calme, on coupe le mode si ROI < 0
+
 PAIR_MAX_IMBALANCE = 1.05
 PAIR_COMPLETION_MAX_COMBINED = 0.95
 # ── ZONE DE COUVERTURE TOLEREE (Steven 05/08, decision explicite) ──────
@@ -5303,6 +5323,7 @@ class MultiTrader:
                     f"🎉 [MAKER-OUVERT] {sym} {slug} LES DEUX JAMBES SERVIES "
                     f"{pa:.3f}+{pb:.3f}={pa + pb:.3f} ({fa:.2f}/{fb:.2f} parts) "
                     f"-- apporteur, ZERO frais"
+                    + (" (mode CALME : couverture, pas un arb)" if e.get("calm") else "")
                 )
                 # _tag_pair_lock solde tout excedent de parts (cf. la-bas)
                 self._tag_pair_lock(
@@ -5311,7 +5332,8 @@ class MultiTrader:
                     pa + pb, tag=f" {sym} {slug} MAKER-OUVERT",
                 )
                 self._maker_open_record(sym, slug, "les_deux", combine=round(pa + pb, 4),
-                                        parts=round(min(fa, fb), 2), prix=pa)
+                                        parts=round(min(fa, fb), 2), prix=pa,
+                                        calm=e.get("calm", False))
                 st.pop(slug, None)
                 self._save()
                 continue
@@ -5355,7 +5377,7 @@ class MultiTrader:
                     self._maker_open_record(
                         sym, slug, "tp", combine=None, parts=round(_qty_avant, 2),
                         prix=leg_seule["price"], vendu=_vendu_passif, sortie=_px_passif,
-                        exec_mode="passif",
+                        exec_mode="passif", calm=e.get("calm", False),
                     )
                     mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
                     st.pop(slug, None)
@@ -5390,7 +5412,7 @@ class MultiTrader:
                 self._maker_open_record(
                     sym, slug, "tp", combine=None, parts=_n_repli, prix=leg_seule["price"],
                     vendu=round(_vendu_repli, 2), sortie=leg_seule.get("tp_passif_price"),
-                    exec_mode="agressif_repli",
+                    exec_mode="agressif_repli", calm=e.get("calm", False),
                 )
                 mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
                 st.pop(slug, None)
@@ -5581,11 +5603,67 @@ class MultiTrader:
                 self._maker_open_record(sym, slug, "tp", combine=None,
                                         parts=round(n_tp, 2), prix=leg_seule["price"],
                                         vendu=round(vendu_tp, 2), sortie=round(_cur, 4),
-                                        exec_mode="agressif_echec_post")
+                                        exec_mode="agressif_echec_post",
+                                        calm=e.get("calm", False))
                 mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
                 st.pop(slug, None)
                 self._save()
                 continue
+
+            # ── SL MODE CALME (Steven 09/08, "gestion sl/tp" + "l'inverse") ──
+            # En mode CROISEMENT on garde la jambe seule jusqu'au cutoff (elle
+            # peut retomber sur le TP x1.8). En mode CALME on a pose a
+            # CALM_MSF_PRICE pour attraper le GAGNANT : si la jambe tenue PERD
+            # au lieu de gagner, on coupe des que le bid passe sous le seuil,
+            # au lieu d'attendre passivement T-45s (c'est LE fix du "on finit
+            # avec la seule jambe perdante"). L'autre ordre est annule : on ne
+            # laisse jamais un ordre non-suivi en vie apres avoir encaisse la
+            # perte.
+            if e.get("calm"):
+                _book_sl = self._live.get_book_sync(leg_seule["token_id"])
+                _bid_sl = _book_sl["bids"][0][0] if _book_sl and _book_sl.get("bids") else None
+                if _bid_sl is not None and _bid_sl <= CALM_MSF_SL_PRICE:
+                    _n_sl = self._live.position_size(leg_seule["token_id"])
+                    _n_sl = round(_n_sl, 2) if _n_sl and _n_sl > 0.01 else 0.0
+                    if _n_sl >= 0.01:
+                        self._log(
+                            f"🛑 [MAKER-OUVERT-CALM-SL] {sym} {slug} {leg_seule['side']} "
+                            f"entree {leg_seule['price']:.3f} -> bid {_bid_sl:.3f} "
+                            f"(seuil {CALM_MSF_SL_PRICE:.2f}, mode CALME) -> on coupe, "
+                            f"plus d'attente jusqu'au cutoff"
+                        )
+                        _vendu_sl = self._sell_orphan(
+                            leg_seule["token_id"], round(_n_sl, 2),
+                            f" {sym} {slug} {leg_seule['side']} MAKER-OUVERT-CALM-SL",
+                            entry_price=leg_seule["price"], symbol=sym, slug=slug,
+                            side=leg_seule["side"],
+                        )
+                        if _vendu_sl < _n_sl - 0.01:
+                            mk["open"][f"{slug}|{leg_seule['side']}"] = {
+                                "symbol": sym, "slug": slug, "side": leg_seule["side"],
+                                "mode": "real", "strat": "orphan",
+                                "token_id": leg_seule["token_id"],
+                                "entry_price": leg_seule["price"],
+                                "filled_shares": round(_n_sl - _vendu_sl, 2),
+                                "cost": round((_n_sl - _vendu_sl) * leg_seule["price"], 2),
+                                "start_ts": e.get("debut_ts"), "pair": None,
+                                "end_ts": e.get("fin_ts"), "opened_ts": now,
+                                "buffer": 0.0, "must_close": True,
+                            }
+                        _leg_autre_sl = e["b" if cote_seule == "a" else "a"]
+                        _oid_autre_sl = (_leg_autre_sl or {}).get("order_id")
+                        if _oid_autre_sl:
+                            self._live.cancel_order(_oid_autre_sl)
+                        self._maker_open_record(
+                            sym, slug, "calm_sl", combine=None,
+                            parts=round(_n_sl, 2), prix=leg_seule["price"],
+                            vendu=round(_vendu_sl, 2), sortie=round(_bid_sl, 4),
+                            exec_mode="calme", calm=True,
+                        )
+                        mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                        st.pop(slug, None)
+                        self._save()
+                        continue
 
             # tant qu'il reste du temps, on laisse courir : la 2e jambe peut
             # arriver bien plus tard dans la fenetre, le verrou n'exige pas la
@@ -5692,7 +5770,8 @@ class MultiTrader:
                 self._add_slug_spent(mk, slug, round(_held_autre_cutoff * leg_autre_cutoff["price"], 2))
             self._maker_open_record(sym, slug, "une_seule", combine=None,
                                     parts=round(n, 2), prix=leg["price"], vendu=round(vendu, 2),
-                                    sortie=(round(_px_sortie, 4) if _px_sortie is not None else None))
+                                    sortie=(round(_px_sortie, 4) if _px_sortie is not None else None),
+                                    calm=e.get("calm", False))
             mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
             st.pop(slug, None)
             self._save()
@@ -5715,6 +5794,40 @@ class MultiTrader:
             return
         outcomes, token_ids = meta
 
+        # ── MODE CALME vs CROISEMENT (Steven 09/08) ──
+        # danger_score bas (< CALM_MSF_DANGER_MAX) = marche calme qui prend une
+        # direction sans croiser -> on fait l'INVERSE de d'habitude : on pose
+        # a CALM_MSF_PRICE (0.65, le prix du gagnant) au lieu de 0.35 (le prix
+        # du perdant), combined autorise jusqu'a 1.05 (couverture directionnelle,
+        # pas un arb), et la gestion coupe la jambe qui decroche. Mode
+        # CROISEMENT : comportement historique exactement inchange.
+        from core.btc_updown import danger_score as _danger_score_mo
+        from core.btc_updown import _strike_at as _strike_at_mo
+
+        _pair_mo = f"{sym.upper()}USDT"
+        _strike_mo = _strike_at_mo(_pair_mo, debut, slug=slug)
+        _d_mo = _danger_score_mo(_pair_mo, _strike_mo) if _strike_mo is not None else 0
+        _calm_mo = bool(
+            CALM_MSF_ENABLED and _strike_mo is not None and _d_mo < CALM_MSF_DANGER_MAX
+        )
+        if _calm_mo:
+            self._tlog(
+                f"makeropen_calm_{sym}",
+                f"🌊 [MAKER-OUVERT-CALME] {sym} {slug} danger={_d_mo} < "
+                f"{CALM_MSF_DANGER_MAX} -> mode CALME, pose a {CALM_MSF_PRICE:.2f} "
+                f"(l'inverse du croisement : on vise le gagnant)",
+            )
+        if self.state.get("calm_msf_stats", {}).get("disabled"):
+            _calm_mo = False
+            self._tlog(
+                f"makeropen_calm_disabled_{sym}",
+                f"⛔ [MAKER-OUVERT-CALME] {sym} {slug} auto-stop actif (ROI<0 apres "
+                f"{CALM_MSF_AUTOSTOP_N} trades) -> on reste en mode croisement",
+            )
+        _px_cap = CALM_MSF_PRICE if _calm_mo else MAKER_OPEN_PRICE
+        _px_floor = CALM_MSF_ADAPT_FLOOR if _calm_mo else MAKER_OPEN_ADAPT_FLOOR
+        _comb_max = CALM_MSF_MAX_COMBINED if _calm_mo else MAKER_OPEN_MAX_COMBINED
+
         prix = []
         for tid in token_ids:
             b = self._live.get_book_sync(tid)
@@ -5724,13 +5837,13 @@ class MultiTrader:
             # JAMAIS AU-DESSUS DE L'ASK : un achat limite qui atteint l'ask
             # traverse le carnet et nous rend PRENEUR -- ce qui reperdrait
             # exactement les frais que ce mecanisme existe pour eviter.
-            if MAKER_OPEN_PRICE < aa:
-                prix.append(MAKER_OPEN_PRICE)
+            if _px_cap < aa:
+                prix.append(_px_cap)
                 continue
-            # ADAPTATIF : l'ask est deja sous notre prix habituel (marche deja
+            # ADAPTATIF : l'ask est deja sous notre prix de pose (marche deja
             # parti d'un cote) -- au lieu d'abandonner toute la fenetre, on se
-            # cale sous l'ask actuel, JAMAIS au-dessus de MAKER_OPEN_PRICE.
-            prix_adapte = round(max(MAKER_OPEN_ADAPT_FLOOR, aa - MAKER_OPEN_ADAPT_DISCOUNT), 2)
+            # cale sous l'ask actuel, JAMAIS au-dessus du plafond du mode.
+            prix_adapte = round(max(_px_floor, aa - MAKER_OPEN_ADAPT_DISCOUNT), 2)
             if prix_adapte >= aa:
                 self._tlog(
                     f"makeropen_cher_{sym}",
@@ -5741,12 +5854,12 @@ class MultiTrader:
             self._tlog(
                 f"makeropen_adapte_{sym}",
                 f"🔧 [MAKER-OUVERT-ADAPTE] {sym} {slug} ask deja a {aa:.3f} "
-                f"(poser a {MAKER_OPEN_PRICE:.2f} nous rendrait PRENEUR) -> "
+                f"(poser a {_px_cap:.2f} nous rendrait PRENEUR) -> "
                 f"pose adaptee a {prix_adapte:.2f} a la place",
             )
             prix.append(prix_adapte)
         comb = round(sum(prix), 4)
-        if comb > MAKER_OPEN_MAX_COMBINED:
+        if comb > _comb_max:
             return
 
         budget = self._maker_open_budget()
@@ -5771,12 +5884,18 @@ class MultiTrader:
             )
             return
 
+        _mode_lbl = "CALME" if _calm_mo else "CROISEMENT"
+        if comb < 1.0:
+            _gain_lbl = f"-> +{(1 - comb) * 100:.1f}% si les 2 sont servis"
+        else:
+            _gain_lbl = f"-> couverture {comb:.3f} (TP/SL gere, pas un arb)"
         self._log(
-            f"📮 [MAKER-OUVERT] {sym} {slug} {reste:.0f}s restantes | pose 2 ordres "
-            f"PASSIFS {outcomes[0]}@{prix[0]:.3f} + {outcomes[1]}@{prix[1]:.3f} = {comb:.3f} "
-            f"({parts} parts, {besoin:.2f}$) -> +{(1 - comb) * 100:.1f}% si les 2 sont servis"
+            f"📮 [MAKER-OUVERT-{_mode_lbl}] {sym} {slug} {reste:.0f}s restantes | "
+            f"danger={_d_mo} | pose 2 ordres PASSIFS {outcomes[0]}@{prix[0]:.3f} + "
+            f"{outcomes[1]}@{prix[1]:.3f} = {comb:.3f} ({parts} parts, {besoin:.2f}$) {_gain_lbl}"
         )
         pose = {}
+        pose["calm"] = _calm_mo
         # POSE EN PARALLELE (Steven 08/08, "HTTP/2 = multiplexing, plusieurs
         # requetes sur la meme connexion sans attendre la reponse de la
         # precedente") : les 2 jambes etaient postees en SERIE ici (contrairement
@@ -5873,6 +5992,38 @@ class MultiTrader:
         h.append({"ts": time.time(), "symbol": sym, "slug": slug, "issue": issue, **kw})
         if len(h) > 400:
             del h[: len(h) - 400]
+        # AUTO-STOP MODE CALME (Steven 09/08) : le mode calme est une hypothese
+        # a mesurer (l'historique interne a montre que "poursuivre le gagnant"
+        # au-dessus de 0.35 perdait SANS le filtre danger). On cumule PnL + nb
+        # de trades calmes reels, et on coupe le mode des que 20 trades ont
+        # rendu un ROI negatif -- le bot retombe en croisement, le toggle
+        # CALM_MSF_ENABLED restant lui-meme inchange.
+        if kw.get("calm"):
+            _net = None
+            _comb = kw.get("combine")
+            _prix = kw.get("prix")
+            _vendu = kw.get("vendu")
+            _sortie = kw.get("sortie")
+            if issue == "les_deux" and _comb and kw.get("parts"):
+                _net = kw["parts"] * (1 - _comb)
+            elif _prix and _vendu and _sortie:
+                _net = _vendu * (_sortie - _prix)
+            if _net is not None:
+                s = self.state.setdefault("calm_msf_stats", {"n": 0, "pnl": 0.0, "disabled": False})
+                s["n"] += 1
+                s["pnl"] = round(s["pnl"] + _net, 4)
+                self._tlog(
+                    f"makeropen_calm_stat",
+                    f"📈 [MAKER-OUVERT-CALME] stat {s['n']}/{CALM_MSF_AUTOSTOP_N} "
+                    f"trades -> pnl cumule {s['pnl']:+.2f}$",
+                )
+                if s["n"] >= CALM_MSF_AUTOSTOP_N and s["pnl"] < 0:
+                    s["disabled"] = True
+                    self._log(
+                        f"⛔ [MAKER-OUVERT-CALME] auto-stop : {s['n']} trades, "
+                        f"ROI < 0 (pnl {s['pnl']:+.2f}$) -> mode calme coupe, "
+                        f"retour au mode croisement seul"
+                    )
 
     def _manage_stagger(self, sym):
         """ARB DECALE, suite : complete la paire des que le verrou est
