@@ -794,7 +794,20 @@ POLY_FEE_SAFETY = 0.003         # marge : mieux vaut rater un arb que le perdre
 # l'instant, juste un fait mesure.
 MAKER_OPEN_ENABLED = True
 MAKER_OPEN_SYMBOLS = ("BTC", "ETH")
-MAKER_OPEN_PRICE = 0.35           # prix de pose, identique des deux cotes
+MAKER_OPEN_PRICE = 0.35           # prix de pose, PLAFOND (jamais depasse)
+# PRIX ADAPTATIF (Steven 09/08, "il pourrait pas s'adapter au marche ?") :
+# au lieu d'abandonner toute la fenetre quand l'ask est deja sous 0.35
+# (PRENEUR), on pose EN DESSOUS de l'ask actuel -- jamais au-dessus de
+# MAKER_OPEN_PRICE (jamais plus cher que ce qu'on fait deja aujourd'hui).
+# Backteste (586 fenetres, walk-forward train/test, frais de sortie inclus) :
+# plafonner au-DESSUS de 0.35 (poursuivre le marche quand il est cher) perd
+# systematiquement de l'argent (jusqu'a -3.7$/j) -- ca transforme l'arb en
+# pari directionnel sur un cote deja tranche. Adapter uniquement vers le BAS,
+# plafonne a 0.35, ne peut jamais faire pire que le fixe actuel (c'est un
+# sous-ensemble strict des memes prix ou moins chers) : train +0.71->+1.44$/j
+# (sell), test directionnellement coherent (jamais pire que le fixe).
+MAKER_OPEN_ADAPT_DISCOUNT = 0.12  # marge sous l'ask quand il est deja < MAKER_OPEN_PRICE
+MAKER_OPEN_ADAPT_FLOOR = 0.02     # jamais en dessous (bruit/quasi-mort)
 MAKER_OPEN_MAX_COMBINED = 0.94    # garde-fou : au-dela on ne pose pas
 MAKER_OPEN_MIN_REMAIN_S = 120     # sous 2 min restantes, trop tard pour etre servi
 MAKER_OPEN_CANCEL_BEFORE_S = 45   # a T-45s : on annule et on solde une jambe seule
@@ -5703,14 +5716,27 @@ class MultiTrader:
             # JAMAIS AU-DESSUS DE L'ASK : un achat limite qui atteint l'ask
             # traverse le carnet et nous rend PRENEUR -- ce qui reperdrait
             # exactement les frais que ce mecanisme existe pour eviter.
-            if MAKER_OPEN_PRICE >= aa:
+            if MAKER_OPEN_PRICE < aa:
+                prix.append(MAKER_OPEN_PRICE)
+                continue
+            # ADAPTATIF : l'ask est deja sous notre prix habituel (marche deja
+            # parti d'un cote) -- au lieu d'abandonner toute la fenetre, on se
+            # cale sous l'ask actuel, JAMAIS au-dessus de MAKER_OPEN_PRICE.
+            prix_adapte = round(max(MAKER_OPEN_ADAPT_FLOOR, aa - MAKER_OPEN_ADAPT_DISCOUNT), 2)
+            if prix_adapte >= aa:
                 self._tlog(
                     f"makeropen_cher_{sym}",
-                    f"⏸️ [MAKER-OUVERT] {sym} {slug} l'ask est deja a {aa:.3f}, "
-                    f"poser a {MAKER_OPEN_PRICE:.2f} nous rendrait PRENEUR -> on ne pose pas",
+                    f"⏸️ [MAKER-OUVERT] {sym} {slug} ask a {aa:.3f} trop bas meme "
+                    f"pour le prix adaptatif -> on ne pose pas",
                 )
                 return
-            prix.append(MAKER_OPEN_PRICE)
+            self._tlog(
+                f"makeropen_adapte_{sym}",
+                f"🔧 [MAKER-OUVERT-ADAPTE] {sym} {slug} ask deja a {aa:.3f} "
+                f"(poser a {MAKER_OPEN_PRICE:.2f} nous rendrait PRENEUR) -> "
+                f"pose adaptee a {prix_adapte:.2f} a la place",
+            )
+            prix.append(prix_adapte)
         comb = round(sum(prix), 4)
         if comb > MAKER_OPEN_MAX_COMBINED:
             return
