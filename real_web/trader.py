@@ -806,6 +806,11 @@ MAKER_OPEN_PRICE = 0.35           # prix de pose, PLAFOND (jamais depasse)
 # plafonne a 0.35, ne peut jamais faire pire que le fixe actuel (c'est un
 # sous-ensemble strict des memes prix ou moins chers) : train +0.71->+1.44$/j
 # (sell), test directionnellement coherent (jamais pire que le fixe).
+# EN PAUSE (Steven 09/08, "le calm mode va nous permettre de faire plus de
+# trade/h") : le mode CALME est desormais la voie choisie pour augmenter la
+# frequence en marche non-croise -- l'adaptatif croisement (descendre sous
+# 0.35) est mis en pause plutot que retire (reactivable en repassant a True).
+MAKER_OPEN_ADAPT_ENABLED = False
 MAKER_OPEN_ADAPT_DISCOUNT = 0.12  # marge sous l'ask quand il est deja < MAKER_OPEN_PRICE
 # PLANCHER = DEAD_MARKET_THRESHOLD (Steven 09/08, "miser sur le perdant ne
 # paye que si le marche est dangereux") : corrige apres coup -- le plancher
@@ -5848,7 +5853,16 @@ class MultiTrader:
                 f"{CALM_MSF_AUTOSTOP_N} trades) -> on reste en mode croisement",
             )
         _px_cap = CALM_MSF_PRICE if _calm_mo else MAKER_OPEN_PRICE
-        _px_floor = CALM_MSF_ADAPT_FLOOR if _calm_mo else MAKER_OPEN_ADAPT_FLOOR
+        if _calm_mo:
+            _px_floor = CALM_MSF_ADAPT_FLOOR
+        elif MAKER_OPEN_ADAPT_ENABLED:
+            _px_floor = MAKER_OPEN_ADAPT_FLOOR
+        else:
+            # PAUSE (Steven 09/08) : plancher = plafond -> le garde-fou
+            # existant ("prix_adapte >= aa -> abandon") se declenche alors
+            # SYSTEMATIQUEMENT des que l'ask est deja sous MAKER_OPEN_PRICE,
+            # reproduisant exactement le comportement d'avant l'adaptatif.
+            _px_floor = MAKER_OPEN_PRICE
         _comb_max = CALM_MSF_MAX_COMBINED if _calm_mo else MAKER_OPEN_MAX_COMBINED
 
         prix = []
@@ -5977,7 +5991,7 @@ class MultiTrader:
         with ThreadPoolExecutor(max_workers=2) as _ex_msf:
             _futs_msf = {
                 i: _ex_msf.submit(self._live.post_limit_buy, tid, px, parts)
-                for i, (side, tid, px) in _post
+                for i, side, tid, px in _post
             }
             _results_msf = {i: f.result() for i, f in _futs_msf.items()}
         _chrono_t1 = time.time()
