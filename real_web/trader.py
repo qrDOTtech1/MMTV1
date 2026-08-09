@@ -5961,7 +5961,7 @@ class MultiTrader:
         # dans le suivi comme "skipped" (ok=True, pas d'ordre) pour ne pas
         # fausser le "pose incomplete -> tout annule".
         _post = [
-            (i, side, tid, px)
+            (i, side, tid, prix[i])
             for i, (side, tid) in enumerate(zip(outcomes, token_ids))
             if prix[i] is not None
         ]
