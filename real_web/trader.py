@@ -807,7 +807,15 @@ MAKER_OPEN_PRICE = 0.35           # prix de pose, PLAFOND (jamais depasse)
 # sous-ensemble strict des memes prix ou moins chers) : train +0.71->+1.44$/j
 # (sell), test directionnellement coherent (jamais pire que le fixe).
 MAKER_OPEN_ADAPT_DISCOUNT = 0.12  # marge sous l'ask quand il est deja < MAKER_OPEN_PRICE
-MAKER_OPEN_ADAPT_FLOOR = 0.02     # jamais en dessous (bruit/quasi-mort)
+# PLANCHER = DEAD_MARKET_THRESHOLD (Steven 09/08, "miser sur le perdant ne
+# paye que si le marche est dangereux") : corrige apres coup -- le plancher
+# etait a 0.02, sous le seuil que le reste du bot utilise deja pour dire
+# "ce cote est quasi resolu, on n'y touche pas" (DEAD_MARKET_THRESHOLD=0.05).
+# Sans ca, dans un marche directionnel SANS croisement, le cote perdant est
+# facile a remplir (vendeurs qui bradent) alors que le cote gagnant (notre
+# autre jambe, encore au prix fixe) ne se remplit quasiment jamais -> on
+# finit avec SEULEMENT la jambe perdante, l'inverse d'un verrou.
+MAKER_OPEN_ADAPT_FLOOR = DEAD_MARKET_THRESHOLD  # jamais sous le seuil "marche mort"
 MAKER_OPEN_MAX_COMBINED = 0.94    # garde-fou : au-dela on ne pose pas
 MAKER_OPEN_MIN_REMAIN_S = 120     # sous 2 min restantes, trop tard pour etre servi
 MAKER_OPEN_CANCEL_BEFORE_S = 45   # a T-45s : on annule et on solde une jambe seule
