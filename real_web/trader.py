@@ -876,6 +876,10 @@ CALM_MSF_PRICE = 0.65              # prix de pose en mode calme, PLAFOND (le gag
 CALM_MSF_ADAPT_FLOOR = 0.35        # plancher adaptatif : jamais plus bas, sinon on rachete le perdant bradé
 CALM_MSF_MAX_COMBINED = 1.05       # couverture 2 jambes acceptee (pas un arb)
 CALM_MSF_SL_PRICE = 0.40           # coupe la jambe seule quand son bid passe sous ce prix
+# TP ABSOLU (pas x1.8) : en mode calme l'entree est a ~0.65, et 0.65 x 1.8 =
+# 1.17 > 1.0 -> le seuil serait INATTEIGNABLE et le TP ne se declencherait
+# jamais. On prend donc un profit a prix fixe CALM_MSF_TP_PRICE.
+CALM_MSF_TP_PRICE = 0.85
 CALM_MSF_AUTOSTOP_N = 20           # apres 20 trades calme, on coupe le mode si ROI < 0
 
 PAIR_MAX_IMBALANCE = 1.05
@@ -5345,12 +5349,31 @@ class MultiTrader:
             # suffisamment monte apres un delai minimal anti-bruit, on prend
             # le profit et on ABANDONNE la tentative sur l'autre cote, comme
             # demande : plus la peine d'esperer completer la paire.
-            cote_seule = "a" if fa > 0.01 else "b"
+            # MODE CALME (Steven 09/08) : une jambe peut avoir ete SAUTEE
+            # (perdant bradé, price=None, pas d'ordre pose). On choisit donc
+            # toujours une jambe POSTEE (avec un prix reel) -- sinon
+            # leg_seule["price"] serait None et le x1.8 du bloc ci-dessous
+            # crasherait.
+            if fa > 0.01:
+                cote_seule = "a"
+            elif fb > 0.01:
+                cote_seule = "b"
+            elif (e.get("a") or {}).get("price") is not None:
+                cote_seule = "a"
+            else:
+                cote_seule = "b"
             leg_seule = e[cote_seule]
             if "fill_ts" not in leg_seule:
                 leg_seule["fill_ts"] = now
             _hold_s = now - leg_seule["fill_ts"]
-            _tp_seuil = leg_seule["price"] * MAKER_OPEN_TP_MULT
+            # MODE CALME (Steven 09/08) : TP a prix ABSOLU (0.85). En calme on
+            # est entre a ~0.65, et le x1.8 historique (0.65*1.8=1.17>1.0) ne
+            # se declencherait jamais. En croisement (entree ~0.35) le x1.8
+            # reste le bon outil.
+            if e.get("calm"):
+                _tp_seuil = CALM_MSF_TP_PRICE
+            else:
+                _tp_seuil = leg_seule["price"] * MAKER_OPEN_TP_MULT
 
             # ── SUIVI D'UN TP PASSIF DEJA POSTE (Steven 08/08, "sortie MAKER
             # au lieu d'agressive") : backteste sur 586 fenetres, frais de
@@ -5829,7 +5852,8 @@ class MultiTrader:
         _comb_max = CALM_MSF_MAX_COMBINED if _calm_mo else MAKER_OPEN_MAX_COMBINED
 
         prix = []
-        for tid in token_ids:
+        _skip = []
+        for i, tid in enumerate(token_ids):
             b = self._live.get_book_sync(tid)
             aa = b["asks"][0][0] if b and b.get("asks") else None
             if aa is None:
@@ -5839,12 +5863,30 @@ class MultiTrader:
             # exactement les frais que ce mecanisme existe pour eviter.
             if _px_cap < aa:
                 prix.append(_px_cap)
+                _skip.append(False)
                 continue
             # ADAPTATIF : l'ask est deja sous notre prix de pose (marche deja
             # parti d'un cote) -- au lieu d'abandonner toute la fenetre, on se
             # cale sous l'ask actuel, JAMAIS au-dessus du plafond du mode.
             prix_adapte = round(max(_px_floor, aa - MAKER_OPEN_ADAPT_DISCOUNT), 2)
             if prix_adapte >= aa:
+                if _calm_mo:
+                    # MODE CALME (Steven 09/08, "rien n'est reellement pose") :
+                    # ce cote est deja tranche/bradé (ask < plancher 0.35). Le
+                    # poser a CALM_MSF_PRICE nous rendrait PRENEUR sur le
+                    # PERDANT -- exactement ce qu'on ne veut PLUS en mode calme.
+                    # On SAUTE cette jambe au lieu d'abandonner toute la fenetre
+                    # : l'autre cote (le gagnant) est encore posee et geree par
+                    # TP absolu / SL.
+                    self._tlog(
+                        f"makeropen_calm_skip_{sym}",
+                        f"↪️ [MAKER-OUVERT-CALME] {sym} {slug} {outcomes[i]} ask "
+                        f"{aa:.3f} < plancher {_px_floor:.2f} (perdant bradé) -> "
+                        f"on saute cette jambe, le gagnant est quand meme pose",
+                    )
+                    prix.append(None)
+                    _skip.append(True)
+                    continue
                 self._tlog(
                     f"makeropen_cher_{sym}",
                     f"⏸️ [MAKER-OUVERT] {sym} {slug} ask a {aa:.3f} trop bas meme "
@@ -5858,7 +5900,16 @@ class MultiTrader:
                 f"pose adaptee a {prix_adapte:.2f} a la place",
             )
             prix.append(prix_adapte)
-        comb = round(sum(prix), 4)
+            _skip.append(False)
+        _prix_post = [p for p in prix if p is not None]
+        if not _prix_post:
+            self._tlog(
+                f"makeropen_rien_{sym}",
+                f"⭕ [MAKER-OUVERT] {sym} {slug} aucune jambe posable (marche "
+                f"tranche des 2 cotes) -> on ne pose pas",
+            )
+            return
+        comb = round(sum(_prix_post), 4)
         if comb > _comb_max:
             return
 
@@ -5885,14 +5936,17 @@ class MultiTrader:
             return
 
         _mode_lbl = "CALME" if _calm_mo else "CROISEMENT"
+        _pose_desc = " + ".join(
+            f"{outcomes[i]}@{px:.3f}" for i, px in enumerate(prix) if px is not None
+        )
         if comb < 1.0:
-            _gain_lbl = f"-> +{(1 - comb) * 100:.1f}% si les 2 sont servis"
+            _gain_lbl = f"-> +{(1 - comb) * 100:.1f}% si tous les ordres sont servis"
         else:
             _gain_lbl = f"-> couverture {comb:.3f} (TP/SL gere, pas un arb)"
         self._log(
             f"📮 [MAKER-OUVERT-{_mode_lbl}] {sym} {slug} {reste:.0f}s restantes | "
-            f"danger={_d_mo} | pose 2 ordres PASSIFS {outcomes[0]}@{prix[0]:.3f} + "
-            f"{outcomes[1]}@{prix[1]:.3f} = {comb:.3f} ({parts} parts, {besoin:.2f}$) {_gain_lbl}"
+            f"danger={_d_mo} | pose {len(_prix_post)} ordre(s) PASSIF(S) {_pose_desc} "
+            f"= {comb:.3f} ({parts} parts, {besoin:.2f}$) {_gain_lbl}"
         )
         pose = {}
         pose["calm"] = _calm_mo
@@ -5902,23 +5956,37 @@ class MultiTrader:
         # au chemin bothside qui les parallelise deja depuis le 04/08) -- rien
         # n'empechait la jambe B d'attendre bêtement la reponse HTTP de la
         # jambe A avant meme de commencer a se signer. Meme technique
-        # (ThreadPoolExecutor) que post_limit_pair_no_slippage.
+        # (ThreadPoolExecutor) que post_limit_pair_no_slippage. En mode calme,
+        # une jambe sautee (perdant bradé) n'est PAS soumise : on la marque
+        # dans le suivi comme "skipped" (ok=True, pas d'ordre) pour ne pas
+        # fausser le "pose incomplete -> tout annule".
+        _post = [
+            (i, side, tid, px)
+            for i, (side, tid) in enumerate(zip(outcomes, token_ids))
+            if prix[i] is not None
+        ]
+        for i, (side, tid) in enumerate(zip(outcomes, token_ids)):
+            if prix[i] is None:
+                pose["a" if i == 0 else "b"] = {
+                    "side": side, "token_id": tid, "price": None,
+                    "order_id": None, "ok": True, "skipped": True,
+                }
         from concurrent.futures import ThreadPoolExecutor
 
         _chrono_t0 = time.time()
         with ThreadPoolExecutor(max_workers=2) as _ex_msf:
             _futs_msf = {
-                i: _ex_msf.submit(self._live.post_limit_buy, tid, prix[i], parts)
-                for i, (side, tid) in enumerate(zip(outcomes, token_ids))
+                i: _ex_msf.submit(self._live.post_limit_buy, tid, px, parts)
+                for i, (side, tid, px) in _post
             }
             _results_msf = {i: f.result() for i, f in _futs_msf.items()}
         _chrono_t1 = time.time()
         _chrono_total_ms = round((_chrono_t1 - _chrono_t0) * 1000)
         _tim_parts = []
-        for i, (side, tid) in enumerate(zip(outcomes, token_ids)):
+        for i, side, tid, px in _post:
             r = _results_msf[i]
             pose["a" if i == 0 else "b"] = {
-                "side": side, "token_id": tid, "price": prix[i],
+                "side": side, "token_id": tid, "price": px,
                 "order_id": r.get("order_id"), "ok": bool(r.get("success")),
             }
             _tim = r.get("timing") or {}
@@ -5942,7 +6010,7 @@ class MultiTrader:
                 _err = str(r.get("error") or "")
                 _cause = _err.split("error_message=")[-1] if "error_message=" in _err else _err
                 self._log(
-                    f"⚠️ [MAKER-OUVERT] {sym} {slug} {side} @ {prix[i]:.3f} x{parts} "
+                    f"⚠️ [MAKER-OUVERT] {sym} {slug} {side} @ {px:.3f} x{parts} "
                     f"refuse : {_cause[:300]}"
                 )
         if len(self.state["latency_history"]) > 1000:
