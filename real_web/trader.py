@@ -5751,8 +5751,16 @@ class MultiTrader:
                 f"{self._investable():.2f}$ dispo -> on ne pose pas ce qu'on ne peut pas honorer",
             )
             return
-        ok_exp, _ = self._exposure_ok(sym, mk, slug, besoin)
+        ok_exp, why_exp = self._exposure_ok(sym, mk, slug, besoin)
         if not ok_exp:
+            # ETAIT SILENCIEUX (Steven 09/08) : ce garde-fou pouvait bloquer
+            # 100% des tentatives sans laisser AUCUNE trace dans le journal --
+            # exactement ce qui rendait le bug budget/expo ci-dessus invisible.
+            self._tlog(
+                f"makeropen_expo_{sym}",
+                f"⛔ [MAKER-OUVERT] {sym} {slug} plafond d'exposition atteint "
+                f"({why_exp}) -> on ne pose pas",
+            )
             return
 
         self._log(
@@ -5830,9 +5838,21 @@ class MultiTrader:
         self._save()
 
     def _maker_open_budget(self):
+        # BUG TROUVE EN LIVE (Steven 09/08, "je ne vois toujours aucun
+        # mouvement") : MAKER_OPEN_TOTAL_FRAC=0.35 > MAX_MARKET_EXPOSURE_FRAC
+        # =0.25 -> des que investable() depasse ~25$, ce budget demande
+        # STRUCTURELLEMENT plus que ce que _exposure_ok() autorise, et
+        # _manage_maker_open() se fait rejeter EN SILENCE (`if not ok_exp:
+        # return`, aucun log) a CHAQUE cycle, peu importe le marche. Confirme
+        # en live : a 35$ investable, budget=12.25$ > plafond expo=8.75$ ->
+        # 0 pose possible depuis que le compte a depasse ~25$. Plafonner ici
+        # au meme garde-fou qu'on devra de toute facon respecter plus bas.
         return round(
-            min(MAKER_OPEN_BUDGET_MAX,
-                max(MAKER_OPEN_BUDGET_MIN, self._investable() * MAKER_OPEN_TOTAL_FRAC)),
+            min(
+                MAKER_OPEN_BUDGET_MAX,
+                self._max_market_exposure(),
+                max(MAKER_OPEN_BUDGET_MIN, self._investable() * MAKER_OPEN_TOTAL_FRAC),
+            ),
             2,
         )
 
