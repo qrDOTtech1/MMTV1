@@ -5854,7 +5854,15 @@ class MultiTrader:
             )
         _px_cap = CALM_MSF_PRICE if _calm_mo else MAKER_OPEN_PRICE
         if _calm_mo:
-            _px_floor = CALM_MSF_ADAPT_FLOOR
+            # PLUS D'ADAPTATION EN CALME (Steven 09/08, "on ne pose QUE a
+            # 0.65 des 2 cotes") : plancher = plafond -> des qu'un cote est
+            # deja sous 0.65 (donc PAS le favori -- c'est justement le cote
+            # qu'on ne veut jamais acheter en mode calme), on saute cette
+            # jambe au lieu de l'acheter a prix adapte. Vu en reel : une
+            # jambe remplie a un prix adapte plus bas (0.35, cote perdant)
+            # au lieu du favori vise -- exactement l'inverse de l'intention
+            # du mode calme.
+            _px_floor = CALM_MSF_PRICE
         elif MAKER_OPEN_ADAPT_ENABLED:
             _px_floor = MAKER_OPEN_ADAPT_FLOOR
         else:
