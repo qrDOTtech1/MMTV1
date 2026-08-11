@@ -1126,6 +1126,37 @@ def api_msf_tp_toggle():
     return jsonify({"ok": True, "msf_tp_enabled": on})
 
 
+@app.route("/api/gatekeeper")
+def api_gatekeeper():
+    """Etat de l'apprentissage en mode ombre (Steven 11/08) : generation
+    courante, historique des generations, verdict. Lecture seule -- ce
+    modele ne decide rien, il apprend et se note."""
+    etat = trader.state.get("gatekeeper", {}) or {}
+    hist = list(etat.get("historique", []))
+    return jsonify({
+        "ok": True,
+        "generation": etat.get("generation", 0),
+        "mode": "ombre",
+        "intervalle_s": getattr(trader, "GATEKEEPER_INTERVAL_S", 3600),
+        "dernier": etat.get("dernier"),
+        "historique": hist[-100:][::-1],
+    })
+
+
+@app.route("/api/gatekeeper/train", methods=["POST"])
+def api_gatekeeper_train():
+    """Force une generation immediatement (sans attendre l'heure).
+    ?force=1 entraine MEME sous le seuil de donnees -- la generation est
+    alors marquee 'entraine_sur_donnees_insuffisantes' et ne doit servir
+    qu'a verifier que la chaine tourne, jamais a decider."""
+    force = bool((request.get_json(silent=True) or {}).get("force"))
+    try:
+        resume = trader._gatekeeper_cycle(force=force)
+        return jsonify({"ok": True, "resume": resume})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
+
+
 @app.route("/api/export-snapshots")
 def api_export_snapshots():
     """Export JSONL a la demande (Steven 08/08, "separer le monde prod
@@ -1138,10 +1169,14 @@ def api_export_snapshots():
     ?kind=book_snapshots (defaut, features pour le futur gatekeeper ML) ou
     ?kind=slippage (base de slippage multi-dimensionnelle)."""
     kind = request.args.get("kind", "book_snapshots")
-    key = {"book_snapshots": "book_snapshot_history", "slippage": "slippage_history"}.get(kind)
-    if key is None:
+    if kind == "book_snapshots":
+        # depuis le 11/08 les releves de marche vivent dans un fichier dedie
+        # (cf. MARKET_DATA_FILE) et non plus dans multi_state.json
+        hist = trader.lire_market_data()
+    elif kind == "slippage":
+        hist = trader.state.get("slippage_history", [])
+    else:
         return jsonify({"ok": False, "error": "kind invalide (book_snapshots ou slippage)"}), 400
-    hist = trader.state.get(key, [])
     lines = "\n".join(json.dumps(r) for r in hist)
     resp = Response(lines + ("\n" if lines else ""), mimetype="application/x-ndjson")
     resp.headers["Content-Disposition"] = f'attachment; filename="{kind}.jsonl"'

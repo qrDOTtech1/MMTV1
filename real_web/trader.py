@@ -35,6 +35,15 @@ ROOT = Path(__file__).parent.parent
 load_dotenv(ROOT / ".env")
 LOG_FILE = ROOT / "data" / "ghost_v3_real.log"
 STATE_FILE = ROOT / "data" / "multi_state.json"
+# JOURNAL DE MARCHE SEPARE (Steven 11/08, 6 marches en dataset) : garder ces
+# releves dans multi_state.json etait tenable a 2 symboles (tampon 8000 =
+# ~17 h) mais pas a 6 -- 12 lignes toutes les 30 s saturent le tampon en 5 h,
+# et surtout _save() reecrit TOUT l'etat a chaque action de trading : y
+# trainer plusieurs Mo de donnees ML ralentirait le chemin critique. Fichier
+# a part, en ajout seul (O(1) par ligne), lu a la demande par l'export et
+# par l'entrainement.
+MARKET_DATA_FILE = ROOT / "data" / "market_snapshots.jsonl"
+MARKET_DATA_MAX_MB = 400
 
 # ── garde-fous & sizing (valeurs validees par Steven) ──
 FLOOR_USD = 20.0  # ne jamais engager de capital sous ce plancher (protege le capital,
@@ -3063,6 +3072,10 @@ class MultiTrader:
         self._thread.start()
         self._fast_exit_thread = threading.Thread(target=self._fast_exit_loop, daemon=True)
         self._fast_exit_thread.start()
+        # GATEKEEPER (Steven 11/08) : apprentissage autonome en mode ombre,
+        # une generation par heure, aucune influence sur le trading.
+        self._gatekeeper_thread = threading.Thread(target=self._gatekeeper_loop, daemon=True)
+        self._gatekeeper_thread.start()
         # COPY-TRADING (Steven 05/08) : thread dedie, tourne meme si
         # COPY_TRADE_ENABLED est False -> le drapeau est verifie a chaque
         # iteration, pas au demarrage, pour pouvoir l'activer/desactiver
@@ -4535,7 +4548,11 @@ class MultiTrader:
             )
             return True, base["cost"]
 
-    MARKET_DATA_SYMBOLS = ("BTC", "ETH")
+    # LES 6 MARCHES (Steven 11/08, "6 marches a mettre en dataset") : la
+    # collecte est independante du trading, donc elargir ne change RIEN aux
+    # decisions -- ca ne fait qu'agrandir le jeu d'apprentissage, et permet
+    # de comparer les marches entre eux pour savoir ou MSF travaille le mieux.
+    MARKET_DATA_SYMBOLS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB")
     MARKET_DATA_INTERVAL_S = 30
 
     def _collect_market_data(self):
@@ -4574,6 +4591,66 @@ class MultiTrader:
                     triggered=False, source="veille",
                 )
         self._save()
+
+    GATEKEEPER_INTERVAL_S = 3600      # une generation par heure
+    GATEKEEPER_HIST_MAX = 500
+
+    def _gatekeeper_loop(self):
+        """ENTRAINEMENT AUTONOME, MODE OMBRE (Steven 11/08, "il s'entraine
+        seul dans son coin, ca doit pas etre en local").
+
+        Tourne DANS le service Railway : le PC de Steven peut etre eteint,
+        l'apprentissage continue. Une generation numerotee par heure. Ce fil
+        ne prend AUCUNE decision de trading -- il lit le journal de marche,
+        apprend, se note, ecrit son verdict. Le branchement eventuel sur les
+        entrees est une decision humaine separee, pas un effet de bord.
+
+        Isole de tout : une exception ici ne doit jamais toucher le trading."""
+        while self._running.is_set():
+            try:
+                time.sleep(self.GATEKEEPER_INTERVAL_S)
+                if not self._running.is_set():
+                    return
+                self._gatekeeper_cycle()
+            except Exception as e:
+                self._tlog("gk_err", f"⚠️ [GATEKEEPER] cycle echoue : {str(e)[:200]}")
+
+    def _gatekeeper_cycle(self, force=False):
+        """Produit UNE generation et l'archive. Retourne le resume."""
+        from real_web import gatekeeper as gk
+
+        etat = self.state.setdefault("gatekeeper", {"generation": 0, "historique": []})
+        gen = int(etat.get("generation", 0)) + 1
+        rows = self.lire_market_data()
+        res = gk.cycle(rows, generation=gen, force=force)
+
+        etat["generation"] = gen
+        etat["dernier"] = res
+        resume = {k: res.get(k) for k in
+                  ("generation", "ts", "statut", "n_fenetres", "n_croisantes",
+                   "n_non_croisantes", "couverture_h", "auc_moyen", "gain_filtre",
+                   "gain_alea", "gain_sans", "verdict", "par_symbole")}
+        etat.setdefault("historique", []).append(resume)
+        if len(etat["historique"]) > self.GATEKEEPER_HIST_MAX:
+            del etat["historique"][: len(etat["historique"]) - self.GATEKEEPER_HIST_MAX]
+        self._save()
+
+        if res.get("statut") == "accumulation":
+            m = res.get("manque", {})
+            self._log(
+                f"🧠 [GATEKEEPER] gen {gen} : accumulation ({res['n_fenetres']} fenetres, "
+                f"{res['n_croisantes']} croisantes) -- manque {m.get('fenetres')} fenetres, "
+                f"{m.get('croisantes')} croisantes, {m.get('non_croisantes')} non croisantes"
+            )
+        else:
+            self._log(
+                f"🧠 [GATEKEEPER] gen {gen} [{res.get('statut')}] {res['n_fenetres']} fenetres "
+                f"({res['couverture_h']}h) | AUC {res.get('auc_moyen')} | "
+                f"filtre {res.get('gain_filtre')}$/fen vs alea {res.get('gain_alea')} "
+                f"vs tout {res.get('gain_sans')} -> {str(res.get('verdict')).upper()} "
+                f"(mode ombre, aucune decision de trading)"
+            )
+        return resume
 
     def _cancel_verifie(self, order_id, tag="", essais=3):
         """Annule un ordre ET VERIFIE qu'il a bien disparu (Steven 10/08,
@@ -4634,8 +4711,7 @@ class MultiTrader:
         bid_depth = round(sum(sz for _, sz in bids[:3]), 2) if bids else 0.0
         ask_depth = round(sum(sz for _, sz in asks[:3]), 2) if asks else 0.0
         _tot_depth = bid_depth + ask_depth
-        hist = self.state.setdefault("book_snapshot_history", [])
-        hist.append({
+        ligne = {
             "ts": round(time.time(), 1), "symbol": symbol, "slug": slug, "side": side,
             "hour_utc": hour_utc, "dow": dow, "danger": danger,
             # tp_seuil/entry_price sont None en mode veille (aucune position) --
@@ -4650,9 +4726,56 @@ class MultiTrader:
             "bid_depth_top3": bid_depth, "ask_depth_top3": ask_depth,
             "imbalance_bid_pct": round(100 * bid_depth / _tot_depth, 1) if _tot_depth > 0 else None,
             "triggered": triggered,
-        })
-        if len(hist) > self.BOOK_SNAPSHOT_HISTORY_SIZE:
-            del hist[: len(hist) - self.BOOK_SNAPSHOT_HISTORY_SIZE]
+        }
+        # AJOUT SEUL dans un fichier dedie (cf. MARKET_DATA_FILE) : ne passe
+        # plus par self.state, donc _save() reste leger meme avec des jours
+        # de donnees accumulees.
+        try:
+            MARKET_DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(MARKET_DATA_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(ligne, ensure_ascii=False) + "\n")
+            self._md_ecrits = getattr(self, "_md_ecrits", 0) + 1
+            # rotation rare : on ne verifie la taille que tous les 5000 ajouts
+            if self._md_ecrits % 5000 == 0:
+                self._rotate_market_data()
+        except Exception as e:
+            self._tlog("md_write_err", f"⚠️ [COLLECTE] ecriture impossible : {e}")
+
+    def _rotate_market_data(self):
+        """Garde la MOITIE la plus recente quand le fichier depasse la taille
+        maximale -- on prefere perdre le passe lointain que saturer le disque
+        du service de trading."""
+        try:
+            if not MARKET_DATA_FILE.exists():
+                return
+            if MARKET_DATA_FILE.stat().st_size < MARKET_DATA_MAX_MB * 1024 * 1024:
+                return
+            lignes = MARKET_DATA_FILE.read_text(encoding="utf-8").splitlines()
+            garde = lignes[len(lignes) // 2:]
+            MARKET_DATA_FILE.write_text("\n".join(garde) + "\n", encoding="utf-8")
+            self._log(f"♻️ [COLLECTE] rotation : {len(lignes)} -> {len(garde)} lignes")
+        except Exception as e:
+            self._tlog("md_rot_err", f"⚠️ [COLLECTE] rotation impossible : {e}")
+
+    @staticmethod
+    def lire_market_data(max_lignes=200000):
+        """Relit le journal de marche (les plus recentes en dernier)."""
+        if not MARKET_DATA_FILE.exists():
+            return []
+        out = []
+        try:
+            with open(MARKET_DATA_FILE, encoding="utf-8") as f:
+                for l in f:
+                    l = l.strip()
+                    if not l:
+                        continue
+                    try:
+                        out.append(json.loads(l))
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            return out
+        return out[-max_lignes:]
 
     SLIPPAGE_HISTORY_SIZE = 2000
 
