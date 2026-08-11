@@ -33,6 +33,15 @@ app = Flask(__name__, static_folder=str(ROOT), static_url_path="")
 trader = MultiTrader()
 reader = ReadApi()  # read-only : courbes, backfill, horloge, log
 
+# RECHERCHE AUTONOME (Steven 11/08) : collecte de marche + gatekeeper
+# demarres des le lancement du process, PAS sur /api/start -- ils doivent
+# tourner meme bot a l'arret. Aucun des deux ne passe d'ordre : la collecte
+# ne fait que lire des carnets, le gatekeeper apprend en mode ombre.
+try:
+    trader.demarrer_recherche()
+except Exception as _e:  # jamais fatal : le serveur doit demarrer quoi qu'il arrive
+    print(f"[boot] recherche autonome non demarree : {_e}")
+
 # AUTH TOKEN (Steven 04/08, deploiement Railway public) : cette API n'avait
 # aucune authentification -> acceptable sur 127.0.0.1 local, mais une fois
 # exposee publiquement sur Railway, n'importe qui avec l'URL pourrait lire

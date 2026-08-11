@@ -3072,10 +3072,10 @@ class MultiTrader:
         self._thread.start()
         self._fast_exit_thread = threading.Thread(target=self._fast_exit_loop, daemon=True)
         self._fast_exit_thread.start()
-        # GATEKEEPER (Steven 11/08) : apprentissage autonome en mode ombre,
-        # une generation par heure, aucune influence sur le trading.
-        self._gatekeeper_thread = threading.Thread(target=self._gatekeeper_loop, daemon=True)
-        self._gatekeeper_thread.start()
+        # La collecte et le gatekeeper NE sont PAS demarres ici : ils tournent
+        # au niveau du process (cf. demarrer_recherche), pour continuer meme
+        # bot a l'arret.
+        self.demarrer_recherche()
         # COPY-TRADING (Steven 05/08) : thread dedie, tourne meme si
         # COPY_TRADE_ENABLED est False -> le drapeau est verifie a chaque
         # iteration, pas au demarrage, pour pouvoir l'activer/desactiver
@@ -4595,6 +4595,39 @@ class MultiTrader:
     GATEKEEPER_INTERVAL_S = 3600      # une generation par heure
     GATEKEEPER_HIST_MAX = 500
 
+    def demarrer_recherche(self):
+        """Fils de RECHERCHE, independants du trading (Steven 11/08, "ca doit
+        etre 100% autonome").
+
+        Demarres au lancement du PROCESS, pas sur /api/start : la collecte de
+        marche et l'apprentissage doivent tourner meme quand le bot est a
+        l'arret ou tous les symboles a 'off'. Ni l'un ni l'autre ne passe
+        d'ordre -- la collecte ne fait que LIRE des carnets, le gatekeeper ne
+        fait qu'apprendre en mode ombre. Aucun risque de trading involontaire.
+        Idempotent : appelable plusieurs fois sans creer de doublons."""
+        if getattr(self, "_recherche_demarree", False):
+            return
+        self._recherche_demarree = True
+
+        def _boucle_collecte():
+            while True:
+                try:
+                    if self._live is None:
+                        # provoque l'initialisation du client (lecture seule)
+                        self._read_cash(max_age=300)
+                    if self._live is not None:
+                        self._collect_market_data()
+                except Exception as e:
+                    self._tlog("collecte_rech_err", f"⚠️ [COLLECTE] {str(e)[:160]}")
+                time.sleep(self.MARKET_DATA_INTERVAL_S)
+
+        threading.Thread(target=_boucle_collecte, daemon=True, name="collecte-marche").start()
+        threading.Thread(target=self._gatekeeper_loop, daemon=True, name="gatekeeper").start()
+        self._log(
+            "🧠 [RECHERCHE] collecte de marche + gatekeeper demarres "
+            "(independants du trading, mode ombre)"
+        )
+
     def _gatekeeper_loop(self):
         """ENTRAINEMENT AUTONOME, MODE OMBRE (Steven 11/08, "il s'entraine
         seul dans son coin, ca doit pas etre en local").
@@ -4605,12 +4638,13 @@ class MultiTrader:
         apprend, se note, ecrit son verdict. Le branchement eventuel sur les
         entrees est une decision humaine separee, pas un effet de bord.
 
-        Isole de tout : une exception ici ne doit jamais toucher le trading."""
-        while self._running.is_set():
+        Isole de tout : une exception ici ne doit jamais toucher le trading.
+        NE depend PAS de _running : l'apprentissage continue meme bot a
+        l'arret (c'est tout l'interet -- les donnees s'accumulent quand
+        meme)."""
+        while True:
             try:
                 time.sleep(self.GATEKEEPER_INTERVAL_S)
-                if not self._running.is_set():
-                    return
                 self._gatekeeper_cycle()
             except Exception as e:
                 self._tlog("gk_err", f"⚠️ [GATEKEEPER] cycle echoue : {str(e)[:200]}")
