@@ -5808,6 +5808,32 @@ class MultiTrader:
                         and not leg_seule.get("comp_maker_tente")):
                     _comb_m = leg_seule["price"] + _bid_c
                     if _comb_m <= MAKER_OPEN_COMPLETION_MAX:
+                        # ANNULER D'ABORD L'ORDRE D'ORIGINE DE CE COTE
+                        # (Steven 11/08, trouve sur la 1re completion reelle).
+                        # Sans ca DEUX achats restent vivants sur la meme
+                        # jambe : celui de la pose initiale (0.35) et celui de
+                        # la completion (0.62). Deux consequences, une
+                        # comptable et une financiere :
+                        #   - on ne sait plus lequel a ete servi, et le bloc
+                        #     "les deux jambes servies" attribue alors le prix
+                        #     de la pose initiale -> verrou annonce a 0.70
+                        #     alors qu'il a coute 0.97 (gain affiche +2.98$
+                        #     contre +0.34$ reels, observe en direct) ;
+                        #   - si le prix retombe sous 0.35, les DEUX se
+                        #     remplissent -> position doublee d'un seul cote,
+                        #     donc plus verrouillee du tout.
+                        if _leg_autre_c.get("order_id"):
+                            if not self._cancel_verifie(
+                                    _leg_autre_c["order_id"],
+                                    f" {sym} {slug} {_leg_autre_c.get('side','?')} avant-completion"):
+                                self._tlog(
+                                    f"makeropen_comp_annul_{sym}",
+                                    f"⚠️ [MAKER-OUVERT-COMPLETION] {sym} {slug} ordre d'origine "
+                                    f"non annulable -> on renonce a completer (risque de double "
+                                    f"remplissage sur la meme jambe)",
+                                )
+                                continue
+                            _leg_autre_c["order_id"] = None
                         _r_m = self._live.post_limit_buy(
                             _leg_autre_c["token_id"], round(_bid_c, 2), round(_n_comp, 2))
                         if _r_m.get("success") and _r_m.get("order_id"):
@@ -5815,6 +5841,10 @@ class MultiTrader:
                             leg_seule["comp_maker_px"] = round(_bid_c, 2)
                             leg_seule["comp_maker_ts"] = now
                             leg_seule["comp_maker_tente"] = True
+                            # le prix de CE cote est desormais celui de la
+                            # completion : toute branche qui lira e[cote]["price"]
+                            # (dont "les deux jambes servies") rapportera juste.
+                            _leg_autre_c["price"] = round(_bid_c, 2)
                             self._log(
                                 f"📮 [MAKER-OUVERT-COMPLETION] {sym} {slug} 2e jambe "
                                 f"{_leg_autre_c['side']} postee EN APPORTEUR a {_bid_c:.3f} "
@@ -5837,11 +5867,22 @@ class MultiTrader:
                                 f"-> verrou garanti +{_gain_c:.3f}$ au lieu de subir la jambe seule"
                             )
                             # on annule d'abord notre ordre passif de ce cote,
-                            # sinon on pourrait etre servi DEUX fois.
+                            # sinon on pourrait etre servi DEUX fois. On
+                            # RENONCE si l'annulation echoue : mieux vaut
+                            # garder une jambe seule que doubler une jambe et
+                            # perdre le verrou (cf. commentaire du chemin
+                            # apporteur).
                             if _leg_autre_c.get("order_id"):
-                                self._cancel_verifie(
-                                    _leg_autre_c["order_id"],
-                                    f" {sym} {slug} {_leg_autre_c.get('side','?')}")
+                                if not self._cancel_verifie(
+                                        _leg_autre_c["order_id"],
+                                        f" {sym} {slug} {_leg_autre_c.get('side','?')}"):
+                                    self._tlog(
+                                        f"makeropen_comp_annul2_{sym}",
+                                        f"⚠️ [MAKER-OUVERT-COMPLETION] {sym} {slug} ordre "
+                                        f"d'origine non annulable -> on renonce a completer",
+                                    )
+                                    continue
+                                _leg_autre_c["order_id"] = None
                             _budget_c = round(_n_comp * _ask_c, 2)
                             with self._order_lock:
                                 _res_c = self._live.snipe_buy_market(
