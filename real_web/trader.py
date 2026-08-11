@@ -1621,6 +1621,7 @@ class MultiTrader:
         self._ultra_future = None
         self._ultra_cooldown = {}
         self._tlog_ts = {}  # throttle des logs repetitifs (cle -> dernier ts)
+        self._md_ts = {}    # throttle de la collecte de marche (cf. _collect_market_data)
         # ── ARB STREAM (Steven 26/07) : callback push quand WS detecte combined <= seuil ──
         self._ws.set_arb_callback(
             self._arb_stream_callback,
@@ -3201,6 +3202,20 @@ class MultiTrader:
                     self._reconcile_open_positions()
                 except Exception as e:
                     self._tlog("fastexit_reconcile_err", f"💥 [FAST-EXIT] reconciliation erreur: {e}")
+                # COLLECTE DE MARCHE INDEPENDANTE DU TRADING (Steven 10/08,
+                # "meme quand bot inactif on doit recup data") : AVANT le
+                # filtre de mode ci-dessous, donc tourne aussi quand tous les
+                # symboles sont a 'off'. Corrige au passage un BIAIS DE
+                # SELECTION majeur du dataset : jusqu'ici les carnets
+                # n'etaient enregistres que depuis la boucle de suivi d'une
+                # position, donc uniquement sur les fenetres ou l'on etait
+                # DEJA entre. Un modele entraine la-dessus ne peut pas
+                # repondre a "faut-il entrer sur cette fenetre ?", puisqu'il
+                # n'a jamais vu une seule fenetre non prise.
+                try:
+                    self._collect_market_data()
+                except Exception as e:
+                    self._tlog("collect_market_err", f"💥 [COLLECTE] erreur: {e}")
                 for sym in SYMBOLS:
                     mode = self.state["modes"].get(sym)
                     # FIX (regression) : limiter au reel privait le PAPER de tout
@@ -4520,9 +4535,85 @@ class MultiTrader:
             )
             return True, base["cost"]
 
+    MARKET_DATA_SYMBOLS = ("BTC", "ETH")
+    MARKET_DATA_INTERVAL_S = 30
+
+    def _collect_market_data(self):
+        """Enregistre le carnet des fenetres EN COURS, que l'on trade ou non
+        (Steven 10/08). Alimente le dataset du futur filtre Go/No-Go avec
+        des fenetres NON prises -- indispensable : un modele qui n'a vu que
+        les fenetres ou l'on est entre ne peut rien dire des autres.
+        Throttle a MARKET_DATA_INTERVAL_S par symbole ; 2 lectures de carnet
+        par symbole et par intervalle, rien d'autre. Aucune decision de
+        trading ne depend de cette fonction."""
+        if not self._live:
+            return
+        now = time.time()
+        for sym in self.MARKET_DATA_SYMBOLS:
+            if now - self._md_ts.get(sym, 0) < self.MARKET_DATA_INTERVAL_S:
+                continue
+            self._md_ts[sym] = now
+            debut = int(now // 300) * 300
+            slug = f"{sym.lower()}-updown-5m-{debut}"
+            meta = self._market_meta(slug)
+            if not meta:
+                continue
+            outcomes, token_ids = meta
+            mk = self.state["markets"].get(sym) or {}
+            for side, tid in zip(outcomes, token_ids):
+                try:
+                    book = self._live.get_book_sync(tid)
+                except Exception:
+                    continue
+                if not book:
+                    continue
+                self._record_book_snapshot(
+                    sym, slug, side, book,
+                    entry_price=None, tp_seuil=None,
+                    hold_s=now - debut, danger=mk.get("danger", 0),
+                    triggered=False, source="veille",
+                )
+        self._save()
+
+    def _cancel_verifie(self, order_id, tag="", essais=3):
+        """Annule un ordre ET VERIFIE qu'il a bien disparu (Steven 10/08,
+        "il n'annulait pas correctement l'ordre de l'autre cote qui etait
+        parfois achete pile au moment du TP").
+
+        PROBLEME CORRIGE : cancel_order() renvoie False sur TOUTE exception
+        (reseau, rejet API, timeout) et ce retour etait IGNORE a chaque
+        appel -- un simple `self._live.cancel_order(oid)`. Un echec
+        silencieux laissait donc l'ordre VIVANT dans le carnet alors qu'on
+        considerait la fenetre terminee (st.pop juste apres) : il pouvait se
+        remplir plusieurs minutes plus tard, sans aucun suivi ni plan de
+        sortie. Ici on reessaie et on relit la liste des ordres ouverts pour
+        confirmer. Retourne True si l'ordre est reellement parti."""
+        if not order_id:
+            return True
+        for i in range(essais):
+            self._live.cancel_order(order_id)
+            try:
+                ouverts = self._live.get_open_orders_list() or []
+                encore = any(
+                    (o.get("id") or o.get("orderID") or o.get("order_id")) == order_id
+                    for o in ouverts
+                )
+            except Exception:
+                return True   # verification impossible : on ne boucle pas a l'aveugle
+            if not encore:
+                return True
+            time.sleep(0.3)
+        self._log(
+            f"⚠️ [ANNULATION-RATEE]{tag} ordre {order_id} TOUJOURS VIVANT apres "
+            f"{essais} tentatives -> s'il se remplit, la reconciliation globale "
+            f"le rattrapera (position retrackee et geree en orpheline)"
+        )
+        return False
+
     BOOK_SNAPSHOT_HISTORY_SIZE = 8000
 
-    def _record_book_snapshot(self, symbol, slug, side, book, entry_price, tp_seuil, hold_s, danger, triggered):
+    def _record_book_snapshot(self, symbol, slug, side, book, entry_price, tp_seuil,
+                              hold_s, danger, triggered, source="position"):
         """Historique brut de carnet pour un futur "gatekeeper" ML (Steven
         08/08) : QUE des features, aucune decision -- l'idee (proposee par
         Steven) est un modele leger (regression logistique/arbre) qui
@@ -4547,7 +4638,13 @@ class MultiTrader:
         hist.append({
             "ts": round(time.time(), 1), "symbol": symbol, "slug": slug, "side": side,
             "hour_utc": hour_utc, "dow": dow, "danger": danger,
-            "entry_price": entry_price, "tp_seuil": round(tp_seuil, 4), "hold_s": round(hold_s, 1),
+            # tp_seuil/entry_price sont None en mode veille (aucune position) --
+            # round() sur None planterait, et le crash serait avale par le
+            # wrapper FAST-EXIT comme celui de la semaine derniere.
+            "entry_price": entry_price,
+            "tp_seuil": round(tp_seuil, 4) if tp_seuil is not None else None,
+            "hold_s": round(hold_s, 1),
+            "source": source,
             "bid_top": bid_top, "ask_top": ask_top,
             "spread": round(ask_top - bid_top, 4) if (bid_top is not None and ask_top is not None) else None,
             "bid_depth_top3": bid_depth, "ask_depth_top3": ask_depth,
@@ -5541,7 +5638,15 @@ class MultiTrader:
                 leg_autre = e[autre_seule]
                 oid_autre = (leg_autre or {}).get("order_id")
                 if oid_autre:
-                    self._live.cancel_order(oid_autre)
+                    # ANNULATION VERIFIEE (Steven 10/08) : etait un
+                    # fire-and-forget dont l'echec passait inapercu -- voir
+                    # _cancel_verifie. C'est LE chemin critique : on s'apprete
+                    # a vendre notre jambe et a oublier la fenetre (st.pop),
+                    # donc un ordre survivant ici n'aurait plus jamais de
+                    # gardien.
+                    self._cancel_verifie(
+                        oid_autre, f" {sym} {slug} {(leg_autre or {}).get('side', '?')}"
+                    )
                 # RE-VERIFICATION (Steven 07/08, "si on a les 2 leg pas de tp") :
                 # entre la decision de prendre le TP et l'annulation qui arrive
                 # REELLEMENT a l'echange, l'autre ordre peut se faire remplir
