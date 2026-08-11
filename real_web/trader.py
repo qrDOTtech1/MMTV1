@@ -5452,7 +5452,14 @@ class MultiTrader:
             # comportement d'avant le TP (attente jusqu'au cutoff habituel,
             # plus bas dans cette meme fonction) -- ni lecture de carnet, ni
             # decision de vente ici.
-            _msf_tp_on = self.state.get("msf_tp_enabled", True)
+            # EXCEPTION MODE CALME (Steven 09/08, "je n'ai vu aucun tp sl") :
+            # ce switch a ete concu pour le TP du mode CROISEMENT (jambe seule
+            # a 0.35 qu'on peut laisser courir jusqu'au cutoff sans drame). En
+            # mode CALME l'entree est directionnelle a 0.65 : sans TP ni SL la
+            # position n'a AUCUNE gestion et va jusqu'a la resolution -- c'est
+            # exactement le "ca fait fondre le compte". Le TP calme ignore donc
+            # le switch ; le SL calme, lui, n'a jamais ete gate par ce switch.
+            _msf_tp_on = bool(self.state.get("msf_tp_enabled", True)) or bool(e.get("calm"))
             _cur = None
             if _msf_tp_on:
                 # PRIX DE DECLENCHEMENT = VRAI BID, PAS _live_price (Steven 07/08).
@@ -5650,6 +5657,21 @@ class MultiTrader:
             if e.get("calm"):
                 _book_sl = self._live.get_book_sync(leg_seule["token_id"])
                 _bid_sl = _book_sl["bids"][0][0] if _book_sl and _book_sl.get("bids") else None
+                # SUIVI VISIBLE (Steven 09/08, "je ne voyais pas non plus de
+                # SL") : sans cette ligne, une position calme sous surveillance
+                # est totalement muette dans le journal tant qu'aucun seuil
+                # n'est franchi -- impossible de distinguer "ca surveille" de
+                # "ca ne tourne pas". Throttle 15s, aucune lecture reseau en
+                # plus (le carnet vient d'etre lu juste au-dessus).
+                if _bid_sl is not None:
+                    _px_in = leg_seule.get("price")
+                    self._tlog(
+                        f"makeropen_calm_suivi_{sym}",
+                        f"👁️ [MAKER-OUVERT-CALME] {sym} {slug} {leg_seule['side']} "
+                        f"entree {_px_in if _px_in is None else f'{_px_in:.3f}'} | "
+                        f"bid {_bid_sl:.3f} | TP {CALM_MSF_TP_PRICE:.2f} | "
+                        f"SL {CALM_MSF_SL_PRICE:.2f} -> sous surveillance",
+                    )
                 if _bid_sl is not None and _bid_sl <= CALM_MSF_SL_PRICE:
                     _n_sl = self._live.position_size(leg_seule["token_id"])
                     _n_sl = round(_n_sl, 2) if _n_sl and _n_sl > 0.01 else 0.0
@@ -6041,8 +6063,21 @@ class MultiTrader:
             f"⏱️ [CHRONO-MSF] {sym} {slug} pose_parallele={_chrono_total_ms}ms "
             f"({' | '.join(_tim_parts)})"
         )
-        if not all(v.get("ok") for v in pose.values()):
-            for v in pose.values():
+        # BUG CRITIQUE CORRIGE (Steven 09/08, "je n'ai vu aucun tp sl") :
+        # pose contient AUSSI pose["calm"] = bool -> iterer sur pose.values()
+        # tombait dessus et faisait .get("ok") sur un booleen ->
+        # "'bool' object has no attribute 'get'". Le crash arrivait APRES
+        # l'envoi reel des ordres mais AVANT `st[slug] = pose` : les ordres
+        # partaient chez Polymarket et le bot les OUBLIAIT instantanement.
+        # Consequences observees en reel : aucune position suivie (donc ni TP
+        # ni SL ne pouvaient tourner), et repose de nouveaux ordres toutes les
+        # ~2s sur la meme fenetre (d'ou les doublons et les prix incoherents
+        # type "0.35 face a 0.65", chaque cycle recalculant son prix).
+        # On n'itere donc plus QUE sur les jambes reelles ("a"/"b"), jamais
+        # sur les cles de metadonnees.
+        _legs_pose = [pose[c] for c in ("a", "b") if isinstance(pose.get(c), dict)]
+        if not all(v.get("ok") for v in _legs_pose):
+            for v in _legs_pose:
                 if v.get("order_id"):
                     self._live.cancel_order(v["order_id"])
             mk.setdefault("makeropen_cooldown", {})[slug] = now + 60
