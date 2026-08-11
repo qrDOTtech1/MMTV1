@@ -4581,10 +4581,20 @@ class MultiTrader:
             mk = self.state["markets"].get(sym) or {}
             for duree, secondes in self.MARKET_DATA_DUREES:
                 cle = f"{sym}:{duree}"
-                # les fenetres longues n'ont pas besoin d'etre echantillonnees
-                # aussi finement : une lecture toutes les 30 s sur une fenetre
-                # de 4 h ne ferait qu'empiler des lignes quasi identiques.
-                pas = self.MARKET_DATA_INTERVAL_S if secondes <= 900 else 300
+                # PAS D'ECHANTILLONNAGE PAR DUREE (Steven 11/08, apres mesure) :
+                # a 30 s sur une fenetre de 5 min, 12% des cotes frolaient le
+                # prix de pose sans qu'on les voie descendre -- l'etiquette
+                # sous-comptait donc les remplissages, et une etiquette bruitee
+                # empeche mecaniquement d'apprendre. On resserre a 10 s la ou
+                # ca compte (5m), on garde large la ou ca ne sert a rien (4h,
+                # ou une lecture toutes les 30 s n'empilerait que des lignes
+                # quasi identiques).
+                if secondes <= 300:
+                    pas = 10
+                elif secondes <= 900:
+                    pas = 30
+                else:
+                    pas = 300
                 if now - self._md_ts.get(cle, 0) < pas:
                     continue
                 self._md_ts[cle] = now

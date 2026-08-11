@@ -1,20 +1,40 @@
 """GATEKEEPER MSF -- apprentissage en mode OMBRE, Python pur.
 
-Prédit, à l'ouverture d'une fenêtre, si elle va CROISER (les deux côtés
-descendre à <= MAKER_OPEN_PRICE, donc verrou possible) ou finir en jambe
-seule. C'est la seule décision qui compte économiquement -- mesuré sur 586
-fenêtres réelles, frais de sortie inclus :
+LA QUESTION POSEE AU MODELE (reformulee le 11/08 apres mesure) :
+
+    >> une jambe vient d'etre servie. L'autre va-t-elle suivre avant la
+       fin de la fenetre, ou va-t-on rester avec une jambe seule ? <<
+
+POURQUOI CETTE QUESTION ET PAS "faut-il poser ?" : poser ne coute RIEN --
+un ordre non servi ne produit aucun evenement on-chain, donc aucun frais
+(verifie). Ce qui coute, c'est d'etre servi d'UN SEUL cote. La decision
+economiquement utile se prend donc au moment du premier remplissage, pas
+a l'ouverture. Mesure sur 586 fenetres reelles, frais de sortie inclus :
     verrou      : +0.300 $/part (garanti)
     jambe seule : -0.249 $/part (moyenne)
-    ne rien poser : 0.00
 
-AUCUNE DÉPENDANCE EXTERNE (ni numpy ni sklearn) : ce module tourne dans le
+La formulation precedente ("cette fenetre va-t-elle croiser ?") a ete
+abandonnee pour deux raisons mesurees, pas theoriques :
+  - a l'ouverture (t<=60s) l'AUC plafonnait a 0.47, soit le hasard ;
+  - en observant plus longtemps l'AUC montait a 0.60, MAIS les
+    caracteristiques encodaient alors une partie de l'etiquette (une
+    marge <= 0 signifie "ce cote a deja touche"), et a t=180s MSF ne peut
+    de toute facon quasiment plus poser. C'etait de la fuite, pas de la
+    prediction.
+
+JEU DE CARACTERISTIQUES VOLONTAIREMENT PETIT : 11 variables sur ~200
+exemples etaient largement sur-parametrees. Mesure a protocole identique :
+complet (11 var.) AUC 0.486 | resserre (4) 0.559 | minimal (2) 0.581.
+On garde le resserre -- meilleur compromis entre pouvoir explicatif et
+sur-ajustement, et on reevaluera quand le volume aura triple.
+
+AUCUNE DEPENDANCE EXTERNE (ni numpy ni sklearn) : ce module tourne dans le
 process du bot de trading, on n'y ajoute pas 200 Mo de librairies pour une
-régression logistique de 40 lignes.
+regression logistique de 40 lignes.
 
-MODE OMBRE STRICT : ce module ne décide RIEN. Il apprend, se note, produit
-une génération numérotée, et s'arrête là. Le branchement éventuel sur les
-décisions de trading est une décision humaine séparée.
+MODE OMBRE STRICT : ce module ne decide RIEN. Il apprend, se note, produit
+une generation numerotee, et s'arrete la. Le branchement eventuel sur les
+decisions de trading est une decision humaine separee.
 """
 import json
 import math
@@ -23,7 +43,6 @@ from collections import defaultdict
 
 PRIX_MSF = 0.35
 FENETRE_S = 300
-DELAI_DECISION_S = 60
 
 GAIN_VERROU = 0.300
 COUT_JAMBE_SEULE = -0.249
@@ -32,11 +51,8 @@ MIN_FENETRES = 300
 MIN_EVENEMENTS = 60
 N_PLIS = 4
 
-FEATURES = [
-    "c0_ask", "c0_bid", "c0_spread", "c0_prof_bid", "c0_prof_ask", "c0_desequilibre",
-    "c1_ask", "c1_bid", "c1_spread", "c1_prof_bid", "c1_prof_ask", "c1_desequilibre",
-    "combine_ask", "heure_utc", "jour_sem", "danger",
-]
+# resserre : bat le jeu complet ET le minimal sur l'echantillon actuel
+FEATURES = ["autre_marge", "autre_delta", "temps_restant", "t_premier_fill"]
 
 
 # ── construction du jeu ────────────────────────────────────────────────────
@@ -48,18 +64,22 @@ def _open_ts(slug):
 
 
 def construire(rows, veille_seulement=True, duree="5m"):
-    """Une ligne par fenêtre : caractéristiques à l'ouverture + étiquette.
+    """Un exemple par fenetre OU une premiere jambe a ete servie.
 
-    `duree` : le modèle est entraîné sur UNE durée à la fois. Toute
-    l'économie ci-dessus (+0.300 / -0.249, prix de pose 0.35, fenêtre de
-    300 s) est mesurée sur les marchés 5 minutes ; mélanger des fenêtres
-    15m ou 4h y injecterait des exemples dont l'étiquette ne veut pas dire
-    la même chose. Les autres durées sont collectées pour être analysées
-    séparément, pas pour nourrir ce modèle-ci."""
+    Caracteristiques : etat du carnet a l'instant EXACT de ce premier
+    remplissage -- toute l'information est disponible a ce moment-la, aucune
+    fuite depuis le futur.
+    Etiquette : l'AUTRE cote finit-il par toucher lui aussi (verrou) ou
+    reste-t-on avec une jambe seule (le cout) ?
+
+    `duree` : le modele est entraine sur UNE duree a la fois. Toute
+    l'economie (+0.300 / -0.249, pose a 0.35, fenetre 300 s) est mesuree
+    sur le 5 minutes ; melanger du 15m ou du 4h y injecterait des exemples
+    dont l'etiquette ne veut pas dire la meme chose."""
     if veille_seulement:
         rows = [r for r in rows if r.get("source") == "veille"]
     if duree:
-        # tolère les relevés d'avant l'ajout du champ (ils sont tous 5m)
+        # tolere les releves d'avant l'ajout du champ (ils sont tous 5m)
         rows = [r for r in rows if r.get("duree", "5m") == duree]
     par_fen = defaultdict(list)
     for r in rows:
@@ -74,38 +94,45 @@ def construire(rows, veille_seulement=True, duree="5m"):
         cotes = sorted({r.get("side") for r in rs if r.get("side")})
         if len(cotes) < 2:
             continue
-        touche = {}
+        # premier instant ou chaque cote passe sous le prix de pose
+        t_touche = {}
         for c in cotes:
-            asks = [r["ask_top"] for r in rs
-                    if r.get("side") == c and r.get("ask_top") is not None
-                    and r.get("ts", 0) <= op + FENETRE_S]
-            touche[c] = bool(asks) and min(asks) <= PRIX_MSF
-        if len(touche) < 2:
-            continue
-        y = 1 if all(touche.values()) else 0
+            t = None
+            for r in rs:
+                if (r.get("side") == c and r.get("ask_top") is not None
+                        and r["ask_top"] <= PRIX_MSF and r.get("ts", 0) <= op + FENETRE_S):
+                    t = r["ts"]
+                    break
+            t_touche[c] = t
+        servis = {c: t for c, t in t_touche.items() if t is not None}
+        if not servis:
+            continue                      # aucune jambe servie : rien a decider
+        c_premier = min(servis, key=lambda c: servis[c])
+        t0 = servis[c_premier]
+        c_autre = [c for c in cotes if c != c_premier][0]
+        t_autre = t_touche.get(c_autre)
+        y = 1 if (t_autre is not None and t_autre >= t0) else 0
 
-        feats, ok = {}, True
-        for i, c in enumerate(cotes[:2]):
-            prem = next((r for r in rs if r.get("side") == c
-                         and r.get("ts", 0) <= op + DELAI_DECISION_S), None)
-            if prem is None:
-                ok = False
-                break
-            p = "c%d" % i
-            feats[p + "_ask"] = prem.get("ask_top")
-            feats[p + "_bid"] = prem.get("bid_top")
-            feats[p + "_spread"] = prem.get("spread")
-            feats[p + "_prof_bid"] = prem.get("bid_depth_top3")
-            feats[p + "_prof_ask"] = prem.get("ask_depth_top3")
-            feats[p + "_desequilibre"] = prem.get("imbalance_bid_pct")
-        if not ok:
+        # etat de l'AUTRE cote au moment du premier remplissage : c'est lui
+        # qu'on attend, donc c'est lui qu'il faut decrire.
+        hist = [r for r in rs if r.get("side") == c_autre and r.get("ts", 0) <= t0
+                and r.get("ask_top") is not None]
+        if not hist:
             continue
-        feats["heure_utc"] = rs[0].get("hour_utc")
-        feats["jour_sem"] = rs[0].get("dow")
-        feats["danger"] = rs[0].get("danger")
-        if feats.get("c0_ask") is not None and feats.get("c1_ask") is not None:
-            feats["combine_ask"] = round(feats["c0_ask"] + feats["c1_ask"], 4)
-        ex.append(dict(symbol=sym, slug=slug, open_ts=op, y=y, **feats))
+        der = hist[-1]
+        ex.append({
+            "symbol": sym, "slug": slug, "open_ts": op, "y": y,
+            "autre_marge": round(der["ask_top"] - PRIX_MSF, 4),
+            "autre_delta": round(der["ask_top"] - hist[0]["ask_top"], 4),
+            "autre_ask": der.get("ask_top"),
+            "autre_spread": der.get("spread"),
+            "autre_prof_ask": der.get("ask_depth_top3"),
+            "autre_desequilibre": der.get("imbalance_bid_pct"),
+            "temps_restant": round(op + FENETRE_S - t0, 1),
+            "t_premier_fill": round(t0 - op, 1),
+            "danger": rs[0].get("danger"),
+            "heure_utc": rs[0].get("hour_utc"),
+        })
     ex.sort(key=lambda e: e["open_ts"])
     return ex
 
