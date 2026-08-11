@@ -869,7 +869,18 @@ MAKER_OPEN_COMPLETION_ENABLED = True
 # A 1.05 on paie 1.05 pour recevoir 1.00, frais compris ~-0.065$/part : moins
 # cher que couper (-0.0735) et bien moins que subir (-0.249).
 MAKER_OPEN_COMPLETION_MAX = 1.05
-MAKER_OPEN_COMPLETION_MIN_HOLD_S = 5    # laisse le carnet se stabiliser
+# ATTENTE AVANT COMPLETION SUPPRIMEE (Steven 12/08). Elle valait 5s pour
+# "laisser le carnet se stabiliser". Mesure on-chain sur 29 paires reelles :
+# AUCUNE n'a ete faite par deux remplissages passifs a 0.35 -- toutes viennent
+# d'un fill passif PUIS d'un achat au marche. La completion n'est donc pas un
+# filet de secours, c'est LE mecanisme qui fabrique la paire. Chaque seconde
+# d'attente est une seconde ou l'autre cote peut fuir : les 3 orphelines du
+# 11/08 sont des marches partis droit ou le combine a franchi le plafond
+# pendant l'attente. Backtest, jambes seules subies TRAIN / TEST :
+#   attente 10s : 30 / 15   net TRAIN +33.51$
+#   attente  5s : 24 / 14   net TRAIN +34.21$   (avant)
+#   attente  0s : 16 / 12   net TRAIN +35.66$   <- retenu, -33% d'orphelines
+MAKER_OPEN_COMPLETION_MIN_HOLD_S = 0
 MAKER_OPEN_COMPLETION_MIN_GAIN = 0.02   # $ : en dessous ca ne vaut pas le risque
 # APPORTEUR D'ABORD (Steven 11/08). Cinq idees d'optimisation backtestees
 # isolement ET combinees ; c'est la SEULE qui ameliore, et elle ameliore
