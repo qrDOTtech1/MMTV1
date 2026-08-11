@@ -845,6 +845,18 @@ MAKER_OPEN_COMPLETION_ENABLED = True
 MAKER_OPEN_COMPLETION_MAX = 0.97
 MAKER_OPEN_COMPLETION_MIN_HOLD_S = 5    # laisse le carnet se stabiliser
 MAKER_OPEN_COMPLETION_MIN_GAIN = 0.02   # $ : en dessous ca ne vaut pas le risque
+# APPORTEUR D'ABORD (Steven 11/08). Cinq idees d'optimisation backtestees
+# isolement ET combinees ; c'est la SEULE qui ameliore, et elle ameliore
+# partout (train et test, les 2 modes de remplissage) :
+#   completion au marche (deployee ce matin) : TEST 8.91% | 24.97 $/j
+#   completion apporteur d'abord, 60s        : TEST 9.79% | 27.45 $/j
+# Sur 63 completions, 59 finissent servies en apporteur -> zero frais.
+# Les 4 autres idees ont ete REJETEES par la mesure : seuil adaptatif au
+# temps restant (8.81% max), completion partielle (degrade de facon
+# monotone : 40% -> 3.81%, 80% -> 7.40%, 100% -> 8.91%, donc le verrou
+# garanti vaut mieux que l'esperance du TP), prix adaptatif (7.71%), et
+# TOUTES les combinaisons degradent I1 seule (I1+I2 9.46% < I1 9.79%).
+MAKER_OPEN_COMPLETION_MAKER_S = 60      # 0 = desactive, achat direct au marche
 MAKER_OPEN_MIN_REMAIN_S = 120     # sous 2 min restantes, trop tard pour etre servi
 MAKER_OPEN_CANCEL_BEFORE_S = 45   # a T-45s : on annule et on solde une jambe seule
 # TP SUR JAMBE SEULE (Steven 07/08, "utiliser signal quand on tient 1 leg et
@@ -5715,6 +5727,66 @@ class MultiTrader:
             # sur MSF -- verifie.
             _autre_c = "b" if cote_seule == "a" else "a"
             _leg_autre_c = e.get(_autre_c) or {}
+
+            # ── SUIVI D'UNE COMPLETION DEJA POSTEE EN MAKER (Steven 11/08) ──
+            # Backteste isolement contre 4 autres idees : c'est la SEULE qui
+            # ameliore (TEST sell 8.91% -> 9.79%, 24.97 -> 27.45 $/j), et elle
+            # ameliore dans les 2 modes de remplissage ET en train comme en
+            # test. Mecanisme evident : la 2e jambe achetee en apporteur ne
+            # paie AUCUN frais, la meme achetee au marche paie ~5% de
+            # min(p,1-p). Sur 63 completions, 59 finissent servies en maker.
+            if leg_seule.get("comp_maker_oid"):
+                _n_autre_m = self._live.position_size(_leg_autre_c.get("token_id"))
+                if _n_autre_m and _n_autre_m > 0.01:
+                    # servie en APPORTEUR -> zero frais, c'est le cas ideal
+                    _n_notre_m = self._live.position_size(leg_seule["token_id"])
+                    _n_notre_m = round(_n_notre_m, 2) if _n_notre_m and _n_notre_m > 0.01 else 0.0
+                    _px_m = leg_seule.get("comp_maker_px", 0.0)
+                    self._log(
+                        f"💚 [MAKER-OUVERT-COMPLETION-MAKER] {sym} {slug} 2e jambe "
+                        f"{_leg_autre_c['side']} servie a {_px_m:.3f} EN APPORTEUR "
+                        f"(zero frais) -> verrou {leg_seule['price'] + _px_m:.3f}"
+                    )
+                    for _cote, _n, _px in ((cote_seule, _n_notre_m, leg_seule["price"]),
+                                           (_autre_c, round(_n_autre_m, 2), _px_m)):
+                        _lg = e[_cote]
+                        mk["open"][f"{slug}|{_lg['side']}"] = {
+                            "symbol": sym, "slug": slug, "side": _lg["side"],
+                            "mode": "real", "strat": "bothside", "maker_open": True,
+                            "token_id": _lg["token_id"], "entry_price": _px,
+                            "filled_shares": round(_n, 2), "cost": round(_n * _px, 2),
+                            "start_ts": e.get("debut_ts"), "pair": None,
+                            "end_ts": e.get("fin_ts"), "opened_ts": now, "buffer": 0.0,
+                        }
+                        self._add_slug_spent(mk, slug, round(_n * _px, 2))
+                    self._tag_pair_lock(
+                        mk["open"].get(f"{slug}|{leg_seule['side']}"),
+                        mk["open"].get(f"{slug}|{_leg_autre_c['side']}"),
+                        leg_seule["price"] + _px_m,
+                        tag=f" {sym} {slug} MAKER-OUVERT-COMPLETION-MAKER")
+                    self._maker_open_record(
+                        sym, slug, "les_deux",
+                        combine=round(leg_seule["price"] + _px_m, 4),
+                        parts=round(min(_n_notre_m, _n_autre_m), 2),
+                        prix=leg_seule["price"], exec_mode="completion_maker")
+                    mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                    st.pop(slug, None)
+                    self._save()
+                    continue
+                _att = now - leg_seule.get("comp_maker_ts", now)
+                if _att < MAKER_OPEN_COMPLETION_MAKER_S and reste > MAKER_OPEN_CANCEL_BEFORE_S:
+                    continue          # on laisse encore sa chance a l'apporteur
+                # delai epuise -> on annule et on repasse en agressif plus bas
+                self._cancel_verifie(leg_seule["comp_maker_oid"],
+                                     f" {sym} {slug} completion-maker")
+                self._tlog(
+                    f"makeropen_comp_repli_{sym}",
+                    f"⏱️ [MAKER-OUVERT-COMPLETION] {sym} {slug} non servie en apporteur "
+                    f"apres {_att:.0f}s -> repli sur l'achat au marche",
+                )
+                for _k in ("comp_maker_oid", "comp_maker_px", "comp_maker_ts"):
+                    leg_seule.pop(_k, None)
+
             if (MAKER_OPEN_COMPLETION_ENABLED and leg_seule.get("price") is not None
                     and _leg_autre_c.get("token_id")
                     and not leg_seule.get("tp_passif_order_id")
@@ -5724,6 +5796,34 @@ class MultiTrader:
                 _n_comp = round(_n_comp, 2) if _n_comp and _n_comp > 0.01 else 0.0
                 _bk_c = self._live.get_book_sync(_leg_autre_c["token_id"])
                 _ask_c = _bk_c["asks"][0][0] if _bk_c and _bk_c.get("asks") else None
+                _bid_c = _bk_c["bids"][0][0] if _bk_c and _bk_c.get("bids") else None
+
+                # TENTATIVE APPORTEUR D'ABORD : on poste au meilleur bid (donc
+                # sans franchir le carnet, donc maker garanti) et on laisse
+                # MAKER_OPEN_COMPLETION_MAKER_S a un vendeur pour nous croiser.
+                # Le combine y est MEILLEUR qu'au marche (bid < ask) en plus
+                # d'etre sans frais.
+                if (MAKER_OPEN_COMPLETION_MAKER_S and _n_comp >= 0.01
+                        and _bid_c is not None
+                        and not leg_seule.get("comp_maker_tente")):
+                    _comb_m = leg_seule["price"] + _bid_c
+                    if _comb_m <= MAKER_OPEN_COMPLETION_MAX:
+                        _r_m = self._live.post_limit_buy(
+                            _leg_autre_c["token_id"], round(_bid_c, 2), round(_n_comp, 2))
+                        if _r_m.get("success") and _r_m.get("order_id"):
+                            leg_seule["comp_maker_oid"] = _r_m["order_id"]
+                            leg_seule["comp_maker_px"] = round(_bid_c, 2)
+                            leg_seule["comp_maker_ts"] = now
+                            leg_seule["comp_maker_tente"] = True
+                            self._log(
+                                f"📮 [MAKER-OUVERT-COMPLETION] {sym} {slug} 2e jambe "
+                                f"{_leg_autre_c['side']} postee EN APPORTEUR a {_bid_c:.3f} "
+                                f"(combine {_comb_m:.3f}, zero frais si servie) -- "
+                                f"repli au marche dans {MAKER_OPEN_COMPLETION_MAKER_S}s"
+                            )
+                            self._save()
+                            continue
+
                 if _n_comp >= 0.01 and _ask_c is not None:
                     _comb_c = leg_seule["price"] + _ask_c
                     if _comb_c <= MAKER_OPEN_COMPLETION_MAX:
