@@ -875,7 +875,31 @@ MAKER_OPEN_BUDGET_MAX = 40.0
 # jambe qui decroche (CALM_MSF_SL_PRICE) au lieu d'attendre le cutoff. Toggle
 # ACTIVE PAR DEFAUT au push (Steven 09/08, "le msf calm mode doit etre active
 # au push sur git") + auto-stop apres 20 trades si ROI < 0.
-CALM_MSF_ENABLED = True
+# COUPE APRES MESURE (Steven 09/08). Le mecanisme reste entierement en place
+# et rallumable en repassant ce drapeau a True, mais le backtest le refute
+# dans TOUTES les configurations testees (190 fenetres BTC calmes, proxy
+# danger<30, frais de sortie inclus) :
+#   entree 0.65 maker (deploye)      : ROI -10.2%   (24 TP contre 25 SL)
+#   entree au bid du favori          : ROI -13.6%
+#   entree taker au prix marche      : ROI  -8.1%
+#   5 autres couples TP/SL           : ROI -9.3% a -15.8%
+#   TP "intelligent" (trailing x9)   : ROI -12.4% a -15.4%
+#   trailing + "pres du strike"      : ROI -9.8% a -13.0%
+# CAUSE RACINE : le marche est efficient sur ces fenetres. Acheter le favori
+# et tenir donne un taux de reussite qui COLLE au prix paye a moins de 2
+# points, a tous les seuils (0.55 -> 65.0% reussi pour 66.1% requis ; 0.65 ->
+# 71.6% pour 72.0% requis). Il n'y a pas d'edge directionnel a capter, et les
+# frais de sortie font basculer le reste en negatif.
+# DEUX CONSTATS UTILES AU PASSAGE :
+#   - le SL fait plus de mal que de bien ici : SL 0.40 -> -13.6%, aucun SL
+#     -> -5.6% (il verrouille des creux qui se seraient repris) ;
+#   - le filtre danger PROTEGE mais ne rapporte pas : en marche agite le
+#     favori ne gagne que 51.6% du temps pour 64.6% requis (-20%), en calme
+#     il revient juste a l'equilibre-moins-les-frais.
+# Sur EXACTEMENT les memes fenetres calmes, le MSF de base (0.35 des 2 cotes)
+# fait -3.3% (conservateur) a +1.3% (optimiste) -- mieux que chaque variante
+# calme, et sans dependre d'avoir raison sur la direction.
+CALM_MSF_ENABLED = False
 CALM_MSF_DANGER_MAX = 30           # danger_score < ce seuil -> mode calme
 CALM_MSF_PRICE = 0.65              # prix de pose en mode calme, PLAFOND (le gagnant)
 CALM_MSF_ADAPT_FLOOR = 0.35        # plancher adaptatif : jamais plus bas, sinon on rachete le perdant bradé
