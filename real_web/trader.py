@@ -842,7 +842,19 @@ MAKER_OPEN_MAX_COMBINED = 0.94    # garde-fou : au-dela on ne pose pas
 # Seuil a 0.97 et non 1.00 : au-dela la marge brute ne couvre plus les frais
 # taker de la 2e jambe. MIN_GAIN garde une marge de securite absolue.
 MAKER_OPEN_COMPLETION_ENABLED = True
-MAKER_OPEN_COMPLETION_MAX = 0.97
+# PLAFOND RELEVE A 0.99 (Steven 11/08, "on devrait tout le temps en avoir").
+# Le 0.97 avait ete cale sur le chemin AU MARCHE, qui paie ~5% de frais. Or
+# 59 completions sur 63 partent en APPORTEUR, et l'apporteur ne paie RIEN :
+# il reste rentable jusqu'a un combine proche de 1.00. Le plafond bridait
+# donc le bon chemin pour proteger le mauvais.
+# Backteste (train ET test, remplissage conservateur) :
+#   0.97 -> TRAIN 12.59% | TEST  9.79% (27.45 $/j) | 59 apporteur, 53 cutoffs
+#   0.99 -> TRAIN 13.20% | TEST 10.05% (29.00 $/j) | 62 apporteur, 48 cutoffs
+#   1.00 -> TRAIN 12.96% | TEST  9.84% -- au-dela on repasse sous 0.99
+# Aucun risque d'ouvrir des completions perdantes AU MARCHE : le controle de
+# gain APRES frais (MIN_GAIN) coupe ce chemin de lui-meme des 0.98
+# (combine 0.98 -> net +0.011$ sur 10 parts, sous le seuil de 0.02$).
+MAKER_OPEN_COMPLETION_MAX = 0.99
 MAKER_OPEN_COMPLETION_MIN_HOLD_S = 5    # laisse le carnet se stabiliser
 MAKER_OPEN_COMPLETION_MIN_GAIN = 0.02   # $ : en dessous ca ne vaut pas le risque
 # APPORTEUR D'ABORD (Steven 11/08). Cinq idees d'optimisation backtestees
@@ -5807,7 +5819,13 @@ class MultiTrader:
                         and _bid_c is not None
                         and not leg_seule.get("comp_maker_tente")):
                     _comb_m = leg_seule["price"] + _bid_c
-                    if _comb_m <= MAKER_OPEN_COMPLETION_MAX:
+                    # meme controle de gain que le chemin au marche, par
+                    # symetrie : l'apporteur ne paie pas de frais, mais un
+                    # combine tres proche de 1.00 sur une petite position ne
+                    # vaut pas la peine d'immobiliser du capital.
+                    _gain_m = _n_comp * (1 - _comb_m)
+                    if (_comb_m <= MAKER_OPEN_COMPLETION_MAX
+                            and _gain_m > MAKER_OPEN_COMPLETION_MIN_GAIN):
                         # ANNULER D'ABORD L'ORDRE D'ORIGINE DE CE COTE
                         # (Steven 11/08, trouve sur la 1re completion reelle).
                         # Sans ca DEUX achats restent vivants sur la meme
