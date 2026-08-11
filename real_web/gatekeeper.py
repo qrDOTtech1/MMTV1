@@ -47,10 +47,20 @@ def _open_ts(slug):
         return None
 
 
-def construire(rows, veille_seulement=True):
-    """Une ligne par fenêtre : caractéristiques à l'ouverture + étiquette."""
+def construire(rows, veille_seulement=True, duree="5m"):
+    """Une ligne par fenêtre : caractéristiques à l'ouverture + étiquette.
+
+    `duree` : le modèle est entraîné sur UNE durée à la fois. Toute
+    l'économie ci-dessus (+0.300 / -0.249, prix de pose 0.35, fenêtre de
+    300 s) est mesurée sur les marchés 5 minutes ; mélanger des fenêtres
+    15m ou 4h y injecterait des exemples dont l'étiquette ne veut pas dire
+    la même chose. Les autres durées sont collectées pour être analysées
+    séparément, pas pour nourrir ce modèle-ci."""
     if veille_seulement:
         rows = [r for r in rows if r.get("source") == "veille"]
+    if duree:
+        # tolère les relevés d'avant l'ajout du champ (ils sont tous 5m)
+        rows = [r for r in rows if r.get("duree", "5m") == duree]
     par_fen = defaultdict(list)
     for r in rows:
         op = _open_ts(r.get("slug"))

@@ -4554,6 +4554,17 @@ class MultiTrader:
     # de comparer les marches entre eux pour savoir ou MSF travaille le mieux.
     MARKET_DATA_SYMBOLS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB")
     MARKET_DATA_INTERVAL_S = 30
+    # DUREES COLLECTEES (Steven 11/08, "s'interesser aux marches 15min/1h/1j").
+    # Verifie sur l'API Gamma : les 6 cryptos ont bien des series 5m, 15m ET
+    # 4h, toutes avec le MEME format de slug horodate (<sym>-updown-<duree>-<ts>),
+    # donc adressables sans deviner. (nom_duree, secondes).
+    #   5m  -> resolution Chainlink TWAP 30s
+    #   15m -> resolution Chainlink TWAP 60s
+    #   4h  -> resolution Chainlink TWAP 60s
+    # Les series "hourly" et "daily" existent aussi mais utilisent un slug en
+    # DATE LISIBLE (bitcoin-up-or-down-august-11-2026-11am-et) et resolvent
+    # sur BINANCE, pas Chainlink : autre regime, non couvert ici.
+    MARKET_DATA_DUREES = (("5m", 300), ("15m", 900), ("4h", 14400))
 
     def _collect_market_data(self):
         """Enregistre le carnet des fenetres EN COURS, que l'on trade ou non
@@ -4567,29 +4578,35 @@ class MultiTrader:
             return
         now = time.time()
         for sym in self.MARKET_DATA_SYMBOLS:
-            if now - self._md_ts.get(sym, 0) < self.MARKET_DATA_INTERVAL_S:
-                continue
-            self._md_ts[sym] = now
-            debut = int(now // 300) * 300
-            slug = f"{sym.lower()}-updown-5m-{debut}"
-            meta = self._market_meta(slug)
-            if not meta:
-                continue
-            outcomes, token_ids = meta
             mk = self.state["markets"].get(sym) or {}
-            for side, tid in zip(outcomes, token_ids):
-                try:
-                    book = self._live.get_book_sync(tid)
-                except Exception:
+            for duree, secondes in self.MARKET_DATA_DUREES:
+                cle = f"{sym}:{duree}"
+                # les fenetres longues n'ont pas besoin d'etre echantillonnees
+                # aussi finement : une lecture toutes les 30 s sur une fenetre
+                # de 4 h ne ferait qu'empiler des lignes quasi identiques.
+                pas = self.MARKET_DATA_INTERVAL_S if secondes <= 900 else 300
+                if now - self._md_ts.get(cle, 0) < pas:
                     continue
-                if not book:
+                self._md_ts[cle] = now
+                debut = int(now // secondes) * secondes
+                slug = f"{sym.lower()}-updown-{duree}-{debut}"
+                meta = self._market_meta(slug)
+                if not meta:
                     continue
-                self._record_book_snapshot(
-                    sym, slug, side, book,
-                    entry_price=None, tp_seuil=None,
-                    hold_s=now - debut, danger=mk.get("danger", 0),
-                    triggered=False, source="veille",
-                )
+                outcomes, token_ids = meta
+                for side, tid in zip(outcomes, token_ids):
+                    try:
+                        book = self._live.get_book_sync(tid)
+                    except Exception:
+                        continue
+                    if not book:
+                        continue
+                    self._record_book_snapshot(
+                        sym, slug, side, book,
+                        entry_price=None, tp_seuil=None,
+                        hold_s=now - debut, danger=mk.get("danger", 0),
+                        triggered=False, source="veille", duree=duree,
+                    )
         self._save()
 
     GATEKEEPER_INTERVAL_S = 3600      # une generation par heure
@@ -4724,7 +4741,7 @@ class MultiTrader:
     BOOK_SNAPSHOT_HISTORY_SIZE = 8000
 
     def _record_book_snapshot(self, symbol, slug, side, book, entry_price, tp_seuil,
-                              hold_s, danger, triggered, source="position"):
+                              hold_s, danger, triggered, source="position", duree="5m"):
         """Historique brut de carnet pour un futur "gatekeeper" ML (Steven
         08/08) : QUE des features, aucune decision -- l'idee (proposee par
         Steven) est un modele leger (regression logistique/arbre) qui
@@ -4755,6 +4772,9 @@ class MultiTrader:
             "tp_seuil": round(tp_seuil, 4) if tp_seuil is not None else None,
             "hold_s": round(hold_s, 1),
             "source": source,
+            # duree de la fenetre : permet de separer les jeux 5m / 15m / 4h
+            # a l'analyse (les economies de MSF sont calibrees sur 5m).
+            "duree": duree,
             "bid_top": bid_top, "ask_top": ask_top,
             "spread": round(ask_top - bid_top, 4) if (bid_top is not None and ask_top is not None) else None,
             "bid_depth_top3": bid_depth, "ask_depth_top3": ask_depth,
