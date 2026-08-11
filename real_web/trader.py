@@ -2535,7 +2535,8 @@ class MultiTrader:
             return 0.0
         return (POLY_FEE_RATE + POLY_FEE_SAFETY) * min(p, 1 - p) * n
 
-    def _pair_net_after_fees(self, px_a, sh_a, px_b, sh_b):
+    def _pair_net_after_fees(self, px_a, sh_a, px_b, sh_b,
+                             maker_a=False, maker_b=False):
         """Gain net GARANTI d'une paire, FRAIS INCLUS.
 
         C'est le seul critere qui compte : le payout du pire cas est
@@ -2543,14 +2544,24 @@ class MultiTrader:
         Sans ca, le bot loggait "gain garanti +0.09$" sur une paire qui
         perdait 0.07$ une fois les frais payes (constate on-chain le 06/08 :
         DOGE 4.65 parts a 0.430 + 4.65 a 0.550, annonce 4.56$ de cout, reel
-        4.72$)."""
+        4.72$).
+
+        maker_a / maker_b (Steven 11/08) : une jambe servie en APPORTEUR ne
+        paie AUCUN frais. Les compter comme preneuses sous-estime la marge
+        et fait declarer "PAS un arb" des paires reellement verrouillees.
+        Constate en direct sur btc-updown-5m-1786479900 : 6.77 parts a
+        0.35 + 0.63, les DEUX servies en apporteur -> brut +0.135$, donc un
+        vrai verrou ; le bot a compte 0.249$ de frais jamais payes, conclu
+        "manque 0.11$", laisse TP/SL actifs, et le TP a alors demonte la
+        paire jambe par jambe jusqu'a 1.7 contre 5.1 parts -- fabriquant de
+        toutes pieces le desequilibre qu'il fallait eviter."""
         try:
             payout = min(float(sh_a), float(sh_b))
         except (TypeError, ValueError):
             return -999.0
         cout = (
-            float(px_a) * float(sh_a) + self._poly_fee(px_a, sh_a)
-            + float(px_b) * float(sh_b) + self._poly_fee(px_b, sh_b)
+            float(px_a) * float(sh_a) + (0.0 if maker_a else self._poly_fee(px_a, sh_a))
+            + float(px_b) * float(sh_b) + (0.0 if maker_b else self._poly_fee(px_b, sh_b))
         )
         return round(payout - cout, 4)
 
@@ -2625,6 +2636,8 @@ class MultiTrader:
         margin = self._pair_net_after_fees(
             pos_a.get("entry_price"), _eff_a,
             pos_b.get("entry_price"), _eff_b,
+            maker_a=bool(pos_a.get("maker_fill")),
+            maker_b=bool(pos_b.get("maker_fill")),
         )
         locked = margin > 0
         for _p in (pos_a, pos_b):
@@ -3298,6 +3311,19 @@ class MultiTrader:
                         self._manage_orphans(sym)
                     except Exception as e:
                         self._tlog(f"fastexit_orphan_err_{sym}", f"💥 [FAST-EXIT] {sym} orphans erreur: {e}")
+                    # SOLDE DE L'EXCEDENT NON COUVERT (Steven 11/08). AVANT le
+                    # TP par paliers : si une paire est desequilibree, la part
+                    # en trop est un pari nu qu'il faut solder avant toute
+                    # autre decision. _tag_pair_lock la MARQUE deja
+                    # (excedent_a_solder) et _guard_both_side sait la vendre --
+                    # mais cette fonction n'etait APPELEE NULLE PART, donc le
+                    # bot ecrivait "1.00 parts en trop, a solder" et ne le
+                    # faisait jamais. Verifie par recherche exhaustive : seule
+                    # sa definition existait.
+                    try:
+                        self._solder_excedent(sym)
+                    except Exception as e:
+                        self._tlog(f"fastexit_exc_err_{sym}", f"💥 [FAST-EXIT] {sym} excedent erreur: {e}")
                     try:
                         self._manage_pnl_tier_exits(sym)
                     except Exception as e:
@@ -5666,6 +5692,9 @@ class MultiTrader:
                         # _manage_pnl_tier_exits sous peine de perdre toute
                         # gestion TP/SL. On marque l'origine a cote.
                         "strat": "bothside", "maker_open": True,
+                        # les 2 jambes viennent d'ordres PASSIFS -> apporteur,
+                        # zero frais (cf. _pair_net_after_fees)
+                        "maker_fill": True,
                         "token_id": leg["token_id"], "entry_price": leg["price"],
                         "filled_shares": round(n, 2),
                         "cost": round(n * leg["price"], 2),
@@ -5765,6 +5794,8 @@ class MultiTrader:
                         mk["open"][f"{slug}|{_lg['side']}"] = {
                             "symbol": sym, "slug": slug, "side": _lg["side"],
                             "mode": "real", "strat": "bothside", "maker_open": True,
+                            # pose initiale ET completion servies en apporteur
+                            "maker_fill": True,
                             "token_id": _lg["token_id"], "entry_price": _px,
                             "filled_shares": round(_n, 2), "cost": round(_n * _px, 2),
                             "start_ts": e.get("debut_ts"), "pair": None,
@@ -5915,6 +5946,9 @@ class MultiTrader:
                                     mk["open"][f"{slug}|{_lg['side']}"] = {
                                         "symbol": sym, "slug": slug, "side": _lg["side"],
                                         "mode": "real", "strat": "bothside", "maker_open": True,
+                                        # notre pose initiale est apporteur ; la
+                                        # completion achetee au marche est preneuse
+                                        "maker_fill": (_cote == cote_seule),
                                         "token_id": _lg["token_id"], "entry_price": _px,
                                         "filled_shares": round(_n, 2),
                                         "cost": round(_n * _px, 2),
@@ -11428,6 +11462,52 @@ class MultiTrader:
                 f"💹 [PRIX]{tag} {sym} {pos['slug']} {pos['side']} {cur:.3f} "
                 f"(entree {entry:.3f}, {pnl_pct:+.1f}%)"
             )
+
+    def _solder_excedent(self, sym):
+        """Vend UNIQUEMENT les parts en trop d'une paire desequilibree.
+
+        Extrait de _guard_both_side, qui n'etait appelee nulle part (code
+        mort verifie par recherche exhaustive). On ne reprend QUE cette
+        partie : le stop-loss par jambe que contient aussi cette fonction
+        reste eteint -- mesure cette semaine, un SL sur MSF casse plus de
+        verrous qu'il n'evite de pertes.
+
+        Pourquoi c'est sur : sur une paire equilibree l'excedent vaut 0 et
+        rien n'est vendu. Sur une paire desequilibree, l'excedent n'est
+        couvert par RIEN (le gagnant paie 1$ par PART, donc seul min(parts)
+        est protege) -- le vendre ameliore toujours le pire cas, que
+        l'excedent soit du cote gagnant ou perdant. Verifie sur le cas reel
+        7.69 contre 3.35 parts : pire cas 3.35$ -> 3.78$, sans jamais rien
+        risquer. Couper la jambe perdante ENTIERE, en revanche, ferait
+        tomber ce pire cas a 0.77$ -- c'est pour ca qu'on ne touche jamais a
+        la partie appariee."""
+        mk = self.state["markets"].get(sym) or {}
+        for key, pos in list(mk.get("open", {}).items()):
+            if not pos or pos.get("strat") != "bothside":
+                continue
+            _exc = pos.get("excedent_a_solder") or 0
+            if _exc < MIN_SELL_SHARES:
+                continue
+            _n = round(min(_exc, pos.get("filled_shares") or 0), 2)
+            if _n < MIN_SELL_SHARES:
+                pos["excedent_a_solder"] = 0
+                continue
+            slug = pos.get("slug")
+            _v = self._sell_orphan(
+                pos["token_id"], _n,
+                f" {sym} {slug} {pos.get('side')} EXCEDENT-NON-COUVERT",
+                entry_price=pos.get("entry_price"), symbol=sym, slug=slug,
+                side=pos.get("side"),
+            )
+            if _v > 0:
+                pos["filled_shares"] = round((pos.get("filled_shares") or 0) - _v, 2)
+                pos["cost"] = round((pos.get("cost") or 0) - _v * (pos.get("entry_price") or 0), 2)
+                self._log(
+                    f"⚖️ [EXCEDENT-SOLDE] {sym} {slug} {pos.get('side')} {_v:.2f} parts "
+                    f"en trop vendues -> la paire revient a des parts egales"
+                )
+            pos["excedent_a_solder"] = round(max(0.0, _exc - _v), 2)
+            self._save()
 
     def _guard_both_side(self, sym):
         """SL PAR JAMBE (Steven 22/07, scalp simultane "en sl et gard pos
