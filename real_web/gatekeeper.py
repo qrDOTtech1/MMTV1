@@ -46,6 +46,22 @@ FENETRE_S = 300
 
 GAIN_VERROU = 0.300
 COUT_JAMBE_SEULE = -0.249
+# COUT REEL DE COUPER TOUT DE SUITE (Steven 11/08). Mesure sur 324 jambes
+# seules reelles (tapes historiques, frais taker inclus) : vendre des le
+# remplissage coute -0.0735 $/part en moyenne (mediane -0.065).
+# CORRECTION MAJEURE : l'evaluation attribuait 0.00 a cette action, ce qui
+# rendait l'abstention gratuite et faussait TOUTES les comparaisons -- un
+# filtre qui coupait au hasard paraissait excellent. Ici la jambe est DEJA
+# servie : ne rien faire n'existe pas, il faut choisir entre attendre et
+# sortir, et les deux ont un cout.
+COUT_COUPE_IMMEDIATE = -0.0735
+# Point d'indifference : attendre vaut mieux que couper tant que
+#   p*0.300 + (1-p)*(-0.249) > -0.0735  soit  p > 0.320.
+# Le taux de base mesure est 37.6% -> attendre est le bon defaut, et le
+# modele n'a de valeur que s'il sait reperer les cas sous 32%.
+#   p*G + (1-p)*C_solo > C_coupe  <=>  p > (C_coupe - C_solo) / (G - C_solo)
+SEUIL_INDIFFERENCE = round((COUT_COUPE_IMMEDIATE - COUT_JAMBE_SEULE)
+                           / (GAIN_VERROU - COUT_JAMBE_SEULE), 4)
 
 MIN_FENETRES = 300
 MIN_EVENEMENTS = 60
@@ -227,13 +243,17 @@ def _pseudo_alea(graine, n):
 
 
 def gain(y, decision):
-    """$/fenêtre d'une politique. decision=1 -> on pose, 0 -> on s'abstient."""
+    """$/cas d'une politique, la jambe etant DEJA servie.
+    decision=1 -> on ATTEND l'autre jambe ; 0 -> on COUPE tout de suite.
+    Les deux ont un cout : ne rien faire n'existe pas a ce stade."""
     if not y:
         return 0.0
     t = 0.0
     for yi, d in zip(y, decision):
         if d:
             t += GAIN_VERROU if yi == 1 else COUT_JAMBE_SEULE
+        else:
+            t += COUT_COUPE_IMMEDIATE
     return t / len(y)
 
 
@@ -279,7 +299,10 @@ def evalue(X, y, n_plis=N_PLIS):
         res.append({
             "pli": k, "n_test": len(yte), "auc": auc(yte, pte), "seuil": round(best_s, 2),
             "gain_filtre": round(gain(yte, dec), 4),
+            # les deux politiques simples : tout attendre (comportement
+            # actuel du bot) et tout couper. Le modele doit battre LES DEUX.
             "gain_sans": round(gain(yte, [1] * len(yte)), 4),
+            "gain_coupe_tout": round(gain(yte, [0] * len(yte)), 4),
             "gain_alea": round(sum(temoin) / len(temoin), 4),
             "part_posee": round(part, 3),
         })
@@ -328,15 +351,23 @@ def cycle(rows, generation, force=False):
     out["gain_filtre"] = round(sum(r["gain_filtre"] for r in res) / nb, 4)
     out["gain_sans"] = round(sum(r["gain_sans"] for r in res) / nb, 4)
     out["gain_alea"] = round(sum(r["gain_alea"] for r in res) / nb, 4)
+    out["gain_coupe_tout"] = round(sum(r["gain_coupe_tout"] for r in res) / nb, 4)
+    out["seuil_indifference"] = SEUIL_INDIFFERENCE
     # VERDICT EXIGEANT (corrige apres un faux positif en recette) : il ne
     # suffit pas de battre "poser sur tout" -- quand le taux de croisement
     # est sous le point mort, s'abstenir au hasard y suffit deja. Le modele
     # doit battre le TEMOIN ALEATOIRE de meme volume, gagner de l'argent
     # dans l'absolu, et discriminer reellement (AUC).
+    # Le modele doit battre TOUTES les politiques simples : attendre a chaque
+    # fois (comportement actuel), couper a chaque fois, et couper au hasard
+    # du meme volume. Plus une AUC qui prouve une vraie discrimination.
+    # On NE demande plus gain>0 dans l'absolu : la jambe est deja servie,
+    # toutes les issues sont couteuses -- exiger un gain positif reviendrait
+    # a exiger l'impossible. Ce qui compte est de PERDRE MOINS.
     out["verdict"] = "gain" if (
         out["gain_filtre"] > out["gain_alea"]
         and out["gain_filtre"] > out["gain_sans"]
-        and out["gain_filtre"] > 0
+        and out["gain_filtre"] > out["gain_coupe_tout"]
         and (out["auc_moyen"] or 0) >= 0.55
     ) else "pas_de_gain"
     # le modèle final est ré-entraîné sur TOUT, mais n'est utilisé par
