@@ -831,6 +831,20 @@ MAKER_OPEN_ADAPT_DISCOUNT = 0.12  # marge sous l'ask quand il est deja < MAKER_O
 # finit avec SEULEMENT la jambe perdante, l'inverse d'un verrou.
 MAKER_OPEN_ADAPT_FLOOR = DEAD_MARKET_THRESHOLD  # jamais sous le seuil "marche mort"
 MAKER_OPEN_MAX_COMBINED = 0.94    # garde-fou : au-dela on ne pose pas
+# ── COMPLETION ACTIVE DE LA JAMBE SEULE (Steven 11/08) ─────────────────
+# La jambe seule coute -0.249 $/part en esperance : c'est LE poste de perte
+# de MSF. Des que l'autre cote redevient assez bon marche pour que le verrou
+# reste rentable, on l'achete au marche -> perte esperee transformee en gain
+# garanti. Backteste (vrais prix imprimes, frais taker sur la 2e jambe) :
+#   MSF actuel            TRAIN +1.59 $/j | TEST -1.67 $/j
+#   + completion <= 0.97  TRAIN +6.79 $/j | TEST +24.97 $/j
+# 185 completions sur 586 fenetres, ZERO perdante, mediane +0.027 $/part.
+# Seuil a 0.97 et non 1.00 : au-dela la marge brute ne couvre plus les frais
+# taker de la 2e jambe. MIN_GAIN garde une marge de securite absolue.
+MAKER_OPEN_COMPLETION_ENABLED = True
+MAKER_OPEN_COMPLETION_MAX = 0.97
+MAKER_OPEN_COMPLETION_MIN_HOLD_S = 5    # laisse le carnet se stabiliser
+MAKER_OPEN_COMPLETION_MIN_GAIN = 0.02   # $ : en dessous ca ne vaut pas le risque
 MAKER_OPEN_MIN_REMAIN_S = 120     # sous 2 min restantes, trop tard pour etre servi
 MAKER_OPEN_CANCEL_BEFORE_S = 45   # a T-45s : on annule et on solde une jambe seule
 # TP SUR JAMBE SEULE (Steven 07/08, "utiliser signal quand on tient 1 leg et
@@ -5679,6 +5693,95 @@ class MultiTrader:
             if "fill_ts" not in leg_seule:
                 leg_seule["fill_ts"] = now
             _hold_s = now - leg_seule["fill_ts"]
+
+            # ── COMPLETION ACTIVE DE LA JAMBE SEULE (Steven 11/08) ──────────
+            # La jambe seule est LE poste de perte de MSF : -0.249 $/part en
+            # esperance (mesure sur 586 fenetres). Plutot que d'attendre le TP
+            # ou de subir le cutoff, on ACHETE l'autre cote au marche des que
+            # son prix rend le verrou encore rentable -- ce qui transforme une
+            # esperance negative en gain GARANTI, petit mais certain.
+            #
+            # Backteste avec les VRAIS prix imprimes de l'autre cote (une 1re
+            # version supposait prix_autre = 1 - prix_notre : faux, les deux
+            # cotes somment a 1.01 en mediane, ce qui offrait gratuitement un
+            # centime par part et inventait des completions inexistantes) :
+            #   MSF actuel                 TRAIN +1.59 $/j | TEST -1.67 $/j
+            #   + completion <= 0.97       TRAIN +6.79 $/j | TEST +24.97 $/j
+            # 185 completions, ZERO perdante, mediane +0.027 $/part, les 5
+            # meilleures ne pesant que 11% du total (reparti, pas concentre).
+            #
+            # Le mecanisme existe deja ailleurs dans le bot
+            # (PAIR_COMPLETION_MAX_COMBINED) mais n'avait jamais ete branche
+            # sur MSF -- verifie.
+            _autre_c = "b" if cote_seule == "a" else "a"
+            _leg_autre_c = e.get(_autre_c) or {}
+            if (MAKER_OPEN_COMPLETION_ENABLED and leg_seule.get("price") is not None
+                    and _leg_autre_c.get("token_id")
+                    and not leg_seule.get("tp_passif_order_id")
+                    and _hold_s >= MAKER_OPEN_COMPLETION_MIN_HOLD_S
+                    and reste > MAKER_OPEN_CANCEL_BEFORE_S):
+                _n_comp = self._live.position_size(leg_seule["token_id"])
+                _n_comp = round(_n_comp, 2) if _n_comp and _n_comp > 0.01 else 0.0
+                _bk_c = self._live.get_book_sync(_leg_autre_c["token_id"])
+                _ask_c = _bk_c["asks"][0][0] if _bk_c and _bk_c.get("asks") else None
+                if _n_comp >= 0.01 and _ask_c is not None:
+                    _comb_c = leg_seule["price"] + _ask_c
+                    if _comb_c <= MAKER_OPEN_COMPLETION_MAX:
+                        # cout reel = ask + frais taker sur CETTE jambe seulement
+                        _gain_c = _n_comp * (1 - _comb_c) - self._poly_fee(_ask_c, _n_comp)
+                        if _gain_c > MAKER_OPEN_COMPLETION_MIN_GAIN:
+                            self._log(
+                                f"🧩 [MAKER-OUVERT-COMPLETION] {sym} {slug} jambe seule "
+                                f"{leg_seule['side']}@{leg_seule['price']:.3f} + achat "
+                                f"{_leg_autre_c['side']}@{_ask_c:.3f} = {_comb_c:.3f} "
+                                f"-> verrou garanti +{_gain_c:.3f}$ au lieu de subir la jambe seule"
+                            )
+                            # on annule d'abord notre ordre passif de ce cote,
+                            # sinon on pourrait etre servi DEUX fois.
+                            if _leg_autre_c.get("order_id"):
+                                self._cancel_verifie(
+                                    _leg_autre_c["order_id"],
+                                    f" {sym} {slug} {_leg_autre_c.get('side','?')}")
+                            _budget_c = round(_n_comp * _ask_c, 2)
+                            with self._order_lock:
+                                _res_c = self._live.snipe_buy_market(
+                                    _leg_autre_c["token_id"],
+                                    round(min(0.99, _ask_c + 0.01), 2), _budget_c)
+                            _fill_c = _res_c.get("filled_shares", 0.0)
+                            if _fill_c > 0.01:
+                                _avg_c = _res_c.get("avg_cost") or _ask_c
+                                for _cote, _n, _px in ((cote_seule, _n_comp, leg_seule["price"]),
+                                                       (_autre_c, round(_fill_c, 2), _avg_c)):
+                                    _lg = e[_cote]
+                                    mk["open"][f"{slug}|{_lg['side']}"] = {
+                                        "symbol": sym, "slug": slug, "side": _lg["side"],
+                                        "mode": "real", "strat": "bothside", "maker_open": True,
+                                        "token_id": _lg["token_id"], "entry_price": _px,
+                                        "filled_shares": round(_n, 2),
+                                        "cost": round(_n * _px, 2),
+                                        "start_ts": e.get("debut_ts"), "pair": None,
+                                        "end_ts": e.get("fin_ts"), "opened_ts": now,
+                                        "buffer": 0.0,
+                                    }
+                                    self._add_slug_spent(mk, slug, round(_n * _px, 2))
+                                self._tag_pair_lock(
+                                    mk["open"].get(f"{slug}|{leg_seule['side']}"),
+                                    mk["open"].get(f"{slug}|{_leg_autre_c['side']}"),
+                                    leg_seule["price"] + _avg_c,
+                                    tag=f" {sym} {slug} MAKER-OUVERT-COMPLETION")
+                                self._maker_open_record(
+                                    sym, slug, "les_deux",
+                                    combine=round(leg_seule["price"] + _avg_c, 4),
+                                    parts=round(min(_n_comp, _fill_c), 2),
+                                    prix=leg_seule["price"], exec_mode="completion")
+                                mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                                st.pop(slug, None)
+                                self._save()
+                                continue
+                            self._log(
+                                f"⚠️ [MAKER-OUVERT-COMPLETION] {sym} {slug} achat non rempli "
+                                f"({_res_c.get('error', '?')}) -> on garde la gestion habituelle"
+                            )
             # MODE CALME (Steven 09/08) : TP a prix ABSOLU (0.85). En calme on
             # est entre a ~0.65, et le x1.8 historique (0.65*1.8=1.17>1.0) ne
             # se declencherait jamais. En croisement (entree ~0.35) le x1.8
