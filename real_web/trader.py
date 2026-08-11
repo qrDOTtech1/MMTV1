@@ -2502,12 +2502,22 @@ class MultiTrader:
 
         Regle : tant que la jambe opposee est detenue, couper la jambe
         PERDANTE est destructeur -- c'est precisement elle qui borne la perte.
-        Vendre la jambe GAGNANTE reste autorise (c'est comme ca qu'on encaisse
-        un TP). On ne bloque donc que la vente a perte d'une jambe couverte."""
+
+        EXEMPTION GAGNANTE SUPPRIMEE (Steven 11/08). La version precedente
+        laissait passer la vente d'une jambe GAGNANTE ("c'est comme ca qu'on
+        encaisse un TP"). Faux raisonnement : ce qui rend une jambe protectrice
+        n'est pas son signe, c'est son EXISTENCE en face de l'autre. Mesure en
+        production le 11/08 a 20:41 sur ETH :
+          20:41:37 BUY Down 3.75@0.260   (couvre Up 6.67@0.600)
+          20:41:43 SELL Down 3.75@0.270  -> +0.038$ encaisse, exemption
+                                            "jambe gagnante" appliquee
+          20:42:32 Up reste a nu, solde en catastrophe @0.450 -> -1.000$
+        On a vendu la couverture pour 3.8 centimes et paye 1.00$. Desormais
+        une jambe couverte est intouchable, gagnante ou non : le seul volume
+        vendable est l'EXCEDENT non apparie, et il a son propre chemin
+        (_solder_excedent), qui ne passe pas par ce garde-fou."""
         if own_price is None or entry_price is None:
             return False
-        if own_price >= entry_price:
-            return False  # jambe gagnante -> le TP peut la vendre
         for k, other in mk.get("open", {}).items():
             if other is None or k == f"{slug}|{side}":
                 continue
@@ -4944,7 +4954,105 @@ class MultiTrader:
         if len(hist) > self.SLIPPAGE_HISTORY_SIZE:
             del hist[: len(hist) - self.SLIPPAGE_HISTORY_SIZE]
 
-    def _sell_orphan(self, token_id, shares, tag="", entry_price=None, symbol=None, slug=None, side=None):
+    def _annuler_ordres_slug(self, sym, slug):
+        """Annule TOUT ordre encore ouvert rattache a ce slug (Steven 11/08).
+
+        Motif : "ca sert a rien de se laisser acheter une leg a -1min de la
+        resolution, on n'a meme plus le temps de faire une completion". Tant
+        qu'on n'arrive pas a solder une jambe nue, les achats passifs encore
+        en carnet restent servables ; etre rempli si tard n'ouvre plus aucune
+        issue (ni verrou, ni completion, ni revente) et ne fait qu'empiler une
+        seconde perte sur celle qu'on essaie de fuir.
+
+        Les ordres sont suivis dans des sous-etats distincts selon la strategie
+        (MSF, pre-ouverture, bothside, TP passif...). Plutot que de plomber
+        chaque chemin, on balaie recursivement l'etat du symbole et on annule
+        tout identifiant d'ordre rencontre sous une branche qui porte ce slug.
+        Annuler un ordre deja mort est sans effet -> aucun risque a ratisser
+        large, et rien d'un AUTRE slug n'est touche."""
+        mk = self.state["markets"].get(sym)
+        if not mk:
+            return 0
+        vus, oids = set(), set()
+
+        def _scan(noeud, dedans):
+            if id(noeud) in vus:
+                return
+            vus.add(id(noeud))
+            if isinstance(noeud, dict):
+                ici = dedans or noeud.get("slug") == slug
+                for cle, val in noeud.items():
+                    if isinstance(cle, str) and slug in cle:
+                        _scan(val, True)
+                        continue
+                    if ici and isinstance(cle, str) and (
+                        cle == "oid" or cle == "order_id" or cle.endswith("_order_id")
+                    ):
+                        if isinstance(val, str) and val:
+                            oids.add(val)
+                        continue
+                    _scan(val, ici)
+            elif isinstance(noeud, (list, tuple)):
+                for val in noeud:
+                    _scan(val, dedans)
+
+        _scan(mk, False)
+        n = 0
+        for oid in oids:
+            try:
+                self._live.cancel_order(oid)
+                n += 1
+            except Exception:
+                pass
+        return n
+
+    @staticmethod
+    def _prix_vente_absorbant(book, shares, urgence=0):
+        """Prix de FAK qui absorbe REELLEMENT `shares`, au lieu de bid-0.02.
+
+        Diagnostic Steven 11/08 sur ETH (4 ventes a 0 part remplie d'affilee,
+        puis solde force a 0.450 pour -1.00$) : le prix de sortie etait fige a
+        "meilleur bid - 2 centimes". Deux mesures expliquent l'echec :
+          - profondeur mediane top-3 : BTC 960 parts, ETH 245 -- ETH est 4x
+            plus fin, mais 6.67 parts y restent absorbables 91.8% du temps
+            (BTC 93.0%). La finesse SEULE n'explique donc pas 4 echecs de
+            suite : c'etait bien le prix, pas la taille.
+          - le prix tombait de 0.760 a 0.450 en 45s (~0.7 centime/seconde).
+            Avec la latence de lecture+envoi, un ordre poste 2 centimes sous
+            un bid deja perime n'a plus rien a croiser -> FAK tue net.
+        On descend donc le carnet jusqu'au niveau qui couvre notre taille, et
+        l'agressivite s'escalade a chaque echec (urgence) au lieu de rester
+        constante. Sur un carnet epais (BTC) le niveau trouve est le sommet :
+        comportement inchange, aucune concession de prix -- c'est uniquement
+        quand le carnet est fin ou en fuite que l'on va plus loin.
+        Retourne (prix, profondeur_cumulee) ou (None, 0.0)."""
+        bids = (book or {}).get("bids") or []
+        if not bids:
+            return None, 0.0
+        try:
+            top = float(bids[0][0])
+        except (TypeError, ValueError, IndexError):
+            return None, 0.0
+        cum = 0.0
+        niveau = top
+        for lvl in bids:
+            try:
+                px, sz = float(lvl[0]), float(lvl[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            cum += sz
+            niveau = px
+            if cum >= shares:
+                break
+        u = max(0, int(urgence))
+        marge = 0.02 + 0.02 * u        # tampon anti-derive du carnet
+        plafond = 0.05 + 0.05 * u      # concession max sous le meilleur bid
+        prix = min(niveau, top) - marge
+        prix = max(prix, top - plafond)   # au 1er essai on ne brade pas
+        return round(max(0.01, prix), 2), round(cum, 2)
+
+    def _sell_orphan(self, token_id, shares, tag="", entry_price=None, symbol=None, slug=None,
+                     side=None, urgence=0):
         """Revend `shares` parts au meilleur bid et VERIFIE ON-CHAIN que la vente
         est reellement passee (Steven 22/07 : plus jamais de vente supposee).
         Retourne le nombre de parts effectivement vendues. Log explicite.
@@ -4987,7 +5095,17 @@ class MultiTrader:
             # _sell_orphan sert TOUJOURS a sortir vite (unwind, stop-loss,
             # fin de fenetre) -> la vitesse prime sur le prix ici.
             _chrono_sell_t0 = time.time()
-            _sell_resp = self._live.sell_position(token_id, round(bid, 2), round(shares, 2), aggressive=True)
+            _px_vente, _prof = self._prix_vente_absorbant(book, shares, urgence)
+            if _px_vente is None:
+                _px_vente = round(max(0.01, bid - 0.02), 2)
+            if _prof < shares or urgence > 0:
+                self._log(
+                    f"📉 [CARNET]{tag} bid={round(bid,2)} profondeur={_prof} parts pour "
+                    f"{round(shares,2)} demandees -> FAK @{_px_vente} (urgence {urgence})"
+                )
+            # marge=0 : le prix est deja le niveau absorbant calcule ci-dessus.
+            _sell_resp = self._live.sell_position(token_id, _px_vente, round(shares, 2),
+                                                  aggressive=True, marge=0.0)
             _chrono_sell_ms = round((time.time() - _chrono_sell_t0) * 1000)
             # CHRONO SORTIE (Steven 08/08) : c'est le chemin TP/cutoff/unwind
             # MSF -- jusqu'ici zero mesure, contrairement a l'entree bothside.
@@ -7246,11 +7364,30 @@ class MultiTrader:
                 _mc_shares = pos.get("filled_shares", 0)
                 if _mc_shares > 0:
                     _tries = pos.get("close_attempts", 0)
+                    # ── PLUS D'ORDRE OUVERT PENDANT QU'ON N'ARRIVE PAS A SORTIR ──
+                    # (Steven 11/08) : tant que la vente echoue, les achats
+                    # passifs encore en carnet peuvent etre servis. Se faire
+                    # remplir une jambe a ~1 minute de la resolution est le
+                    # pire des cas : il ne reste meme plus le temps d'une
+                    # completion, et on n'achete alors qu'une perte de plus
+                    # par-dessus une position qu'on cherche justement a fuir.
+                    _t0_close = pos.get("close_since")
+                    if _t0_close is None:
+                        pos["close_since"] = _t0_close = now
+                    if (now - _t0_close) >= 60 and not pos.get("close_cancelled"):
+                        _annules = self._annuler_ordres_slug(sym, pos["slug"])
+                        pos["close_cancelled"] = True
+                        self._log(
+                            f"🛑 [ZERO-JAMBE-NUE] {sym} {pos['slug']} vente bloquee depuis "
+                            f"{int(now - _t0_close)}s -> {_annules} ordre(s) annule(s), "
+                            f"plus aucune jambe ne peut etre achetee ici"
+                        )
                     _mc_sold = self._sell_orphan(
                         pos["token_id"], _mc_shares,
                         f" {sym} {pos['slug']} {pos['side']} ZERO-JAMBE-NUE(essai {_tries + 1})",
                         entry_price=pos["entry_price"], symbol=sym,
                         slug=pos.get("slug"), side=pos.get("side"),
+                        urgence=_tries,
                     )
                     if _mc_sold >= _mc_shares - 0.01:
                         del mk["open"][key]

@@ -585,7 +585,8 @@ class PolyLive:
 
     # ── ordre directionnel simple (momentum / IA) ──
 
-    def sell_position(self, token_id: str, price: float, size: float, aggressive: bool = False) -> dict:
+    def sell_position(self, token_id: str, price: float, size: float, aggressive: bool = False,
+                      marge: float = 0.02) -> dict:
         """Vend size parts détenues, au prix donné. FALLBACK NEG-RISK : comme
         l'achat, les marchés multi-issues (World Cup...) rejettent l'ordre standard
         -> on retente en neg_risk=True pour pouvoir SORTIR de ces positions.
@@ -606,7 +607,12 @@ class PolyLive:
         from py_clob_client_v2 import OrderArgsV2, OrderType
 
         order_type = OrderType.FAK if aggressive else OrderType.GTC
-        sell_price = round(max(0.01, price - 0.02), 2) if aggressive else price
+        # `marge` (Steven 11/08) : l'ecart sous le bid etait fige a 2 centimes.
+        # Sur un carnet fin ou en chute rapide, le prix a deja franchi ces 2
+        # centimes quand l'ordre arrive -> le FAK ne croise rien et meurt a
+        # 0 part remplie. L'appelant calcule desormais lui-meme le niveau qui
+        # absorbe reellement sa taille et passe marge=0.
+        sell_price = round(max(0.01, price - marge), 2) if aggressive else price
         args = OrderArgsV2(token_id=token_id, price=sell_price, size=size, side="SELL")
         try:
             resp, timing = self._signed_post_timed(token_id, args, order_type)
