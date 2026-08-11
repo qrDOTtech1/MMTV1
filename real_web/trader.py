@@ -854,7 +854,21 @@ MAKER_OPEN_COMPLETION_ENABLED = True
 # Aucun risque d'ouvrir des completions perdantes AU MARCHE : le controle de
 # gain APRES frais (MIN_GAIN) coupe ce chemin de lui-meme des 0.98
 # (combine 0.98 -> net +0.011$ sur 10 parts, sous le seuil de 0.02$).
-MAKER_OPEN_COMPLETION_MAX = 0.99
+# PLAFOND DE COMPLETION > 1.00 (Steven 11/08, "perdant rempli mais jamais
+# gagnant"). Tant qu'il valait 0.99, la completion n'existait QUE dans les
+# fenetres ou l'on ne perdait pas -- or notre jambe n'est servie que lorsque
+# le marche traverse notre prix, donc on est structurellement rempli du cote
+# perdant, et l'autre cote est alors DEJA trop cher : combine > 1, completion
+# refusee, jambe seule subie. On refusait donc de payer 0.05 de perte
+# GARANTIE pour continuer a encaisser -0.249/part en esperance.
+# Backtest chronologique TRAIN/TEST (retrait T=90s actif) :
+#   plafond 0.99  TRAIN +30.94$  TEST +15.46$  (31 jambes seules subies)
+#   plafond 1.02  TRAIN +31.55$  TEST +15.79$  (23)
+#   plafond 1.05  TRAIN +33.39$  TEST +16.88$  (14)  <- retenu
+#   plafond 1.08  TRAIN +34.49$  TEST +16.68$  (11)  TEST retombe
+# A 1.05 on paie 1.05 pour recevoir 1.00, frais compris ~-0.065$/part : moins
+# cher que couper (-0.0735) et bien moins que subir (-0.249).
+MAKER_OPEN_COMPLETION_MAX = 1.05
 MAKER_OPEN_COMPLETION_MIN_HOLD_S = 5    # laisse le carnet se stabiliser
 MAKER_OPEN_COMPLETION_MIN_GAIN = 0.02   # $ : en dessous ca ne vaut pas le risque
 # APPORTEUR D'ABORD (Steven 11/08). Cinq idees d'optimisation backtestees
@@ -871,6 +885,19 @@ MAKER_OPEN_COMPLETION_MIN_GAIN = 0.02   # $ : en dessous ca ne vaut pas le risqu
 MAKER_OPEN_COMPLETION_MAKER_S = 60      # 0 = desactive, achat direct au marche
 MAKER_OPEN_MIN_REMAIN_S = 120     # sous 2 min restantes, trop tard pour etre servi
 MAKER_OPEN_CANCEL_BEFORE_S = 45   # a T-45s : on annule et on solde une jambe seule
+# ANTI-SELECTION ADVERSE (Steven 11/08) : si AUCUNE des deux jambes n'est
+# servie apres N secondes de fenetre, on retire les deux ordres. Un ordre
+# passif n'est servi que lorsque le marche vient de traverser notre prix --
+# donc plus il est servi tard, plus il est certain qu'on achete le perdant.
+# Mesure sur 583 fenetres, proba que la 2e jambe suive selon l'instant du 1er
+# remplissage : 0-30s 47.9% | 30-60s 46.9% | 60-90s 45.6% | 90-120s 33.3% |
+# 120-150s 25.7%. Le seuil d'indifference tenir/couper est 31.97% -> au-dela
+# de ~90s la pose est perdante en esperance. Test chronologique, TRAIN/TEST :
+#   jamais (avant)  TRAIN +3.48$  TEST -3.90$
+#   T=120s          TRAIN +2.96$  TEST -1.41$
+#   T=90s           TRAIN +3.94$  TEST +0.65$   <- retenu
+# On sacrifie 7 verrous sur 86 pour eviter 36 remplissages tardifs.
+MAKER_OPEN_NOFILL_CANCEL_S = 90
 # TP SUR JAMBE SEULE (Steven 07/08, "utiliser signal quand on tient 1 leg et
 # qu'on voit que le marche ne bouge pas assez vite de l'autre cote -> TP
 # maximal et se retirer sans poser l'autre").
@@ -5785,6 +5812,33 @@ class MultiTrader:
                 held = self._live.position_size(tid)
                 fills[cote] = max(0.0, held if held and held > 0 else 0.0)
             fa, fb = fills.get("a", 0.0), fills.get("b", 0.0)
+
+            # ── RETRAIT SI TOUJOURS RIEN SERVI (Steven 11/08) ────────────
+            # Ne coute aucun verrou deja acquis : on ne retire que des ordres
+            # dont AUCUN cote n'a ete touche. Cf. MAKER_OPEN_NOFILL_CANCEL_S.
+            _ecoule = now - (e.get("debut_ts") or now)
+            if (fa <= 0.01 and fb <= 0.01
+                    and _ecoule >= MAKER_OPEN_NOFILL_CANCEL_S
+                    and reste > MAKER_OPEN_CANCEL_BEFORE_S):
+                for cote in ("a", "b"):
+                    oid = (e.get(cote) or {}).get("order_id")
+                    if oid:
+                        self._live.cancel_order(oid)
+                self._log(
+                    f"🚪 [MSF-RETRAIT] {sym} {slug} aucune jambe servie apres "
+                    f"{int(_ecoule)}s -> les 2 ordres retires. Un remplissage a "
+                    f"ce stade n'achete plus que le perdant (croisement 25-33%, "
+                    f"seuil 32%)."
+                )
+                self._maker_open_record(
+                    sym, slug, "retrait_sans_fill", combine=None, parts=0.0,
+                    prix=(e.get("a") or {}).get("price"), vendu=0.0, sortie=None,
+                    exec_mode="passif", calm=e.get("calm", False),
+                )
+                mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                st.pop(slug, None)
+                self._save()
+                continue
 
             if fa > 0.01 and fb > 0.01:
                 # LES DEUX SERVIS -> arb verrouille, sans le moindre frais.
