@@ -966,8 +966,25 @@ MAKER_OPEN_TP_MULT = 1.8          # conserve pour le mode calme / historique
 # Risque nul en face : un ask non servi ne coute rien, la jambe poursuit sa
 # vie normale et la completion reprend la main. Le pire cas est le
 # comportement actuel.
-MAKER_OPEN_TP_OFFSET = 0.02
-MAKER_OPEN_TP_MIN_HOLD_S = 0
+# ══ SCALP DESACTIVE EN URGENCE (Steven 12/08, solde 20$ -> 3$) ══════════
+# LE SCALP TUAIT LE VERROU. Erreur de backtest de ma part, grave : mon
+# simulateur decidait "verrou" AVANT de considerer le scalp, en supposant
+# que si les deux cotes touchent 0.35 dans la fenetre, le verrou a lieu.
+# FAUX EN REEL : poster un ask a 0.37 des le 1er remplissage fait VENDRE la
+# jambe en quelques secondes ; quand l'autre cote touche 0.35 ensuite, on ne
+# detient plus la premiere jambe -> pas de verrou, juste une nouvelle jambe
+# seule. On echangeait donc des opportunites a +2.02$ (verrou, 0.30/part x
+# 6.72) contre des sorties a +0.13$ (scalp, 0.02/part).
+# Constate on-chain le 12/08 entre 06:56 et 07:43 : 8 cycles
+# BUY@0.350 -> SELL@0.370 en 4 a 40 secondes, ZERO verrou, et deux abandons
+# a -2.10$ et -2.29$ qui effacent 16 scalps chacun.
+# Le taux de verrou historique est de 47.5% et le verrou est la SEULE source
+# de profit reelle (mesure : 79 verrous = 23.7$ sur 18.06$ de net total).
+# On revient donc au TP multiplicatif d'avant, qui ne se declenchait
+# jamais -- inoffensif -- en attendant une version qui n'arme le scalp
+# QU'APRES la disparition de toute chance de verrou.
+MAKER_OPEN_TP_OFFSET = 0.02       # conserve pour reference, plus utilise
+MAKER_OPEN_TP_MIN_HOLD_S = 15
 # ABANDON : la paire est devenue hors d'atteinte (Steven 12/08). Au-dessus de
 # ce combine, ni la completion (plafond 1.05) ni le scalp n'ont de chance : la
 # jambe n'est plus un demi-arbitrage, c'est un pari directionnel perdant.
@@ -6246,8 +6263,10 @@ class MultiTrader:
             if e.get("calm"):
                 _tp_seuil = CALM_MSF_TP_PRICE
             else:
-                # OFFSET ABSOLU, plus multiplicatif (cf. MAKER_OPEN_TP_OFFSET).
-                _tp_seuil = leg_seule["price"] + MAKER_OPEN_TP_OFFSET
+                # RETOUR AU MULTIPLICATIF (cf. bloc SCALP DESACTIVE ci-dessus) :
+                # l'offset +0.02 vendait la jambe avant que le verrou puisse
+                # se former.
+                _tp_seuil = leg_seule["price"] * MAKER_OPEN_TP_MULT
 
             # ── SUIVI D'UN TP PASSIF DEJA POSTE (Steven 08/08, "sortie MAKER
             # au lieu d'agressive") : backteste sur 586 fenetres, frais de
@@ -6360,12 +6379,11 @@ class MultiTrader:
                         _tp_seuil, _hold_s, mk.get("danger", 0),
                         triggered=bool(_cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil),
                     )
-            # POSE IMMEDIATE (Steven 12/08) : on n'attend plus que le prix
-            # ATTEIGNE le seuil pour poster l'ask. Attendre, c'est laisser la
-            # completion gagner la course a tous les coups. On pose l'ask des
-            # que la jambe est seule ; s'il n'est jamais servi il n'a rien
-            # coute, et le repli agressif d'avant le cutoff reste en place.
-            if _cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S:
+            # POSE IMMEDIATE ANNULEE (Steven 12/08, solde 20$ -> 3$) : poster
+            # l'ask des le remplissage vendait la jambe avant que l'autre cote
+            # ait eu le temps de toucher 0.35 -> plus aucun verrou. On exige a
+            # nouveau que le prix ATTEIGNE le seuil avant de poster.
+            if _cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil:
                 # RELECTURE FRAICHE DE LA QUANTITE (Steven 07/08, "24 TP dont
                 # 11 rates a parts=0.0"). `fills[cote_seule]` vient d'une
                 # lecture faite PLUS TOT dans ce meme cycle -- position_size()
@@ -6453,11 +6471,7 @@ class MultiTrader:
                 # agressive dans les 2 modes de remplissage. Repli agressif
                 # immediat si le post lui-meme echoue (jamais de position
                 # laissee sans plan de sortie).
-                # Cible = entree + offset (0.37 sur une entree a 0.35), mais
-                # jamais SOUS _cur+0.01 : un ask qui traverse le carnet nous
-                # rendrait PRENEUR et couterait le frais que tout ce mecanisme
-                # existe justement pour eviter.
-                _ask_passif = round(max(_tp_seuil, _cur + 0.01), 2)
+                _ask_passif = round(_cur + 0.01, 2)
                 _post_passif = self._live.post_limit_sell(leg_seule["token_id"], _ask_passif, round(n_tp, 2))
                 if _post_passif.get("success") and _post_passif.get("order_id"):
                     leg_seule["tp_passif_order_id"] = _post_passif["order_id"]
