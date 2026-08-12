@@ -880,7 +880,19 @@ MAKER_OPEN_COMPLETION_MAX = 1.05
 #   attente 10s : 30 / 15   net TRAIN +33.51$
 #   attente  5s : 24 / 14   net TRAIN +34.21$   (avant)
 #   attente  0s : 16 / 12   net TRAIN +35.66$   <- retenu, -33% d'orphelines
-MAKER_OPEN_COMPLETION_MIN_HOLD_S = 0
+# ATTENTE RETABLIE (Steven 12/08). Je l'avais mise a 0 dans c387048 en
+# raisonnant "attendre, c'est laisser l'autre cote fuir". Faux : ces 5
+# secondes servaient a laisser le SECOND ORDRE PASSIF se remplir a 0.35
+# (verrou gratuit) au lieu d'acheter l'autre cote au marche. Corrolation
+# mesuree sur le PnL reel du bot, trades manuels exclus :
+#   11/08 22:00  +0.240$/fenetre   jambes restees seules  7/16 (44%)
+#   12/08 00:00  +0.372$/fenetre                          4/19 (21%)
+#   12/08 02:00  -0.135$/fenetre                         14/34 (41%)   <- c387048 a 01:17
+#   12/08 04:00  -0.543$/fenetre                         11/17 (65%)
+#   12/08 06:00  -0.536$/fenetre                         15/19 (79%)
+# Le taux de jambes seules a quadruple, c'est-a-dire l'inverse exact de ce
+# que le changement etait cense produire.
+MAKER_OPEN_COMPLETION_MIN_HOLD_S = 5
 MAKER_OPEN_COMPLETION_MIN_GAIN = 0.02   # $ : en dessous ca ne vaut pas le risque
 # APPORTEUR D'ABORD (Steven 11/08). Cinq idees d'optimisation backtestees
 # isolement ET combinees ; c'est la SEULE qui ameliore, et elle ameliore
