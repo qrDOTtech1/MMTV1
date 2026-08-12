@@ -802,7 +802,34 @@ POLY_FEE_SAFETY = 0.003         # marge : mieux vaut rater un arb que le perdre
 # les series, bonnes et mauvaises. Pas de fix demande sur ce point pour
 # l'instant, juste un fait mesure.
 MAKER_OPEN_ENABLED = True
-MAKER_OPEN_SYMBOLS = ("BTC", "ETH")
+# EXTENSION AUX 6 MARCHES (Steven 12/08). MSF n'etait autorise que sur BTC et
+# ETH alors que la collecte tourne sur 6 marches depuis le 11/08. Mesure sur
+# 24h de carnet reel, 289 fenetres 5m par symbole, meme critere partout
+# (ask_top <= 0.35 sur un cote = notre achat passif peut y etre servi) :
+#     symbole   2 cotes touches   profondeur med   spread
+#       BTC          31.5%              687        0.010
+#       ETH          27.3%              138        0.010
+#       XRP          33.2%               75        0.020
+#       SOL          30.4%               94        0.010
+#       DOGE         28.4%              112        0.030
+#       BNB          27.3%               67        0.030
+# Le taux de croisement -- seule source de profit du systeme -- est
+# equivalent sur les six : XRP fait meme mieux que BTC. Les 4 marches non
+# exploites representent 1156 fenetres/24h contre 289 pour BTC seul.
+# RISQUE BORNE : un ordre passif non servi ne coute RIEN (verifie on-chain,
+# l'historique ne contient aucun evenement ORDER ni CANCEL, seulement TRADE
+# et REDEEM). Le pire cas d'un nouveau symbole est de ne pas etre rempli.
+# RESERVE REELLE : ces carnets sont 6 a 10x plus fins que BTC et le spread
+# est 2 a 3x plus large sur DOGE et BNB -- les SORTIES y seront plus dures
+# (c'est ce qui a produit 4 echecs de vente consecutifs sur ETH le 12/08,
+# alors qu'ETH est deja 5x plus profond que BNB). Le correctif du meme jour
+# -- prix de vente qui descend le carnet jusqu'au niveau absorbant -- adresse
+# precisement ce point.
+# NB : ceci n'ACTIVE rien tout seul. Le second garde-fou reste en place :
+#      self.state["modes"][sym] doit valoir "real" pour que MSF pose quoi que
+#      ce soit. Steven garde donc la main, symbole par symbole, depuis le
+#      dashboard.
+MAKER_OPEN_SYMBOLS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB")
 MAKER_OPEN_PRICE = 0.35           # prix de pose, PLAFOND (jamais depasse)
 # PRIX ADAPTATIF (Steven 09/08, "il pourrait pas s'adapter au marche ?") :
 # au lieu d'abandonner toute la fenetre quand l'ask est deja sous 0.35
