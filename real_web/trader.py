@@ -942,8 +942,42 @@ MAKER_OPEN_NOFILL_CANCEL_S = 90
 # conservatrice, le pire cas mesure reste negatif (-2.26%, contre -7.22% sans
 # TP -- ameliore mais pas gagnant). Echantillon ETH 8x plus petit que BTC (65
 # vs 519 fenetres) : le signe de son edge reste incertain, contrairement a BTC.
-MAKER_OPEN_TP_MULT = 1.8
-MAKER_OPEN_TP_MIN_HOLD_S = 15
+MAKER_OPEN_TP_MULT = 1.8          # conserve pour le mode calme / historique
+# SCALP APPORTEUR DES L'ENTREE (Steven 12/08, "si on TP tres rapidement il y a
+# de la marge ici aussi"). Le TP multiplicatif exigeait 0.35 x 1.8 = 0.63 : il
+# ne s'est declenche ZERO fois sur 694 fenetres de backtest, TRAIN et TEST
+# confondus. Raison structurelle : notre jambe qui monte de X = l'autre cote
+# qui baisse de X = le combine qui baisse de X -> la completion se declenche
+# toujours AVANT que 0.63 soit atteint. Les deux sont le meme evenement vu des
+# deux cotes.
+# A +0.02 en revanche on encaisse dans les premieres secondes, dans la fenetre
+# ou le marche bouge a 21.6 millemes/s (mesure : 10x la vitesse du reste de la
+# fenetre). Et l'arithmetique est nette, a gain EGAL :
+#   vendre a 0.37 en APPORTEUR      -> +0.020$/part, zero frais
+#   completer a un combine de 0.96  -> +0.040 - frais preneur = +0.020$/part
+# ...sauf que le scalp REND le capital la ou la completion en immobilise le
+# double. Backtest (vente servie uniquement par un vrai print acheteur) :
+#   0.37 : TRAIN +2.20$  TEST +1.17$  rendement 12.24% -> 13.88%
+#   0.38 : TRAIN +1.84$  TEST +0.81$
+#   0.40 : TRAIN +1.59$  TEST +0.72$
+#   0.43 : TRAIN +1.09$  TEST +0.27$
+#   0.50 : TRAIN +0.80$  TEST  0.00$
+# Gradient monotone : plus le TP est serre, plus il rapporte.
+# Risque nul en face : un ask non servi ne coute rien, la jambe poursuit sa
+# vie normale et la completion reprend la main. Le pire cas est le
+# comportement actuel.
+MAKER_OPEN_TP_OFFSET = 0.02
+MAKER_OPEN_TP_MIN_HOLD_S = 0
+# ABANDON : la paire est devenue hors d'atteinte (Steven 12/08). Au-dessus de
+# ce combine, ni la completion (plafond 1.05) ni le scalp n'ont de chance : la
+# jambe n'est plus un demi-arbitrage, c'est un pari directionnel perdant.
+# Mesure on-chain du 11/08 sur les 3 orphelines : vendue tot -> 40% recupere,
+# vendue tard -> 5%, jamais vendue -> 0%. L'abandon se declenche a 44s en
+# mediane contre 255s pour le solde force actuel, soit 211s plus tot.
+# Le seuil 1.25 (plutot que 1.05) laisse vivre la jambe assez longtemps pour
+# que le scalp apporteur ait lieu : a 1.05 le combine est soit dessous soit
+# dessus, la decision tombe des le 1er tick et aucun TP ne peut exister.
+MAKER_OPEN_ABANDON_MAX = 1.25
 MAKER_OPEN_TOTAL_FRAC = 0.35      # TOTAL des 2 jambes, en part de l'investissable
 MAKER_OPEN_BUDGET_MIN = 4.7
 MAKER_OPEN_BUDGET_MAX = 40.0
@@ -6158,6 +6192,53 @@ class MultiTrader:
                                 f"⚠️ [MAKER-OUVERT-COMPLETION] {sym} {slug} achat non rempli "
                                 f"({_res_c.get('error', '?')}) -> on garde la gestion habituelle"
                             )
+
+                # ── ABANDON : la paire est hors d'atteinte ────────────────
+                # Voir MAKER_OPEN_ABANDON_MAX. On ne laisse plus la jambe
+                # deriver jusqu'au solde force de T-45s : a ce stade elle ne
+                # vaut deja plus rien et le carnet s'est vide.
+                if (_n_comp >= 0.01 and _ask_c is not None
+                        and (leg_seule["price"] + _ask_c) > MAKER_OPEN_ABANDON_MAX
+                        and reste > MAKER_OPEN_CANCEL_BEFORE_S):
+                    _comb_ab = round(leg_seule["price"] + _ask_c, 3)
+                    # on retire d'abord TOUT ordre encore vivant sur ce slug :
+                    # l'ask de scalp (qui ne sera jamais servi a ce stade) et
+                    # le bid de l'autre cote (se faire remplir maintenant
+                    # n'ajouterait qu'une seconde perte).
+                    for _oid_ab in (leg_seule.get("tp_passif_order_id"),
+                                    (_leg_autre_c or {}).get("order_id")):
+                        if _oid_ab:
+                            self._live.cancel_order(_oid_ab)
+                    for _k in ("tp_passif_order_id", "tp_passif_price",
+                               "tp_passif_qty", "tp_passif_posted_ts"):
+                        leg_seule.pop(_k, None)
+                    self._log(
+                        f"🏳️ [MAKER-OUVERT-ABANDON] {sym} {slug} {leg_seule['side']} "
+                        f"combine {_comb_ab} > {MAKER_OPEN_ABANDON_MAX} -> paire hors "
+                        f"d'atteinte, on solde maintenant ({int(300 - reste)}s de fenetre) "
+                        f"plutot que d'attendre T-{MAKER_OPEN_CANCEL_BEFORE_S}s dans un "
+                        f"carnet qui se vide"
+                    )
+                    _vendu_ab = self._sell_orphan(
+                        leg_seule["token_id"], _n_comp,
+                        f" {sym} {slug} {leg_seule['side']} MAKER-OUVERT-ABANDON",
+                        entry_price=leg_seule["price"], symbol=sym,
+                        slug=slug, side=leg_seule["side"],
+                    )
+                    if _vendu_ab >= _n_comp - 0.01:
+                        self._maker_open_record(
+                            sym, slug, "abandon", combine=_comb_ab,
+                            parts=round(_n_comp, 2), prix=leg_seule["price"],
+                            vendu=round(_vendu_ab, 2), exec_mode="agressif",
+                            calm=e.get("calm", False),
+                        )
+                        mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                        st.pop(slug, None)
+                        self._save()
+                        continue
+                    # vente partielle ou ratee -> on repasse par la gestion
+                    # habituelle et on retentera au prochain cycle.
+
             # MODE CALME (Steven 09/08) : TP a prix ABSOLU (0.85). En calme on
             # est entre a ~0.65, et le x1.8 historique (0.65*1.8=1.17>1.0) ne
             # se declencherait jamais. En croisement (entree ~0.35) le x1.8
@@ -6165,7 +6246,8 @@ class MultiTrader:
             if e.get("calm"):
                 _tp_seuil = CALM_MSF_TP_PRICE
             else:
-                _tp_seuil = leg_seule["price"] * MAKER_OPEN_TP_MULT
+                # OFFSET ABSOLU, plus multiplicatif (cf. MAKER_OPEN_TP_OFFSET).
+                _tp_seuil = leg_seule["price"] + MAKER_OPEN_TP_OFFSET
 
             # ── SUIVI D'UN TP PASSIF DEJA POSTE (Steven 08/08, "sortie MAKER
             # au lieu d'agressive") : backteste sur 586 fenetres, frais de
@@ -6278,7 +6360,12 @@ class MultiTrader:
                         _tp_seuil, _hold_s, mk.get("danger", 0),
                         triggered=bool(_cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil),
                     )
-            if _cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil:
+            # POSE IMMEDIATE (Steven 12/08) : on n'attend plus que le prix
+            # ATTEIGNE le seuil pour poster l'ask. Attendre, c'est laisser la
+            # completion gagner la course a tous les coups. On pose l'ask des
+            # que la jambe est seule ; s'il n'est jamais servi il n'a rien
+            # coute, et le repli agressif d'avant le cutoff reste en place.
+            if _cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S:
                 # RELECTURE FRAICHE DE LA QUANTITE (Steven 07/08, "24 TP dont
                 # 11 rates a parts=0.0"). `fills[cote_seule]` vient d'une
                 # lecture faite PLUS TOT dans ce meme cycle -- position_size()
@@ -6366,7 +6453,11 @@ class MultiTrader:
                 # agressive dans les 2 modes de remplissage. Repli agressif
                 # immediat si le post lui-meme echoue (jamais de position
                 # laissee sans plan de sortie).
-                _ask_passif = round(_cur + 0.01, 2)
+                # Cible = entree + offset (0.37 sur une entree a 0.35), mais
+                # jamais SOUS _cur+0.01 : un ask qui traverse le carnet nous
+                # rendrait PRENEUR et couterait le frais que tout ce mecanisme
+                # existe justement pour eviter.
+                _ask_passif = round(max(_tp_seuil, _cur + 0.01), 2)
                 _post_passif = self._live.post_limit_sell(leg_seule["token_id"], _ask_passif, round(n_tp, 2))
                 if _post_passif.get("success") and _post_passif.get("order_id"):
                     leg_seule["tp_passif_order_id"] = _post_passif["order_id"]
