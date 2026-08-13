@@ -1148,18 +1148,44 @@ def _abandon_min_hold_s(sym):
 # marginalement rentable : (1) potentiellement plus gros, (2) liquidite
 # immediate au lieu de capital bloque -- important sur un petit bankroll ou
 # on a deja vu des refus de position faute de budget.
-# GARDE-FOUS : on ne renonce QUE si la completion est deja proche du plancher
-# (pas question de sacrifier un gros gain garanti pour un pari), ET seulement
-# si notre propre jambe montre DEJA un mouvement franc vers le seuil de TP
-# (pas un espoir en l'air -- un signal deja engage). Si la condition n'est
-# pas remplie, la completion s'execute exactement comme avant.
+#
+# LES DEUX PREMIERS GARDE-FOUS ETAIENT MUTUELLEMENT EXCLUSIFS -- CORRIGE LE
+# 13/08. L'ancienne porte exigeait a la fois :
+#   (A) gain de completion entre MIN_GAIN (0.02$) et 0.06$
+#   (B) notre bid >= 0.35 + 0.70 x (0.525 - 0.35) = 0.4725
+# Or (A) et (B) portent sur LE MEME prix vu des deux cotes du carnet, qui se
+# somment a ~1.01 : (A) demande l'autre cote a ~0.62-0.63, (B) le demande a
+# ~0.54. Jamais vrais ensemble. Pire, (A) seul est deja vide sur une grille
+# au centime : a 0.62 le gain vaut +0.071$ (>0.06, on complete), a 0.63 il
+# vaut +0.008$ (<0.02, MIN_GAIN bloque). Il n'existe aucun prix entre les
+# deux. MSF-TPNOW ne s'est donc JAMAIS declenche depuis son deploiement --
+# exactement le meme piege que l'ancien TP a x1.8 (zero fois sur 694
+# fenetres) : deux seuils qui decrivent le meme evenement vu des deux cotes.
+#
+# LA REGLE CORRECTE N'A PAS DE SEUIL A CALER : a l'instant ou la completion
+# se declencherait, on calcule les DEUX gains sur le meme carnet et on prend
+# le plus grand. Rien a surajuster, et il est impossible de choisir la moins
+# bonne option.
+#
+# BACKTEST (36 h de carnet, 1212 completions reelles sur les 4 symboles) :
+#   toujours completer          -> reference
+#   prendre le meilleur des 2   -> +18.13$, et +11.13$ meme en degradant le
+#                                  prix de vente de 2 centimes (test a charge)
+#   walk-forward 18h/18h        -> positif sur les deux moities, 4 symboles
+#                                  sur 4, sans exception
+#   profondeur                  -> mediane 131 parts aux 3 meilleurs bids
+#                                  contre 6.72 requises : vendre est realiste
+#
+# POURQUOI LA MARGE MINIMUM CI-DESSOUS. Sur les 278 cas ou le TP l'emportait,
+# la mediane de l'ecart valait 0.0000$ : 172 etaient des egalites a la
+# fraction de centime. Les 106 cas a ecart >= 0.05$ portent a eux seuls 100%
+# du gain. Exiger cette marge capture donc tout le benefice en supprimant les
+# 172 changements de comportement qui ne rapportaient rien -- et evite de
+# troquer un gain GARANTI (la paire paie 1.00$ a coup sur) contre un gain
+# REALISE pour un ecart qui n'est que du bruit d'arrondi.
 MAKER_OPEN_TPNOW_SYMBOLES = ("SOL", "XRP", "DOGE", "BNB")   # BTC/ETH inchanges
-MAKER_OPEN_TPNOW_GAIN_MARGINAL_MAX = 0.06   # $ : au-dela, la completion est
-                                             # deja un gain solide -> on la prend
-MAKER_OPEN_TPNOW_MOMENTUM_FRAC = 0.70       # notre jambe doit deja avoir
-                                             # parcouru 70% du chemin vers le
-                                             # seuil de TP -- signal engage,
-                                             # pas un espoir
+MAKER_OPEN_TPNOW_MARGE_MIN = 0.05   # $ : le TP doit battre la completion d'au
+                                     # moins ca pour qu'on change d'action
 
 
 # PERSISTANCE AVANT ABANDON (Steven 13/08, "le SL plombe le peu qui a a
@@ -6410,8 +6436,7 @@ class MultiTrader:
                             # aura sa chance. Aucun cash depense ici, aucun
                             # ordre annule : juste "pas cette fois".
                             _tpnow_agi = False
-                            if (sym in MAKER_OPEN_TPNOW_SYMBOLES
-                                    and _gain_c < MAKER_OPEN_TPNOW_GAIN_MARGINAL_MAX):
+                            if sym in MAKER_OPEN_TPNOW_SYMBOLES:
                                 try:
                                     _bk_notre = self._live.get_book_sync(leg_seule["token_id"])
                                     _bid_notre = (_bk_notre["bids"][0][0]
@@ -6419,19 +6444,20 @@ class MultiTrader:
                                 except Exception:
                                     _bid_notre = None
                                 if _bid_notre is not None:
-                                    _seuil_tpnow = leg_seule["price"] * _tp_mult(sym)
-                                    _chemin = _seuil_tpnow - leg_seule["price"]
-                                    _parcouru = _bid_notre - leg_seule["price"]
-                                    if _chemin > 0 and _parcouru >= MAKER_OPEN_TPNOW_MOMENTUM_FRAC * _chemin:
+                                    # LE MEILLEUR DES DEUX, calcule sur le meme
+                                    # carnet au meme instant. Aucun seuil de prix :
+                                    # on compare deux gains en dollars.
+                                    _gain_tp = ((_bid_notre - leg_seule["price"]) * _n_comp
+                                                - self._poly_fee(_bid_notre, _n_comp))
+                                    if _gain_tp > _gain_c + MAKER_OPEN_TPNOW_MARGE_MIN:
                                         _tpnow_agi = True
                                         self._log(
                                             f"💸 [MSF-TPNOW] {sym} {slug} {leg_seule['side']} "
-                                            f"completion marginale ({_gain_c:+.3f}$ a {_comb_c:.3f}) "
-                                            f"MAIS notre jambe deja a {_bid_notre:.3f} "
-                                            f"({100*_parcouru/_chemin:.0f}% du chemin vers "
-                                            f"{_seuil_tpnow:.3f}) -> on prefere ENCAISSER via le "
-                                            f"TP (cash immediat) plutot que DEPENSER pour verrouiller "
-                                            f"un gain qui n'arrive qu'a la resolution 🚀💵"
+                                            f"vendre notre jambe a {_bid_notre:.3f} rapporte "
+                                            f"{_gain_tp:+.3f}$ contre {_gain_c:+.3f}$ pour la "
+                                            f"completion a {_comb_c:.3f} (+{_gain_tp - _gain_c:.3f}$) "
+                                            f"-> on ENCAISSE au lieu de DEPENSER, cash immediat "
+                                            f"plutot qu'un gain bloque jusqu'a la resolution 🚀💵"
                                         )
                             if _tpnow_agi:
                                 # ON PREND LE TP TOUT DE SUITE, A LA PLACE DE LA
