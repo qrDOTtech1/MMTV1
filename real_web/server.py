@@ -1146,6 +1146,49 @@ def api_msf_tp_toggle():
     return jsonify({"ok": True, "msf_tp_enabled": on})
 
 
+@app.route("/api/msf/completion-toggle", methods=["POST"])
+def api_msf_completion_toggle():
+    """Interrupteur de la COMPLETION sur MSF (Steven 13/08), reglable a
+    chaud depuis le dashboard, sans redeploiement.
+
+    A QUOI CA SERT. Le TP d'une jambe seule ne peut structurellement jamais
+    se declencher tant que la completion est active : les deux cotes du
+    carnet sommant a ~1.01, la completion part des que l'autre cote passe
+    sous 0.70 (combine 1.05), c'est-a-dire quand NOTRE jambe ne vaut encore
+    que ~0.31 -- tres loin des 0.525 qu'exige le TP. Notre jambe qui monte
+    de X EST l'autre cote qui baisse de X : meme evenement vu des deux
+    cotes, et la completion franchit son seuil en premier, toujours.
+    Mesure en direct sur la fenetre XRP 10:40-10:45 ET : completion 12
+    secondes apres le fill.
+
+    OFF : la jambe seule est conservee et geree par le TP / l'abandon /
+    le cutoff, exactement comme si aucune seconde jambe n'etait
+    disponible. C'est le seul moyen d'observer ce que le TP rapporte
+    vraiment.
+
+    AVERTISSEMENT, a lire avant de laisser OFF longtemps : sur 82 fenetres
+    reelles mesurees, les fenetres COMPLETEES font 83% de gagnantes et
+    +0.251$ piece, les JAMBES SEULES 13% de gagnantes et -1.064$ piece.
+    Eteindre la completion expose donc volontairement le compte a la
+    branche mesuree comme perdante. C'est une experience a mener sur une
+    duree bornee, pas un reglage a oublier.
+    """
+    try:
+        on = bool((request.get_json(silent=True) or {}).get("on"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "parametre 'on' invalide"}), 400
+    trader.state["msf_completion_enabled"] = on
+    trader._save()
+    trader._log(
+        f"{'🧩' if on else '🚫'} [MSF-COMPLETION] passee a "
+        f"{'ON' if on else 'OFF'} depuis le dashboard"
+        + ("" if on else " -> les jambes seules iront au TP / abandon / cutoff, "
+                        "le TP peut enfin se declencher")
+    )
+    return jsonify({"ok": True, "msf_completion_enabled": on})
+
+
+
 @app.route("/api/gatekeeper")
 def api_gatekeeper():
     """Etat de l'apprentissage en mode ombre (Steven 11/08) : generation
