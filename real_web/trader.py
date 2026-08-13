@@ -1333,6 +1333,39 @@ def _score_risque_retournement(sym, slug, reste):
 MAKER_OPEN_TOTAL_FRAC = 0.35      # TOTAL des 2 jambes, en part de l'investissable
 MAKER_OPEN_BUDGET_MIN = 4.7
 MAKER_OPEN_BUDGET_MAX = 40.0
+# ── PLAFOND D'EXPOSITION PROPRE A MSF (Steven 13/08, "au lieu d'un budget
+# fixe, un pourcentage ? comme ca ca suit l'evolution sans palier stricte").
+#
+# LE PALIER, mesure : le budget MSF etait borne par _max_market_exposure(),
+# qui vaut max(8$, investissable x 0.25). Or le budget vise investissable
+# x 0.35. Consequence en deux temps :
+#   - entre ~23$ et 32$ d'investissable, le plafond reste colle a 8$ pendant
+#     que le budget voudrait deja 8.05$ puis 11.20$ -> la machine cesse de
+#     grandir alors que le compte grandit ;
+#   - au-dessus de 32$, 0.25 < 0.35 TOUJOURS, donc le budget est plafonne a
+#     0.25 pour l'eternite : la fraction 0.35 est purement morte. Ce n'etait
+#     pas un palier temporaire, c'etait un plafond definitif.
+#
+# POURQUOI ON NE PASSE PAS EN POURCENTAGE PUR : Polymarket impose 5 parts
+# minimum par ordre limite, soit 3.50$ pour une paire a 0.35+0.35. Un
+# pourcentage sans plancher bloquerait tout compte sous ~10$ d'investissable
+# -- le plancher n'est pas une erreur, il compense cette contrainte. On garde
+# donc le plancher et on supprime le PALIER.
+#
+# MSF a desormais son propre plafond, avec une fraction volontairement au
+# DESSUS de MAKER_OPEN_TOTAL_FRAC pour qu'il ne borne jamais le budget (la
+# taille en parts est arrondie au-dessus, le besoin depasse donc le budget de
+# quelques centimes ; sans cette marge le plafond redeviendrait mordant).
+# Les autres strategies gardent MAX_MARKET_EXPOSURE_FRAC = 0.25 inchange.
+#
+# CE QUE CA COUTE, dit franchement : l'exposition MSF par fenetre passe de
+# 25% a 35% de l'investissable au-dela de 23$. Une paire COMPLETEE est
+# couverte (0.70$/part pour un paiement de 1.00$), mais une JAMBE SEULE qui
+# meurt est directionnelle et peut tout perdre. A 50$ d'investissable le
+# risque sur une fenetre passe de 12.50$ a 17.50$. C'est un choix assume,
+# pas un effet de bord.
+MAKER_OPEN_EXPO_FRAC = 0.40
+MAKER_OPEN_EXPO_MIN = 8.0
 
 # ── MODE CALME MSF (Steven 09/08, "miser sur le perdant ca marchait quand ca
 # croisait, mais quand c'est calme il faut faire l'inverse") ────────────────
@@ -3165,13 +3198,32 @@ class MultiTrader:
             2,
         )
 
-    def _exposure_ok(self, sym, mk, slug, add_usd):
+    def _maker_open_expo_max(self):
+        """Plafond d'exposition propre a MSF (voir MAKER_OPEN_EXPO_FRAC).
+
+        Meme forme que _max_market_exposure -- plancher pour les petits
+        comptes, garde-fou absolu en haut -- mais avec une fraction qui suit
+        reellement le budget MSF, donc SANS le palier de 8$ ni le plafond
+        definitif a 0.25 qui rendaient MAKER_OPEN_TOTAL_FRAC inoperant.
+        """
+        return round(
+            min(
+                MAX_MARKET_EXPOSURE_CEIL,
+                max(MAKER_OPEN_EXPO_MIN, self._investable() * MAKER_OPEN_EXPO_FRAC),
+            ),
+            2,
+        )
+
+    def _exposure_ok(self, sym, mk, slug, add_usd, cap=None):
         """Refuse un achat qui ferait depasser le plafond d'exposition de ce
         marche. Filet STRUCTUREL contre les boucles de re-entree : peu importe
         quel bug ou quelle strategie relance l'achat, le cumul par fenetre est
-        borne. Retourne (ok: bool, detail: str)."""
+        borne. Retourne (ok: bool, detail: str).
+
+        `cap` permet a une strategie d'imposer SON plafond (MSF passe le sien,
+        cf. _maker_open_expo_max). Absent -> plafond generique inchange."""
         spent = self._slug_spent(mk, slug)
-        _cap = self._max_market_exposure()
+        _cap = cap if cap is not None else self._max_market_exposure()
         if spent + (add_usd or 0.0) <= _cap:
             return True, ""
         return False, (
@@ -6134,8 +6186,18 @@ class MultiTrader:
                     f"{self._investable():.2f}$ dispo -> on ne pose pas ce qu'on ne peut pas honorer",
                 )
                 continue
-            ok_exp, why = self._exposure_ok(sym, mk, slug, besoin)
+            # MEME PLAFOND QUE MSF : la pre-ouverture vise elle aussi
+            # PREOPEN_TOTAL_FRAC = 0.35, elle se heurtait donc au meme plafond
+            # generique a 0.25 -- et ici le refus etait carrement MUET (un
+            # `continue` sans le moindre log), donc invisible dans le journal.
+            ok_exp, why = self._exposure_ok(sym, mk, slug, besoin,
+                                            cap=self._maker_open_expo_max())
             if not ok_exp:
+                self._tlog(
+                    f"preopen_expo_{sym}",
+                    f"⛔ [PRE-OUVERTURE] {sym} {slug} plafond d'exposition atteint "
+                    f"({why}) -> on ne pose pas",
+                )
                 continue
 
             self._log(
@@ -7467,7 +7529,8 @@ class MultiTrader:
                 f"{self._investable():.2f}$ dispo -> on ne pose pas ce qu'on ne peut pas honorer",
             )
             return
-        ok_exp, why_exp = self._exposure_ok(sym, mk, slug, besoin)
+        ok_exp, why_exp = self._exposure_ok(sym, mk, slug, besoin,
+                                            cap=self._maker_open_expo_max())
         if not ok_exp:
             # ETAIT SILENCIEUX (Steven 09/08) : ce garde-fou pouvait bloquer
             # 100% des tentatives sans laisser AUCUNE trace dans le journal --
@@ -7650,10 +7713,18 @@ class MultiTrader:
         # en live : a 35$ investable, budget=12.25$ > plafond expo=8.75$ ->
         # 0 pose possible depuis que le compte a depasse ~25$. Plafonner ici
         # au meme garde-fou qu'on devra de toute facon respecter plus bas.
+        # Depuis le 13/08 on borne par le plafond PROPRE A MSF
+        # (_maker_open_expo_max) et non plus par le plafond generique : ce
+        # dernier valait max(8$, inv x 0.25), donc inferieur au budget vise
+        # (inv x 0.35) des 23$ et POUR TOUJOURS au-dela de 32$. La ligne
+        # ci-dessous reste indispensable -- c'est elle qui garantit qu'on ne
+        # demande jamais plus que ce que _exposure_ok acceptera juste apres --
+        # mais elle ne doit borner qu'au vrai plafond, pas a un plafond
+        # etranger plus bas.
         return round(
             min(
                 MAKER_OPEN_BUDGET_MAX,
-                self._max_market_exposure(),
+                self._maker_open_expo_max(),
                 max(MAKER_OPEN_BUDGET_MIN, self._investable() * MAKER_OPEN_TOTAL_FRAC),
             ),
             2,
