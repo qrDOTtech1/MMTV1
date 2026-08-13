@@ -742,6 +742,16 @@ INSTANT_ARB_MAX_COMBINED = 0.95
 # 0.036-0.048) et un badge peut changer de palier.
 POLY_FEE_RATE = 0.048           # taux prudent (p75 mesure), pas la mediane
 POLY_FEE_SAFETY = 0.003         # marge : mieux vaut rater un arb que le perdre
+# ── TAUX MESURES SUR LE COMPTE REEL (13/08) ───────────────────────────────
+# Reconciliation du champ `cost` on-chain contre prix x parts, trades
+# manuels de Steven exclus. Voir le docstring de _poly_fee.
+#   ACHATS : 317 trades, 94% a ecart RIGOUREUSEMENT nul, median 0.00%
+#   VENTES :  70 trades, median -4.27%, taux implicite median 0.0595
+# On garde une petite marge au-dessus de la mediane mesuree sur les ventes,
+# dans l'esprit de POLY_FEE_SAFETY : mieux vaut renoncer a une sortie que
+# la croire plus rentable qu'elle n'est.
+POLY_FEE_RATE_ACHAT = 0.0       # gratuit au palier actuel (bronze)
+POLY_FEE_RATE_VENTE = 0.062     # mediane 0.0595 + marge de securite
 
 # Seuil de verrou AVANT frais. Avec 2 jambes sous 0.50 les frais valent
 # rate*C, donc le vrai seuil de rentabilite est 1/(1+rate) = 0.954 a 0.048.
@@ -3015,11 +3025,43 @@ class MultiTrader:
 
     # ── VERROU REEL D'UNE PAIRE (Steven 05/08) ──────────────────────────
     @staticmethod
-    def _poly_fee(price, shares):
+    def _poly_fee(price, shares, sens="vente"):
         """Frais Polymarket : rate * min(p, 1-p) * parts (formule officielle,
         champ feeSchedule de l'API). Maximum au milieu du carnet, quasi nul
         aux extremes -- c'est pour ca que le near-certain a 0.96 paie tres peu
-        alors qu'une paire a 0.50/0.50 paie plein pot."""
+        alors qu'une paire a 0.50/0.50 paie plein pot.
+
+        LES FRAIS SONT ASYMETRIQUES -- mesure le 13/08 sur l'historique
+        on-chain reel du compte (Steven : "je suis bronze sur polymarket,
+        les frais ne nous concernent pas tant que ca") :
+
+            ACHATS : 317 trades, ecart median 0.00%, et 94% d'entre eux a
+                     ecart RIGOUREUSEMENT nul -> aucun frais preleve
+            VENTES :  70 trades, ecart median -4.27%, taux implicite median
+                     0.0595 -> frais bien reels, et PLUS ELEVES que ce que
+                     le bot supposait
+
+        Le code appliquait 0.051 DANS LES DEUX SENS. Deux erreurs de signe
+        oppose, qui se cumulaient dans la meme direction :
+          - il facturait des frais fantomes sur la COMPLETION (un achat),
+            donc sous-estimait son gain et en refusait de rentables ;
+          - il sous-estimait les frais de VENTE (0.051 au lieu de ~0.06),
+            donc surestimait le produit d'un TP ou d'un abandon.
+        Resultat : vendre paraissait meilleur qu'en realite, acheter la
+        seconde jambe paraissait pire. Exactement a l'envers.
+
+        CAS CONCRET, fenetre XRP 10:40-10:45 ET : completion de 11 parts a
+        0.62 sur une jambe a 0.35 (combine 0.97). Le bot calculait
+        +0.117$ apres des frais qui n'existent pas ; le gain reel est
+        +0.33$, ce qu'affichait l'interface Polymarket.
+
+        `sens` vaut "achat" ou "vente". La valeur par defaut reste "vente",
+        c'est-a-dire le comportement prudent : un appelant qui ne precise
+        rien continue de payer le taux le plus cher.
+
+        A RE-MESURER si le palier de frais du compte change (bronze ->
+        superieur) : ces deux taux sont empiriques, pas contractuels.
+        """
         try:
             p = float(price)
             n = float(shares)
@@ -3027,7 +3069,8 @@ class MultiTrader:
             return 0.0
         if n <= 0 or not (0 < p < 1):
             return 0.0
-        return (POLY_FEE_RATE + POLY_FEE_SAFETY) * min(p, 1 - p) * n
+        taux = POLY_FEE_RATE_ACHAT if sens == "achat" else POLY_FEE_RATE_VENTE
+        return taux * min(p, 1 - p) * n
 
     def _pair_net_after_fees(self, px_a, sh_a, px_b, sh_b,
                              maker_a=False, maker_b=False):
@@ -3053,9 +3096,15 @@ class MultiTrader:
             payout = min(float(sh_a), float(sh_b))
         except (TypeError, ValueError):
             return -999.0
+        # Les deux jambes d'une paire sont des ACHATS -> sens="achat".
+        # Mesure du 13/08 : les achats ne paient rien, meme en preneur. Les
+        # drapeaux maker_a/maker_b deviennent donc redondants ici, mais on
+        # les garde : ils resteront justes si le palier de frais change.
         cout = (
-            float(px_a) * float(sh_a) + (0.0 if maker_a else self._poly_fee(px_a, sh_a))
-            + float(px_b) * float(sh_b) + (0.0 if maker_b else self._poly_fee(px_b, sh_b))
+            float(px_a) * float(sh_a)
+            + (0.0 if maker_a else self._poly_fee(px_a, sh_a, "achat"))
+            + float(px_b) * float(sh_b)
+            + (0.0 if maker_b else self._poly_fee(px_b, sh_b, "achat"))
         )
         return round(payout - cout, 4)
 
@@ -6697,7 +6746,12 @@ class MultiTrader:
                     _comb_c = leg_seule["price"] + _ask_c
                     if _comb_c <= MAKER_OPEN_COMPLETION_MAX:
                         # cout reel = ask + frais taker sur CETTE jambe seulement
-                        _gain_c = _n_comp * (1 - _comb_c) - self._poly_fee(_ask_c, _n_comp)
+                        # ACHAT de la 2e jambe -> aucun frais (mesure 13/08).
+                        # Avant, on retranchait ici des frais fantomes : sur
+                        # la fenetre XRP 10:40-10:45 ET le gain reel etait
+                        # +0.33$ et le bot calculait +0.117$.
+                        _gain_c = _n_comp * (1 - _comb_c) - self._poly_fee(
+                            _ask_c, _n_comp, "achat")
                         if _gain_c > MAKER_OPEN_COMPLETION_MIN_GAIN:
                             # MSF-TPNOW : la completion est-elle marginale ET
                             # notre jambe montre-t-elle DEJA un mouvement
