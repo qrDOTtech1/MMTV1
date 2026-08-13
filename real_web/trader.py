@@ -967,6 +967,10 @@ def _cancel_before_s(sym):
 #   T=90s           TRAIN +3.94$  TEST +0.65$   <- retenu
 # On sacrifie 7 verrous sur 86 pour eviter 36 remplissages tardifs.
 MAKER_OPEN_NOFILL_CANCEL_S = 90
+# Delai avant de retenter une pose MSF refusee pour cause TRANSITOIRE
+# ("order manager not ready, please retry"). Court : la fenetre ne dure que
+# 300s et une pose tardive perd son interet (cf. MAKER_OPEN_NOFILL_CANCEL_S).
+MSF_RETRY_POST_S = 2.0
 # TP SUR JAMBE SEULE (Steven 07/08, "utiliser signal quand on tient 1 leg et
 # qu'on voit que le marche ne bouge pas assez vite de l'autre cote -> TP
 # maximal et se retirer sans poser l'autre").
@@ -7520,6 +7524,57 @@ class MultiTrader:
                 for i, side, tid, px in _post
             }
             _results_msf = {i: f.result() for i, f in _futs_msf.items()}
+
+        # ── RETRY DES REFUS TRANSITOIRES (Steven 13/08) ──────────────────
+        # Observe en direct sur XRP 1786596600 : les DEUX jambes refusees
+        # avec {'error': 'order manager not ready, please retry'}, donc
+        # "pose incomplete -> tout annule" + 60s de cooldown. La fenetre
+        # entiere est perdue alors que l'API demande explicitement de
+        # RESSAYER : ce n'est pas un refus, c'est un "pas encore".
+        # Le chemin agressif avait deja son RETRY-425 depuis le 24/07 ;
+        # le chemin MSF, lui, n'en avait aucun.
+        # On ne retente QUE sur les messages transitoires connus, une seule
+        # fois, et seulement s'il reste assez de fenetre pour que la pose
+        # ait un sens. Un refus de fond (taille, solde, marche ferme) tombe
+        # exactement comme avant.
+        _MSG_TRANSITOIRES = ("not ready", "please retry", "try again", "425")
+        _a_refaire = [
+            (i, side, tid, px) for i, side, tid, px in _post
+            if not _results_msf[i].get("success")
+            and any(_m in str(_results_msf[i].get("error") or "").lower()
+                    for _m in _MSG_TRANSITOIRES)
+        ]
+        if _a_refaire and (fin - time.time()) > _cancel_before_s(sym) + MSF_RETRY_POST_S:
+            self._log(
+                f"🔁 [MSF-RETRY] {sym} {slug} {len(_a_refaire)} jambe(s) refusee(s) "
+                f"pour cause transitoire ('order manager not ready') -> nouvelle "
+                f"tentative dans {MSF_RETRY_POST_S}s au lieu de perdre la fenetre"
+            )
+            time.sleep(MSF_RETRY_POST_S)
+            with ThreadPoolExecutor(max_workers=2) as _ex_r:
+                _futs_r = {
+                    i: _ex_r.submit(self._live.post_limit_buy, tid, px, parts)
+                    for i, side, tid, px in _a_refaire
+                }
+                for i, f in _futs_r.items():
+                    _r2 = f.result()
+                    if _r2.get("success"):
+                        _results_msf[i] = _r2
+                    else:
+                        # on garde le refus d'origine pour le journal, mais on
+                        # trace la 2e cause si elle differe
+                        _c2 = str(_r2.get("error") or "")[:150]
+                        self._tlog(
+                            f"msf_retry_ko_{sym}",
+                            f"⚠️ [MSF-RETRY] {sym} {slug} 2e tentative refusee "
+                            f"aussi : {_c2}",
+                        )
+            _ok2 = sum(1 for i, *_ in _a_refaire if _results_msf[i].get("success"))
+            if _ok2:
+                self._log(
+                    f"✅ [MSF-RETRY] {sym} {slug} {_ok2}/{len(_a_refaire)} jambe(s) "
+                    f"acceptee(s) au 2e essai -- fenetre sauvee"
+                )
         _chrono_t1 = time.time()
         _chrono_total_ms = round((_chrono_t1 - _chrono_t0) * 1000)
         _tim_parts = []
