@@ -386,6 +386,11 @@
         <button class="btn btn-raz" id="btn-ultra-real"><span>💰 ULTRA RÉEL OFF</span></button>
         <button class="btn btn-raz" id="btn-dn"><span>⚖️ DELTA-NEUTRE OFF</span></button>
         <button class="btn btn-ultra" id="btn-mm"><span>🎯 MARKET MAKER OFF</span></button>
+        <!-- INTERRUPTEUR COMPLETION (Steven 13/08) : OFF laisse enfin le TP
+             se declencher. Tant que la completion est ON, le TP est
+             structurellement inatteignable (elle part quand notre jambe vaut
+             ~0.31, le TP exige 0.525). -->
+        <button class="btn btn-ultra on" id="btn-comp"><span>🧩 COMPLÉTION ON</span></button>
         <button class="btn btn-hist" id="btn-hist"><span>📊 HISTORIQUE RÉEL</span></button>
         <button class="btn btn-raz" id="btn-raz"><span>🔄 RAZ</span></button>
         <span id="ultra-stats"></span>
@@ -656,6 +661,9 @@ const API={
   setDN:(enabled)=>fetch('/api/deltaneutral',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})}).then(r=>r.json()),
   setMM:(enabled)=>fetch('/api/marketmaker',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})}).then(r=>r.json()),
   resetMMKill:()=>fetch('/api/marketmaker/reset-kill',{method:'POST'}).then(r=>r.json()),
+  // COMPLETION MSF (Steven 13/08) : OFF = la jambe seule est conservee et
+  // geree par le TP / l'abandon / le cutoff. Seul moyen de voir un TP.
+  setCompletion:(on)=>fetch('/api/msf/completion-toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on})}).then(r=>r.json()),
   setFloor:(floor)=>fetch('/api/floor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({floor})}).then(r=>r.json()),
   setArbBudget:(arb_budget)=>fetch('/api/arb-budget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({arb_budget})}).then(r=>r.json()),
   curve:(rng)=>fetch('/api/curve?range='+(rng||300)).then(r=>r.json()),
@@ -833,6 +841,17 @@ function renderSnapshot(s){
       `RÉEL: ${s.poly.trades_done_real||0} arbs (${s.poly.wins_real||0}W) ${fmt(s.poly.pnl_total_real||0)} · `+
       `PAPER: ${s.poly.trades_done_paper||0} arbs (${s.poly.wins_paper||0}W) ${fmt(s.poly.pnl_total_paper||0)}`;
   } else { us.textContent=''; }
+
+  // ── COMPLETION MSF : etat du bouton (Steven 13/08) ──
+  // Absent du snapshot -> on considere ON, le comportement historique.
+  _compOn = (s.msf_completion_enabled !== false);
+  const cpb=document.getElementById('btn-comp');
+  if(cpb){
+    cpb.classList.toggle('on', _compOn);
+    cpb.innerHTML = _compOn
+      ? `<span>🧩 COMPLÉTION ON</span>`
+      : `<span>🚫 COMPLÉTION OFF — TP libre</span>`;
+  }
 
   // ── MARKET MAKER : etat bouton + stats ──
   _mmOn = !!(s.mm && s.mm.enabled);
@@ -1793,6 +1812,8 @@ let _ultraOn=false;
 let _ultraRealOn=false;
 let _mmOn=false;
 let _dnOn=false;
+// COMPLETION MSF : defaut ON, c'est le comportement historique.
+let _compOn=true;
 document.getElementById('btn-ultra').addEventListener('click',async()=>{await API.setUltra(!_ultraOn);});
 document.getElementById('btn-dn').addEventListener('click',async()=>{
   if(!_dnOn && !confirm("Activer DELTA-NEUTRE en réel ?\n(poste un bid des 2 côtés crypto, capture l'arb-au-bid via WebSocket)"))return;
@@ -1805,6 +1826,21 @@ document.getElementById('btn-ultra-real').addEventListener('click',async()=>{
 document.getElementById('btn-mm').addEventListener('click',async()=>{
   if(!_mmOn && !confirm("Activer le MARKET MAKER en argent réel ?\n(taille minimale, plafonds d'inventaire + kill switch actifs)"))return;
   await API.setMM(!_mmOn);
+});
+// COMPLETION MSF : l'eteindre est le SEUL moyen de voir un TP se declencher,
+// mais cela expose le compte a la branche mesuree comme perdante -> on
+// confirme a l'extinction, jamais a l'allumage.
+document.getElementById('btn-comp').addEventListener('click',async()=>{
+  if(_compOn && !confirm(
+    "ÉTEINDRE LA COMPLÉTION ?\n\n"
+    +"Les jambes seules ne seront plus verrouillées : elles iront au TP, "
+    +"à l'abandon ou au cutoff. C'est le seul moyen de voir le TP se "
+    +"déclencher (tant que la complétion est ON il est inatteignable).\n\n"
+    +"MESURE SUR 82 FENÊTRES RÉELLES :\n"
+    +"  complétées   : 83% gagnantes, +0.251$/fenêtre\n"
+    +"  jambes seules : 13% gagnantes, -1.064$/fenêtre\n\n"
+    +"À laisser OFF le temps d'une mesure, pas à oublier."))return;
+  await API.setCompletion(!_compOn);
 });
 document.getElementById('btn-raz').addEventListener('click',async()=>{
   if(!confirm("RAZ : remettre à zéro toutes les stats paper ?\n(backup automatique, positions réelles conservées)"))return;

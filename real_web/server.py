@@ -183,7 +183,14 @@ def precheck():
 
 @app.route("/api/snapshot")
 def snapshot():
-    return jsonify(trader.snapshot())
+    snap = trader.snapshot()
+    # Interrupteurs MSF exposes au premier niveau : le dashboard les lit
+    # directement sur le snapshot (il n'appelle pas /api/enginebtb3, ou
+    # vivent les autres champs maker_open). Voir /api/msf/completion-toggle.
+    snap["msf_completion_enabled"] = bool(
+        trader.state.get("msf_completion_enabled", True))
+    snap["msf_tp_enabled"] = bool(trader.state.get("msf_tp_enabled", True))
+    return jsonify(snap)
 
 
 @app.route("/api/risk-config")
@@ -1075,6 +1082,10 @@ def api_arb_quality():
         # INTERRUPTEUR TP (Steven 07/08, MSF) : reglable a chaud, voir
         # /api/msf/tp-toggle. Defaut True si jamais bascule.
         "msf_tp_enabled": bool(trader.state.get("msf_tp_enabled", True)),
+        # INTERRUPTEUR COMPLETION (Steven 13/08), voir
+        # /api/msf/completion-toggle. Defaut True = comportement historique.
+        "msf_completion_enabled": bool(
+            trader.state.get("msf_completion_enabled", True)),
         "symbols": list(getattr(trader_mod, "MAKER_OPEN_SYMBOLS", ())),
         "prix": float(getattr(trader_mod, "MAKER_OPEN_PRICE", 0.46)),
         "tp_mult": float(getattr(trader_mod, "MAKER_OPEN_TP_MULT", 1.8)),

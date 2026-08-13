@@ -6669,7 +6669,30 @@ class MultiTrader:
                 for _k in ("comp_maker_oid", "comp_maker_px", "comp_maker_ts"):
                     leg_seule.pop(_k, None)
 
-            if (MAKER_OPEN_COMPLETION_ENABLED and leg_seule.get("price") is not None
+            # INTERRUPTEUR DE COMPLETION (Steven 13/08, reglable a chaud
+            # depuis le dashboard -- voir /api/msf/completion-toggle).
+            #
+            # POURQUOI IL EXISTE. Steven demandait depuis des heures a voir
+            # des TP se declencher. Ils ne le peuvent pas : les deux cotes
+            # sommant a ~1.01, la completion part des que l'autre cote passe
+            # sous 0.70 (combine 1.05), soit quand NOTRE jambe vaut ~0.31 --
+            # tres loin des 0.525 qu'exige le TP. Notre jambe qui monte de X
+            # EST l'autre cote qui baisse de X : c'est le meme evenement vu
+            # des deux cotes, et la completion franchit son seuil en premier,
+            # toujours. Mesure : sur la fenetre XRP 10:40-10:45 ET, completion
+            # 12 SECONDES apres le fill. Le TP n'a jamais la main.
+            #
+            # Eteindre la completion est donc le SEUL moyen de tester ce que
+            # vaut vraiment le TP. C'est une experience, pas un reglage : la
+            # completion reste la branche mesuree comme rentable (52 fenetres
+            # reelles, 83% gagnantes, +0.251$/fenetre, contre 13% et
+            # -1.064$ pour les jambes seules). L'eteindre expose donc
+            # volontairement le compte a la branche perdante -- a ne laisser
+            # OFF que le temps de mesurer, et a rallumer si le TP ne tient
+            # pas sa promesse.
+            _comp_on = bool(self.state.get("msf_completion_enabled", True))
+            if (MAKER_OPEN_COMPLETION_ENABLED and _comp_on
+                    and leg_seule.get("price") is not None
                     and _leg_autre_c.get("token_id")
                     and not leg_seule.get("tp_passif_order_id")
                     and _hold_s >= MAKER_OPEN_COMPLETION_MIN_HOLD_S
