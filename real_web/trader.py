@@ -1001,6 +1001,31 @@ MAKER_OPEN_NOFILL_CANCEL_S = 90
 # TP -- ameliore mais pas gagnant). Echantillon ETH 8x plus petit que BTC (65
 # vs 519 fenetres) : le signe de son edge reste incertain, contrairement a BTC.
 MAKER_OPEN_TP_MULT = 1.8          # conserve pour le mode calme / historique
+# TP PLUS PRECOCE, PAR SYMBOLE (Steven 13/08, "des TP comme avant, 35c to
+# 55c"). x1.8 exige 0.63 sur une entree a 0.35 -- mesure : 0 declenchement
+# sur 694 fenetres de backtest. Raison structurelle : notre jambe qui monte
+# de X = l'autre cote qui baisse de X = le combine qui baisse de X -> soit la
+# completion se declenche avant 0.63 (bon, on gagne quand meme), soit combien
+# grimpe a la place -> l'abandon prend le relais avant que 0.63 soit atteint
+# (mauvais, aucune sortie gagnante n'a eu la chance de s'armer). Un seuil
+# PLUS BAS (x1.5 = 0.525, dans la fourchette "35c to 55c" demandee) donne au
+# TP une vraie chance d'agir dans la ZONE MORTE entre completion et abandon --
+# exactement la zone ou 35% des jambes seules XRP ne recevaient aucune
+# gestion (mesure du 13/08). Poser un ask passif qui n'est jamais servi ne
+# coute rien (verifie on-chain : aucun evenement ORDER ni CANCEL) -- risque
+# asymetrique favorable, contrairement a l'abandon ou chaque seconde
+# d'attente est une seconde de perte potentielle.
+# BTC/ETH gardent 1.8 (mesure et validee ailleurs cette session). Les 4
+# symboles a carnet fin recoivent 1.5 -- pose par raisonnement (la fourchette
+# que Steven demande), PAS mesuree par backtest fiable.
+MAKER_OPEN_TP_MULT_PAR_SYMBOLE = {
+    "BTC": 1.8, "ETH": 1.8,
+    "SOL": 1.5, "XRP": 1.5, "DOGE": 1.5, "BNB": 1.5,
+}
+
+
+def _tp_mult(sym):
+    return MAKER_OPEN_TP_MULT_PAR_SYMBOLE.get(sym, MAKER_OPEN_TP_MULT)
 # SCALP APPORTEUR DES L'ENTREE (Steven 12/08, "si on TP tres rapidement il y a
 # de la marge ici aussi"). Le TP multiplicatif exigeait 0.35 x 1.8 = 0.63 : il
 # ne s'est declenche ZERO fois sur 694 fenetres de backtest, TRAIN et TEST
@@ -1043,6 +1068,24 @@ MAKER_OPEN_TP_MULT = 1.8          # conserve pour le mode calme / historique
 # QU'APRES la disparition de toute chance de verrou.
 MAKER_OPEN_TP_OFFSET = 0.02       # conserve pour reference, plus utilise
 MAKER_OPEN_TP_MIN_HOLD_S = 15
+# ATTENTE PLUS COURTE AVANT D'ARMER LE TP, PAR SYMBOLE (Steven 13/08). Sur un
+# carnet fin qui bouge vite (mesure : XRP Up 0.35 -> 0.18 en 12s, cas du
+# 13/08), un rallye favorable peut monter PUIS retomber avant que les 15s
+# d'attente n'expirent -- le TP n'a alors jamais eu la moindre chance de
+# s'armer. Poser l'ask plus tot ne coute rien s'il n'est pas servi (meme
+# argument que le seuil ci-dessus) ; le seul risque est d'armer a un niveau
+# legerement bas si le prix continue de monter -- mineur compare a rater le
+# rallye entier. BTC/ETH gardent 15s (mesure et validee). Les 4 symboles a
+# carnet fin passent a 5s, symetrique au comp_hold_s deja utilise pour la
+# completion (meme raisonnement, meme ordre de grandeur).
+MAKER_OPEN_TP_MIN_HOLD_S_PAR_SYMBOLE = {
+    "BTC": 15, "ETH": 15,
+    "SOL": 5, "XRP": 5, "DOGE": 5, "BNB": 5,
+}
+
+
+def _tp_min_hold_s(sym):
+    return MAKER_OPEN_TP_MIN_HOLD_S_PAR_SYMBOLE.get(sym, MAKER_OPEN_TP_MIN_HOLD_S)
 # ABANDON : la paire est devenue hors d'atteinte (Steven 12/08). Au-dessus de
 # ce combine, ni la completion (plafond 1.05) ni le scalp n'ont de chance : la
 # jambe n'est plus un demi-arbitrage, c'est un pari directionnel perdant.
@@ -6404,7 +6447,7 @@ class MultiTrader:
                 # RETOUR AU MULTIPLICATIF (cf. bloc SCALP DESACTIVE ci-dessus) :
                 # l'offset +0.02 vendait la jambe avant que le verrou puisse
                 # se former.
-                _tp_seuil = leg_seule["price"] * MAKER_OPEN_TP_MULT
+                _tp_seuil = leg_seule["price"] * _tp_mult(sym)
 
             # ── SUIVI D'UN TP PASSIF DEJA POSTE (Steven 08/08, "sortie MAKER
             # au lieu d'agressive") : backteste sur 586 fenetres, frais de
@@ -6515,13 +6558,13 @@ class MultiTrader:
                     self._record_book_snapshot(
                         sym, slug, leg_seule["side"], _book_tp, leg_seule["price"],
                         _tp_seuil, _hold_s, mk.get("danger", 0),
-                        triggered=bool(_cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil),
+                        triggered=bool(_cur is not None and _hold_s >= _tp_min_hold_s(sym) and _cur >= _tp_seuil),
                     )
             # POSE IMMEDIATE ANNULEE (Steven 12/08, solde 20$ -> 3$) : poster
             # l'ask des le remplissage vendait la jambe avant que l'autre cote
             # ait eu le temps de toucher 0.35 -> plus aucun verrou. On exige a
             # nouveau que le prix ATTEIGNE le seuil avant de poster.
-            if _cur is not None and _hold_s >= MAKER_OPEN_TP_MIN_HOLD_S and _cur >= _tp_seuil:
+            if _cur is not None and _hold_s >= _tp_min_hold_s(sym) and _cur >= _tp_seuil:
                 # RELECTURE FRAICHE DE LA QUANTITE (Steven 07/08, "24 TP dont
                 # 11 rates a parts=0.0"). `fills[cote_seule]` vient d'une
                 # lecture faite PLUS TOT dans ce meme cycle -- position_size()
