@@ -7640,7 +7640,23 @@ class MultiTrader:
         # fois, et seulement s'il reste assez de fenetre pour que la pose
         # ait un sens. Un refus de fond (taille, solde, marche ferme) tombe
         # exactement comme avant.
-        _MSG_TRANSITOIRES = ("not ready", "please retry", "try again", "425")
+        # LISTE ELARGIE (Steven 13/08, 2e observation) : la 1re version ne
+        # couvrait que "order manager not ready". Vu en direct sur
+        # xrp-updown-5m-1786598700, les deux jambes sont tombees sur des
+        # motifs DIFFERENTS et non couverts -- "Request exception!" d'un cote,
+        # "order timed out" de l'autre -- avec pose_parallele=11423ms. Onze
+        # secondes pour poster : ce n'est pas un refus metier, c'est le
+        # reseau ou le CLOB qui rame, exactement le cas ou il faut ressayer.
+        #
+        # On ne liste QUE des defaillances de transport ou de disponibilite.
+        # Un refus de fond -- solde insuffisant, taille invalide, marche
+        # ferme, prix hors bornes -- ne contient aucun de ces motifs et
+        # continue de tomber immediatement, sans retry.
+        _MSG_TRANSITOIRES = (
+            "not ready", "please retry", "try again", "425",
+            "timed out", "timeout", "request exception", "connection",
+            "temporarily", "unavailable", "502", "503", "504", "429",
+        )
         _a_refaire = [
             (i, side, tid, px) for i, side, tid, px in _post
             if not _results_msf[i].get("success")
