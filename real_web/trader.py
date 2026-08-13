@@ -1136,8 +1136,35 @@ MAKER_OPEN_ABANDON_MIN_HOLD_S_PAR_SYMBOLE = {
 }
 
 
+# ── AUCUN SL AVANT 1min40 (Steven 13/08, consigne explicite) ──────────────
+# "INTERDIT SL si ordre pose il y a moins de 1min40 ! sa nous a coute 6$ sur
+# la derniere fenetre (manque a gagner) ! il a coupe trop tot !"
+#
+# CAS DECLENCHEUR, fenetre XRP 1:05-1:10AM ET : servi a t+13s pour 10.76
+# parts a 0.35, ABANDONNE a t+64s a 0.15. Cinquante-et-une secondes de
+# detention. Le min_hold XRP valait 10s et la persistance 12s : les deux
+# etaient largement satisfaits, l'abandon etait donc "legitime" au sens du
+# code -- et pourtant destructeur, parce qu'il restait encore 236 secondes
+# de fenetre pour que le prix revienne, ce qu'il a fait.
+#
+# CE QUE CE SEUIL NE BLOQUE PAS, et c'est essentiel : la fermeture forcee au
+# cutoff (T-75s sur XRP) reste intacte -- elle n'est pas un SL de confort
+# mais le filet qui evite de rester coince dans un carnet qui se vide. Le TP
+# n'est pas concerne non plus : on n'interdit que les sorties EN PERTE.
+# Consequence a connaitre : une jambe servie apres T-175s ne pourra jamais
+# etre abandonnee volontairement (100s de detention depasseraient le cutoff),
+# elle ira au cutoff. C'est voulu.
+MSF_SL_MIN_HOLD_S = 100.0
+
+
 def _abandon_min_hold_s(sym):
-    return MAKER_OPEN_ABANDON_MIN_HOLD_S_PAR_SYMBOLE.get(sym, 0)
+    """Detention minimale avant toute coupe volontaire.
+
+    Le plancher global MSF_SL_MIN_HOLD_S prime : la table par symbole ne peut
+    que l'ALLONGER, jamais le raccourcir.
+    """
+    return max(MSF_SL_MIN_HOLD_S,
+               MAKER_OPEN_ABANDON_MIN_HOLD_S_PAR_SYMBOLE.get(sym, 0))
 
 
 # ── MSF-TPNOW : PRIORITE AU TP SUR UNE COMPLETION MARGINALE (Steven 13/08) ──
@@ -7234,7 +7261,20 @@ class MultiTrader:
                         f"bid {_bid_sl:.3f} | TP {CALM_MSF_TP_PRICE:.2f} | "
                         f"SL {CALM_MSF_SL_PRICE:.2f} -> sous surveillance",
                     )
-                if _bid_sl is not None and _bid_sl <= CALM_MSF_SL_PRICE:
+                # MEME PLANCHER DE DETENTION que l'abandon (Steven 13/08) :
+                # ce chemin-ci n'avait AUCUN min_hold, il pouvait donc couper
+                # dans la seconde suivant le fill. C'est exactement le
+                # comportement que la consigne interdit.
+                if (_bid_sl is not None and _bid_sl <= CALM_MSF_SL_PRICE
+                        and _hold_s < MSF_SL_MIN_HOLD_S):
+                    self._tlog(
+                        f"makeropen_calm_sl_jeune_{sym}",
+                        f"⏳ [MAKER-OUVERT-CALM-SL] {sym} {slug} bid {_bid_sl:.3f} "
+                        f"sous le seuil MAIS position agee de {_hold_s:.0f}s "
+                        f"seulement (< {MSF_SL_MIN_HOLD_S:.0f}s) -> on NE COUPE PAS, "
+                        f"on laisse le prix respirer",
+                    )
+                elif _bid_sl is not None and _bid_sl <= CALM_MSF_SL_PRICE:
                     _n_sl = self._live.position_size(leg_seule["token_id"])
                     _n_sl = round(_n_sl, 2) if _n_sl and _n_sl > 0.01 else 0.0
                     if _n_sl >= 0.01:
