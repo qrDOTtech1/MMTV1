@@ -6284,10 +6284,71 @@ class MultiTrader:
             if (fa <= 0.01 and fb <= 0.01
                     and _ecoule >= MAKER_OPEN_NOFILL_CANCEL_S
                     and reste > _cancel_before_s(sym)):
+                # ANNULATION VERIFIEE, PUIS RELECTURE DES POSITIONS
+                # (Steven 13/08, trouve sur la fenetre XRP 00:25-00:30 ET).
+                #
+                # LE BUG : cette annulation etait tiree "en aveugle" avec
+                # cancel_order(), sans verifier qu'elle avait abouti, et le
+                # slug etait retire de l'etat MSF juste apres. Si un ordre
+                # etait deja en train d'etre servi -- ou si l'annulation
+                # echouait -- le fill arrivait dans une fenetre que MSF avait
+                # DEJA OUBLIEE. La position devenait alors un simple "orphan"
+                # sans le tag maker_open, donc geree par _manage_pnl_tier_exits
+                # et PLUS DU TOUT par _manage_maker_open : plus de TP a x1.5,
+                # plus de completion, plus d'abandon raisonne, plus de
+                # MSF-TPNOW, plus de garde-fou spot. Tous les reglages de la
+                # nuit sautaient d'un coup pour ces positions.
+                #
+                # CAS REEL MESURE, fenetre XRP 00:25-00:30 ET : ordre servi a
+                # 111s (donc APRES les 90s de retrait), 11.14 parts a 0.35.
+                # Le bid est ensuite reste AU-DESSUS du seuil de TP (0.525)
+                # pendant 70 secondes d'affilee, jusqu'a 0.67 -- sans que rien
+                # ne se declenche, puisque MSF ne savait plus que la position
+                # existait. Elle a fini a +7.13$ par pur hasard de resolution,
+                # apres etre repassee a 0.27 juste avant le cutoff.
+                #
+                # AMPLEUR : 15 des 108 fills reels a 0.35 (14%) arrivent apres
+                # 90s. C'est donc une position sur sept qui echappait a toute
+                # la gestion MSF.
+                #
+                # LE CORRECTIF, en deux temps : (1) on exige une annulation
+                # VERIFIEE, comme partout ailleurs dans ce fichier ; (2) meme
+                # si elle reussit, on RELIT les positions avant d'oublier la
+                # fenetre, parce qu'un fill peut etre parti entre la lecture du
+                # debut de boucle et maintenant. Au moindre doute on GARDE le
+                # slug sous gestion MSF : le pire cas est de gerer une fenetre
+                # vide, ce qui ne coute rien, alors que l'oublier a tort coute
+                # une position entiere livree a elle-meme.
+                _annul_ok = True
                 for cote in ("a", "b"):
                     oid = (e.get(cote) or {}).get("order_id")
                     if oid:
-                        self._live.cancel_order(oid)
+                        if self._cancel_verifie(
+                                oid,
+                                f" {sym} {slug} {(e.get(cote) or {}).get('side','?')} "
+                                f"MSF-RETRAIT"):
+                            e[cote]["order_id"] = None
+                        else:
+                            _annul_ok = False
+                # relecture : un fill a-t-il eu lieu entre-temps ?
+                _apres = {}
+                for cote in ("a", "b"):
+                    _tid_a = (e.get(cote) or {}).get("token_id")
+                    if not _tid_a:
+                        continue
+                    _h = self._live.position_size(_tid_a)
+                    _apres[cote] = max(0.0, _h if _h and _h > 0 else 0.0)
+                if not _annul_ok or any(v > 0.01 for v in _apres.values()):
+                    self._tlog(
+                        f"makeropen_retrait_course_{sym}",
+                        f"🛟 [MSF-RETRAIT] {sym} {slug} annulation incomplete ou "
+                        f"fill arrive pendant le retrait "
+                        f"(a={_apres.get('a', 0):.2f} b={_apres.get('b', 0):.2f}) "
+                        f"-> la fenetre RESTE sous gestion MSF. Sans ca la position "
+                        f"devenait orphan : ni TP, ni completion, ni abandon.",
+                    )
+                    self._save()
+                    continue
                 self._log(
                     f"🚪 [MSF-RETRAIT] {sym} {slug} aucune jambe servie apres "
                     f"{int(_ecoule)}s -> les 2 ordres retires. Un remplissage a "
