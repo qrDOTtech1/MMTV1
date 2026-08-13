@@ -1026,39 +1026,6 @@ MAKER_OPEN_TP_MULT_PAR_SYMBOLE = {
 
 def _tp_mult(sym):
     return MAKER_OPEN_TP_MULT_PAR_SYMBOLE.get(sym, MAKER_OPEN_TP_MULT)
-
-
-def _completion_ask_max(sym):
-    """Prix maximum accepte pour ACHETER la 2e jambe (None = pas de plafond).
-
-    Voir MAKER_OPEN_COMPLETION_ASK_MAX. Limite aux symboles TPNOW : BTC/ETH
-    gardent le comportement valide en backtest.
-    """
-    if sym in MAKER_OPEN_TPNOW_SYMBOLES:
-        return MAKER_OPEN_COMPLETION_ASK_MAX
-    return None
-
-
-def _tp_seuil_prix(sym, prix_entree):
-    """Prix de declenchement du TP.
-
-    Absolu (0.52) sur les symboles TPNOW, multiplicatif ailleurs.
-
-    POURQUOI CE COUPLE DE SEUILS DEBLOQUE ENFIN LE TP -- le commentaire du
-    bloc SCALP ci-dessous l'avait deja demontre sur 694 fenetres de backtest :
-    notre jambe qui monte de X = l'autre cote qui baisse de X, donc completion
-    et TP sont LE MEME EVENEMENT vu des deux cotes, et celui dont le seuil est
-    atteint en premier gagne toujours la course. Avec l'ancien reglage la
-    completion se declenchait des que l'autre cote passait sous ~0.70 (combine
-    1.05), soit notre jambe a ~0.31 -- tres loin des 0.525 du TP, qui ne
-    pouvait donc JAMAIS se declencher (zero fois sur 694 fenetres, mesure).
-    En plafonnant l'achat a 0.49, la completion attend que notre jambe vaille
-    ~0.51 : les deux seuils deviennent adjacents et le TP redevient
-    atteignable. MSF-TPNOW sert alors d'arbitre sur la zone de recouvrement.
-    """
-    if sym in MAKER_OPEN_TPNOW_SYMBOLES:
-        return MAKER_OPEN_TP_PRIX_ABS
-    return prix_entree * _tp_mult(sym)
 # SCALP APPORTEUR DES L'ENTREE (Steven 12/08, "si on TP tres rapidement il y a
 # de la marge ici aussi"). Le TP multiplicatif exigeait 0.35 x 1.8 = 0.63 : il
 # ne s'est declenche ZERO fois sur 694 fenetres de backtest, TRAIN et TEST
@@ -1193,32 +1160,6 @@ MAKER_OPEN_TPNOW_MOMENTUM_FRAC = 0.70       # notre jambe doit deja avoir
                                              # parcouru 70% du chemin vers le
                                              # seuil de TP -- signal engage,
                                              # pas un espoir
-
-# ── PLAFOND DE PRIX SUR LA JAMBE DE COMPLETION + TP ABSOLU ─────────────────
-# Steven 13/08, apres la fenetre XRP 10:35-10:40PM ET : le bot a complete en
-# achetant Up a 0.60 (combine 0.95 -> +0.21$ garanti). Trade correct mais
-# INEFFICACE EN CAPITAL : il immobilise 4.03$ jusqu'a la resolution pour
-# 0.21$, sur une bankroll de ~10$. Sa consigne : "je veux voir des TP".
-#
-# LES DEUX SEUILS SONT COMPLEMENTAIRES, PAS INDEPENDANTS. Les deux cotes se
-# somment a ~1.01 : si l'autre cote cote 0.49 a l'achat, NOTRE jambe vaut
-# ~0.51 a la vente. Plafonner la completion a 0.49 et poser le TP a 0.52
-# range donc les deux regimes bout a bout sur la meme echelle de prix :
-#   autre cote > 0.49  (notre jambe < ~0.51) -> ni completion ni TP : on tient
-#   autre cote <= 0.49 (notre jambe >= ~0.51) -> completion possible
-#   notre jambe >= 0.52                       -> TP, on encaisse
-# Au-dessus de 0.52 le TP prend la main : c'est exactement ce que Steven veut
-# voir se declencher.
-#
-# RISQUE ASSUME, CHIFFRE : une completion refusee laisse une JAMBE SEULE. Sur
-# les 25 dernieres fenetres XRP reelles, les jambes seules non completees
-# ("orphan"/"unwind") sortent entre -1.0$ et -1.7$ piece, quand une completion
-# a 0.95 rapportait +0.21$ GARANTI. Ce reglage echange donc un petit gain sur
-# pour un pari : il ne se justifie que si le TP a 0.52 se declenche vraiment
-# assez souvent. C'est precisement la mesure a faire tourner en live avant de
-# le laisser en place -- il est deliberement limite aux 4 symboles TPNOW.
-MAKER_OPEN_COMPLETION_ASK_MAX = 0.49   # prix max paye pour la 2e jambe
-MAKER_OPEN_TP_PRIX_ABS = 0.52          # seuil de TP en prix absolu
 
 
 # PERSISTANCE AVANT ABANDON (Steven 13/08, "le SL plombe le peu qui a a
@@ -6408,19 +6349,7 @@ class MultiTrader:
                     # combine tres proche de 1.00 sur une petite position ne
                     # vaut pas la peine d'immobiliser du capital.
                     _gain_m = _n_comp * (1 - _comb_m)
-                    # PLAFOND DE PRIX SUR LA JAMBE ACHETEE (voir
-                    # _completion_ask_max) : au-dela, on laisse la place au TP.
-                    _capm = _completion_ask_max(sym)
-                    _cap_ok_m = _capm is None or _bid_c <= _capm
-                    if not _cap_ok_m:
-                        self._tlog(
-                            f"makeropen_comp_capm_{sym}",
-                            f"🚦 [COMPLETION-PLAFOND] {sym} {slug} 2e jambe a "
-                            f"{_bid_c:.3f} > {_capm:.2f} -> on ne complete PAS, "
-                            f"notre jambe ({leg_seule['price']:.3f}) a la place "
-                            f"de monter vers le TP {_tp_seuil_prix(sym, leg_seule['price']):.3f}",
-                        )
-                    if (_cap_ok_m and _comb_m <= MAKER_OPEN_COMPLETION_MAX
+                    if (_comb_m <= MAKER_OPEN_COMPLETION_MAX
                             and _gain_m > MAKER_OPEN_COMPLETION_MIN_GAIN):
                         # ANNULER D'ABORD L'ORDRE D'ORIGINE DE CE COTE
                         # (Steven 11/08, trouve sur la 1re completion reelle).
@@ -6470,19 +6399,7 @@ class MultiTrader:
 
                 if _n_comp >= 0.01 and _ask_c is not None:
                     _comb_c = leg_seule["price"] + _ask_c
-                    # MEME PLAFOND que le chemin apporteur ci-dessus : sans lui
-                    # la completion au marche rattraperait par la fenetre ce
-                    # qu'on vient de refuser par la porte.
-                    _capc = _completion_ask_max(sym)
-                    if _capc is not None and _ask_c > _capc:
-                        self._tlog(
-                            f"makeropen_comp_capc_{sym}",
-                            f"🚦 [COMPLETION-PLAFOND] {sym} {slug} 2e jambe au marche a "
-                            f"{_ask_c:.3f} > {_capc:.2f} -> refus, on garde la jambe "
-                            f"seule et on vise le TP a "
-                            f"{_tp_seuil_prix(sym, leg_seule['price']):.3f}",
-                        )
-                    elif _comb_c <= MAKER_OPEN_COMPLETION_MAX:
+                    if _comb_c <= MAKER_OPEN_COMPLETION_MAX:
                         # cout reel = ask + frais taker sur CETTE jambe seulement
                         _gain_c = _n_comp * (1 - _comb_c) - self._poly_fee(_ask_c, _n_comp)
                         if _gain_c > MAKER_OPEN_COMPLETION_MIN_GAIN:
@@ -6502,7 +6419,7 @@ class MultiTrader:
                                 except Exception:
                                     _bid_notre = None
                                 if _bid_notre is not None:
-                                    _seuil_tpnow = _tp_seuil_prix(sym, leg_seule["price"])
+                                    _seuil_tpnow = leg_seule["price"] * _tp_mult(sym)
                                     _chemin = _seuil_tpnow - leg_seule["price"]
                                     _parcouru = _bid_notre - leg_seule["price"]
                                     if _chemin > 0 and _parcouru >= MAKER_OPEN_TPNOW_MOMENTUM_FRAC * _chemin:
@@ -6517,11 +6434,82 @@ class MultiTrader:
                                             f"un gain qui n'arrive qu'a la resolution 🚀💵"
                                         )
                             if _tpnow_agi:
-                                # ON SAUTE LA COMPLETION CE CYCLE : le `continue`
-                                # renvoie au slug suivant sans depenser un centime
-                                # ici -- ce meme slug sera reconsidere au prochain
-                                # appel de _manage_maker_open (poll suivant), avec
-                                # une chance que le TP se soit arme entre-temps.
+                                # ON PREND LE TP TOUT DE SUITE, A LA PLACE DE LA
+                                # COMPLETION (Steven 13/08 : "tout ce que je
+                                # demande depuis le depart c'est que MSF-TPNOW
+                                # prenne le TP a sa place").
+                                #
+                                # La version precedente se contentait de SAUTER
+                                # la completion en esperant que le flux de TP
+                                # plus bas s'arme au cycle suivant. Il ne s'armait
+                                # quasiment jamais : le TP passif exige que le
+                                # prix atteigne le seuil PLEIN (x1.8, ou x1.5),
+                                # alors que TPNOW se declenche a 70% du chemin.
+                                # On renoncait donc a la completion sans rien
+                                # encaisser -- le pire des deux mondes.
+                                #
+                                # L'ARITHMETIQUE EST SANS APPEL a ce point precis :
+                                # la porte d'entree exige deja que la completion
+                                # rapporte MOINS de 0.06$ ET que notre jambe ait
+                                # parcouru 70% du chemin vers le seuil. Sur XRP
+                                # (entree 0.35, seuil 0.525) ces 70% valent
+                                # +0.1225/part, soit ~+0.66$ net sur 6.72 parts,
+                                # contre <0.06$ pour la completion. On ne sacrifie
+                                # pas un gros gain garanti : on en prend un ~10x
+                                # plus gros, et en cash immediat.
+                                #
+                                # Mesure sur 36 h de carnet XRP (197 declenchements
+                                # reels) : a l'instant de la completion, vendre
+                                # notre jambe rapporte 1.576$ contre 1.601$ pour
+                                # la completion -- 2.5 centimes d'ecart, 1.5%.
+                                # Mais la completion DEPENSE ~3.29$ et bloque le
+                                # capital 164s (median) plus le delai de
+                                # redemption (2.8min median, 22min au p90), la
+                                # ou le TP fait RENTRER ~4.70$ immediatement.
+                                #
+                                # On annule d'abord TOUT ordre encore vivant sur
+                                # ce slug -- surtout le bid de l'autre cote : se
+                                # faire servir apres avoir vendu notre jambe
+                                # ouvrirait une position nue.
+                                for _oid_tn in (leg_seule.get("tp_passif_order_id"),
+                                                (_leg_autre_c or {}).get("order_id")):
+                                    if _oid_tn:
+                                        self._live.cancel_order(_oid_tn)
+                                for _k in ("tp_passif_order_id", "tp_passif_price",
+                                           "tp_passif_qty", "tp_passif_posted_ts"):
+                                    leg_seule.pop(_k, None)
+                                _vendu_tn = self._sell_orphan(
+                                    leg_seule["token_id"], _n_comp,
+                                    f" {sym} {slug} {leg_seule['side']} MSF-TPNOW",
+                                    entry_price=leg_seule["price"], symbol=sym,
+                                    slug=slug, side=leg_seule["side"],
+                                )
+                                if _vendu_tn >= _n_comp - 0.01:
+                                    self._log(
+                                        f"💸 [MSF-TPNOW] {sym} {slug} {leg_seule['side']} "
+                                        f"ENCAISSE {_vendu_tn:.2f} parts au lieu de completer "
+                                        f"-> cash immediat, zero capital immobilise 🚀💵"
+                                    )
+                                    self._maker_open_record(
+                                        sym, slug, "tp", combine=round(_comb_c, 4),
+                                        parts=round(_n_comp, 2), prix=leg_seule["price"],
+                                        vendu=round(_vendu_tn, 2), exec_mode="tpnow",
+                                        calm=e.get("calm", False),
+                                    )
+                                    mk.setdefault("makeropen_cooldown", {})[slug] = \
+                                        e.get("fin_ts", now) + 5
+                                    st.pop(slug, None)
+                                    self._save()
+                                    continue
+                                # vente ratee ou partielle -> on ne complete PAS
+                                # ce cycle (on vient d'annuler l'ordre de l'autre
+                                # cote) et on repassera au prochain poll.
+                                self._log(
+                                    f"⚠️ [MSF-TPNOW] {sym} {slug} vente incomplete "
+                                    f"({_vendu_tn:.2f}/{_n_comp:.2f} parts) -> on retente "
+                                    f"au prochain cycle"
+                                )
+                                self._save()
                                 continue
                             self._log(
                                 f"🧩 [MAKER-OUVERT-COMPLETION] {sym} {slug} jambe seule "
@@ -6671,7 +6659,7 @@ class MultiTrader:
                 # RETOUR AU MULTIPLICATIF (cf. bloc SCALP DESACTIVE ci-dessus) :
                 # l'offset +0.02 vendait la jambe avant que le verrou puisse
                 # se former.
-                _tp_seuil = _tp_seuil_prix(sym, leg_seule["price"])
+                _tp_seuil = leg_seule["price"] * _tp_mult(sym)
 
             # ── SUIVI D'UN TP PASSIF DEJA POSTE (Steven 08/08, "sortie MAKER
             # au lieu d'agressive") : backteste sur 586 fenetres, frais de
