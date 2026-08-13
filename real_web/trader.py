@@ -1136,6 +1136,32 @@ def _abandon_min_hold_s(sym):
     return MAKER_OPEN_ABANDON_MIN_HOLD_S_PAR_SYMBOLE.get(sym, 0)
 
 
+# ── MSF-TPNOW : PRIORITE AU TP SUR UNE COMPLETION MARGINALE (Steven 13/08) ──
+# Question de Steven, verifiee : la completion ACHETE (depense du cash
+# MAINTENANT, gain encaisse seulement a la resolution, minutes plus tard) ;
+# le TP VEND ce qu'on detient deja (encaisse du cash MAINTENANT, position
+# fermee, zero capital immobilise). Exemple reel a 6.72 parts, entree 0.35 :
+#   completion @0.60 -> DEPENSE 4.03$ maintenant, gain +0.30$ encaisse a la
+#                        resolution (delai median mesure 2.8min, jusqu'a 22min)
+#   TP @0.525         -> ENCAISSE 3.53$ MAINTENANT, gain +1.18$ deja realise
+# Deux raisons independantes de preferer le TP quand la completion n'est que
+# marginalement rentable : (1) potentiellement plus gros, (2) liquidite
+# immediate au lieu de capital bloque -- important sur un petit bankroll ou
+# on a deja vu des refus de position faute de budget.
+# GARDE-FOUS : on ne renonce QUE si la completion est deja proche du plancher
+# (pas question de sacrifier un gros gain garanti pour un pari), ET seulement
+# si notre propre jambe montre DEJA un mouvement franc vers le seuil de TP
+# (pas un espoir en l'air -- un signal deja engage). Si la condition n'est
+# pas remplie, la completion s'execute exactement comme avant.
+MAKER_OPEN_TPNOW_SYMBOLES = ("SOL", "XRP", "DOGE", "BNB")   # BTC/ETH inchanges
+MAKER_OPEN_TPNOW_GAIN_MARGINAL_MAX = 0.06   # $ : au-dela, la completion est
+                                             # deja un gain solide -> on la prend
+MAKER_OPEN_TPNOW_MOMENTUM_FRAC = 0.70       # notre jambe doit deja avoir
+                                             # parcouru 70% du chemin vers le
+                                             # seuil de TP -- signal engage,
+                                             # pas un espoir
+
+
 # PERSISTANCE AVANT ABANDON (Steven 13/08, "le SL plombe le peu qui a a
 # plombe"). Constat sur XRP 20:55-21:00 ET : remplie a 0.35, ABANDONNEE 12
 # SECONDES plus tard a 0.18 (-49%), alors qu'il restait 4min48s dans la
@@ -6377,6 +6403,43 @@ class MultiTrader:
                         # cout reel = ask + frais taker sur CETTE jambe seulement
                         _gain_c = _n_comp * (1 - _comb_c) - self._poly_fee(_ask_c, _n_comp)
                         if _gain_c > MAKER_OPEN_COMPLETION_MIN_GAIN:
+                            # MSF-TPNOW : la completion est-elle marginale ET
+                            # notre jambe montre-t-elle DEJA un mouvement
+                            # franc vers le TP ? Si oui, on renonce a acheter
+                            # la 2e jambe ce cycle -- le flux plus bas (TP)
+                            # aura sa chance. Aucun cash depense ici, aucun
+                            # ordre annule : juste "pas cette fois".
+                            _tpnow_agi = False
+                            if (sym in MAKER_OPEN_TPNOW_SYMBOLES
+                                    and _gain_c < MAKER_OPEN_TPNOW_GAIN_MARGINAL_MAX):
+                                try:
+                                    _bk_notre = self._live.get_book_sync(leg_seule["token_id"])
+                                    _bid_notre = (_bk_notre["bids"][0][0]
+                                                 if _bk_notre and _bk_notre.get("bids") else None)
+                                except Exception:
+                                    _bid_notre = None
+                                if _bid_notre is not None:
+                                    _seuil_tpnow = leg_seule["price"] * _tp_mult(sym)
+                                    _chemin = _seuil_tpnow - leg_seule["price"]
+                                    _parcouru = _bid_notre - leg_seule["price"]
+                                    if _chemin > 0 and _parcouru >= MAKER_OPEN_TPNOW_MOMENTUM_FRAC * _chemin:
+                                        _tpnow_agi = True
+                                        self._log(
+                                            f"💸 [MSF-TPNOW] {sym} {slug} {leg_seule['side']} "
+                                            f"completion marginale ({_gain_c:+.3f}$ a {_comb_c:.3f}) "
+                                            f"MAIS notre jambe deja a {_bid_notre:.3f} "
+                                            f"({100*_parcouru/_chemin:.0f}% du chemin vers "
+                                            f"{_seuil_tpnow:.3f}) -> on prefere ENCAISSER via le "
+                                            f"TP (cash immediat) plutot que DEPENSER pour verrouiller "
+                                            f"un gain qui n'arrive qu'a la resolution 🚀💵"
+                                        )
+                            if _tpnow_agi:
+                                # ON SAUTE LA COMPLETION CE CYCLE : le `continue`
+                                # renvoie au slug suivant sans depenser un centime
+                                # ici -- ce meme slug sera reconsidere au prochain
+                                # appel de _manage_maker_open (poll suivant), avec
+                                # une chance que le TP se soit arme entre-temps.
+                                continue
                             self._log(
                                 f"🧩 [MAKER-OUVERT-COMPLETION] {sym} {slug} jambe seule "
                                 f"{leg_seule['side']}@{leg_seule['price']:.3f} + achat "
