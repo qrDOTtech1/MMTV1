@@ -1115,6 +1115,27 @@ def _abandon_max(sym):
     return MAKER_OPEN_ABANDON_MAX_PAR_SYMBOLE.get(sym, MAKER_OPEN_ABANDON_MAX)
 
 
+# INTERDICTION D'ABANDONNER JUSTE APRES LE REMPLISSAGE (Steven 13/08,
+# "surtout ca doit favoriser TP, interdit de faire SL si on vient de poser
+# il y a moins de xx sec"). Ni la completion (comp_hold_s) ni le TP
+# (tp_min_hold_s) n'avaient d'equivalent cote abandon -- rien n'empechait de
+# couper une jambe remplie depuis quelques secondes a peine, avant meme que
+# le TP ait eu la moindre chance de s'armer. Fixe volontairement AU-DESSUS
+# de _tp_min_hold_s(sym) (5s pour ces symboles) : le TP a systematiquement
+# le temps d'essayer avant que l'abandon ne devienne seulement ELIGIBLE
+# (il faut ensuite encore satisfaire la persistance ET, desormais, le score
+# de risque -- ce minimum est un plancher supplementaire, pas un remplacement
+# des deux autres gardes). BTC/ETH : 0, comportement mesure inchange.
+MAKER_OPEN_ABANDON_MIN_HOLD_S_PAR_SYMBOLE = {
+    "BTC": 0, "ETH": 0,
+    "SOL": 10, "XRP": 10, "DOGE": 10, "BNB": 10,
+}
+
+
+def _abandon_min_hold_s(sym):
+    return MAKER_OPEN_ABANDON_MIN_HOLD_S_PAR_SYMBOLE.get(sym, 0)
+
+
 # PERSISTANCE AVANT ABANDON (Steven 13/08, "le SL plombe le peu qui a a
 # plombe"). Constat sur XRP 20:55-21:00 ET : remplie a 0.35, ABANDONNEE 12
 # SECONDES plus tard a 0.18 (-49%), alors qu'il restait 4min48s dans la
@@ -1138,6 +1159,51 @@ MAKER_OPEN_ABANDON_PERSIST_S_PAR_SYMBOLE = {
 
 def _abandon_persist_s(sym):
     return MAKER_OPEN_ABANDON_PERSIST_S_PAR_SYMBOLE.get(sym, 0)
+
+
+# ── CONFIRMATION SPOT AVANT ABANDON (Steven 13/08) ──────────────────────
+# Cas reel qui a motive ceci : XRP 21:45-21:50 ET. Combine hors d'atteinte
+# pendant 18s (> les 12s de persistance) -> abandon a 0.19$. 3 SECONDES apres
+# la vente, Up rebondit et grimpe a 0.99 en moins de 3 minutes. La persistance
+# temporelle seule ne peut pas voir cette difference : ces marches paient sur
+# "spot au-dessus ou en dessous d'un strike", et quand le spot REEL oscille
+# tout pres du strike, la probabilite implicite peut faire des allers-retours
+# violents pour un mouvement minuscule du sous-jacent -- ce n'est pas du bruit
+# de carnet, c'est la nature de la fonction de prix pres de la frontiere.
+# core.btc_updown.danger_score() existe deja (flips autour du strike +
+# velocite, 0-100, LECTURE SEULE de l'historique Binance deja collecte en
+# memoire -- aucun appel reseau ici), mais n'etait branche sur aucune decision
+# MSF. On le combine avec le TEMPS RESTANT : un marche agite pres du strike
+# avec beaucoup de temps encore devant lui a plus d'occasions de se retourner
+# ENCORE qu'un marche agite a 10s de la resolution -- le risque qu'un abandon
+# soit premature doit donc etre pondere par les deux, pas par le danger seul.
+MAKER_OPEN_ABANDON_RISK_MAX = 50   # 0-100 : au-dessus, on retient l'abandon
+MAKER_OPEN_ABANDON_RISK_TEMPS_PLEIN_S = 180  # a ce temps restant ou plus, le
+                                              # facteur temps est a son maximum
+
+_PAIR_PAR_SYMBOLE_RISQUE = {
+    "SOL": "SOLUSDT", "XRP": "XRPUSDT", "DOGE": "DOGEUSDT", "BNB": "BNBUSDT",
+}
+
+
+def _score_risque_retournement(sym, slug, reste):
+    """0-100, ou None si l'information n'est pas disponible (FAIL-OPEN : dans
+    ce cas l'abandon se comporte exactement comme avant cette fonction, on ne
+    bloque jamais faute de donnee). Seuls les 4 symboles a carnet fin sont
+    concernes -- BTC/ETH gardent leur comportement mesure, inchange."""
+    pair = _PAIR_PAR_SYMBOLE_RISQUE.get(sym)
+    if pair is None:
+        return None
+    try:
+        from core.btc_updown import danger_score, _poly_strike_cache
+        strike = _poly_strike_cache.get(slug)
+        if not strike or strike <= 0:
+            return None
+        d = danger_score(pair, strike)  # lecture memoire seule, pas de reseau
+    except Exception:
+        return None
+    facteur_temps = min(1.0, max(0.0, reste) / MAKER_OPEN_ABANDON_RISK_TEMPS_PLEIN_S)
+    return round(d * facteur_temps)
 
 
 MAKER_OPEN_TOTAL_FRAC = 0.35      # TOTAL des 2 jambes, en part de l'investissable
@@ -6394,9 +6460,20 @@ class MultiTrader:
                     leg_seule.pop("abandon_depuis", None)
                     _depuis = None
 
+                # SCORE DE RISQUE DE RETOURNEMENT (danger pres du strike x
+                # temps restant) : voir _score_risque_retournement. None ->
+                # fail-open, ne bloque rien. Une valeur haute retient
+                # l'abandon meme si persistance ET min_hold sont satisfaits --
+                # le marche est en train de faire du yoyo pres de sa frontiere
+                # de decision, laisser vivre encore un peu.
+                _risque_ab = _score_risque_retournement(sym, slug, reste)
+                _risque_ok = _risque_ab is None or _risque_ab < MAKER_OPEN_ABANDON_RISK_MAX
+
                 if (_n_comp >= 0.01 and _combine_actuel is not None
                         and _combine_actuel > _abandon_max(sym)
                         and _depuis is not None and _depuis >= _abandon_persist_s(sym)
+                        and _hold_s >= _abandon_min_hold_s(sym)
+                        and _risque_ok
                         and reste > _cancel_before_s(sym)):
                     _comb_ab = round(_combine_actuel, 3)
                     # on retire d'abord TOUT ordre encore vivant sur ce slug :
@@ -6412,7 +6489,8 @@ class MultiTrader:
                         leg_seule.pop(_k, None)
                     self._log(
                         f"🏳️ [MAKER-OUVERT-ABANDON] {sym} {slug} {leg_seule['side']} "
-                        f"combine {_comb_ab} > {_abandon_max(sym)} -> paire hors "
+                        f"combine {_comb_ab} > {_abandon_max(sym)} (persiste {round(_depuis)}s, "
+                        f"hold {round(_hold_s)}s, risque={_risque_ab}) -> paire hors "
                         f"d'atteinte, on solde maintenant ({int(300 - reste)}s de fenetre) "
                         f"plutot que d'attendre T-{MAKER_OPEN_CANCEL_BEFORE_S}s dans un "
                         f"carnet qui se vide"
