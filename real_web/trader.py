@@ -1188,6 +1188,74 @@ MAKER_OPEN_TPNOW_MARGE_MIN = 0.05   # $ : le TP doit battre la completion d'au
                                      # moins ca pour qu'on change d'action
 
 
+# ── RETRAIT D'UN COTE QUAND LE SPOT LUI EST DEJA CONTRAIRE (Steven 13/08) ──
+# TROUVE SUR LES TRADES REELS, pas en simulation. Sur 82 fenetres reelles
+# etiquetables (47 gagnantes / 35 perdantes), en ne regardant QUE ce qui est
+# connu a l'instant du fill, le mouvement du spot Binance depuis l'ouverture
+# de la fenetre, oriente dans le sens de NOTRE cote, separe les deux groupes :
+#     gagnantes  -1.95 bp   |   perdantes  -3.97 bp   |   AUC 0.714
+# Les deux sont negatifs -- on est toujours servi quand ca va un peu contre
+# nous, c'est la definition meme de l'adverse selection -- mais les perdantes
+# sont DEUX FOIS plus contraires.
+#
+# POURQUOI CA MARCHE, mecaniquement : notre achat passif a 0.35 n'est servi
+# que si le prix descend jusqu'a nous, donc seulement si le marche s'eloigne
+# de notre cote. Tant que le spot n'a que legerement bouge, la fenetre reste
+# indecise, les deux cotes restent proches et la SECONDE JAMBE reste
+# accessible -- or la completion est tout ce qui separe le gain de la perte :
+#     completee    52 fenetres | 83% gagnantes | +0.251$/fenetre
+#     jambe seule  30 fenetres | 13% gagnantes | -1.064$/fenetre
+# Passe un certain mouvement, le marche a tranche : on ne se fait plus servir
+# que le perdant, et la seconde jambe devient inatteignable.
+#
+# VALIDATION WALK-FORWARD (seuil calibre sur les 41 premieres fenetres, puis
+# applique EN AVEUGLE sur les 41 suivantes -- jamais regardees pour le choix) :
+#     2e moitie sans filtre : 41 fenetres, -11.64$ (-0.284$/fenetre), 54% gagnantes
+#     2e moitie avec filtre : 22 fenetres,  +7.92$ (+0.360$/fenetre), 64% gagnantes
+# Changement de SIGNE hors echantillon. Et la courbe est monotone sur cette
+# 2e moitie (-6bp -0.174$ ; -4bp +0.002$ ; -3bp +0.116$ ; -2bp +0.360$) : ce
+# n'est pas un pic isole choisi par chance.
+#
+# CE QUE CE FILTRE N'EST PAS : un simple frein. Les tentatives precedentes
+# (annuler si le fill tarde, ne poser que d'un cote) ne faisaient que baisser
+# le VOLUME, l'esperance par jambe restant collee a -0.36$. Ici le taux de
+# reussite passe de 54% a 64% et le taux de completion de 63% a 70% : c'est
+# l'edge qui bouge, pas seulement le nombre de coups.
+#
+# L'ACTION est un RETRAIT D'ORDRE, jamais une vente. Mesure de la soiree :
+# sortir une position a l'instant du fill est catastrophique (-772$ sur 36 h
+# simulees) parce que le carnet est alors au plus defavorable. Ici on ne vend
+# rien -- on retire un ordre qui n'a pas encore ete servi, ce qui coute
+# exactement zero. Un cote deja servi n'est jamais touche.
+MAKER_OPEN_SPOT_GUARD_ENABLED = True
+MAKER_OPEN_SPOT_GUARD_SYMBOLES = ("SOL", "XRP", "DOGE", "BNB")
+MAKER_OPEN_SPOT_GUARD_BP = -2.0     # bp de mouvement du spot CONTRE un cote
+                                     # au-dela duquel on retire son ordre
+
+
+def _mouvement_spot_bp(sym, slug, debut_ts, side):
+    """Mouvement du spot depuis l'ouverture, ORIENTE dans le sens de `side`.
+
+    Negatif = le spot est alle CONTRE ce cote. Rend None si le spot ou le
+    strike est indisponible -- l'appelant doit alors ne rien bloquer
+    (fail-open : ce garde-fou ne doit jamais empecher de trader sur une
+    simple panne de lecture de prix).
+    """
+    pair = _PAIR_PAR_SYMBOLE_RISQUE.get(sym)
+    if not pair:
+        return None
+    try:
+        from core.btc_updown import _binance_price, _strike_at
+        strike = _strike_at(pair, debut_ts, slug=slug)
+        spot = _binance_price(pair)
+    except Exception:
+        return None
+    if not strike or not spot:
+        return None
+    bp = (spot - strike) / strike * 10000.0
+    return bp if side == "Up" else -bp
+
+
 # PERSISTANCE AVANT ABANDON (Steven 13/08, "le SL plombe le peu qui a a
 # plombe"). Constat sur XRP 20:55-21:00 ET : remplie a 0.35, ABANDONNEE 12
 # SECONDES plus tard a 0.18 (-49%), alors qu'il restait 4min48s dans la
@@ -6160,6 +6228,54 @@ class MultiTrader:
                 held = self._live.position_size(tid)
                 fills[cote] = max(0.0, held if held and held > 0 else 0.0)
             fa, fb = fills.get("a", 0.0), fills.get("b", 0.0)
+
+            # ── RETRAIT D'UN COTE QUE LE SPOT A DEJA CONDAMNE ────────────
+            # Voir MAKER_OPEN_SPOT_GUARD_BP. On ne retire QUE des ordres non
+            # servis : un cote deja rempli n'est jamais touche ici, et retirer
+            # un ordre qui n'a pas ete servi coute exactement zero.
+            if (MAKER_OPEN_SPOT_GUARD_ENABLED
+                    and sym in MAKER_OPEN_SPOT_GUARD_SYMBOLES
+                    and reste > _cancel_before_s(sym)):
+                for _cote in ("a", "b"):
+                    _leg_g = e.get(_cote) or {}
+                    if fills.get(_cote, 0.0) > 0.01:
+                        continue          # deja servi : on ne touche pas
+                    if not _leg_g.get("order_id"):
+                        continue          # deja retire
+                    _bp = _mouvement_spot_bp(sym, slug, e.get("debut_ts"),
+                                             _leg_g.get("side"))
+                    if _bp is None or _bp >= MAKER_OPEN_SPOT_GUARD_BP:
+                        continue          # fail-open, ou spot encore tolerable
+                    if self._cancel_verifie(
+                            _leg_g["order_id"],
+                            f" {sym} {slug} {_leg_g.get('side','?')} SPOT-GUARD"):
+                        _leg_g["order_id"] = None
+                        _leg_g["retire_spot"] = True
+                        self._log(
+                            f"🧭 [MSF-SPOT-GUARD] {sym} {slug} {_leg_g.get('side')} "
+                            f"le spot a bouge {_bp:+.1f}bp CONTRE ce cote "
+                            f"(seuil {MAKER_OPEN_SPOT_GUARD_BP:+.1f}) -> ordre retire "
+                            f"avant d'etre servi. Se faire remplir ici, c'est "
+                            f"acheter le perdant et rester en jambe seule "
+                            f"(-1.06$/fenetre mesure sur 30 cas reels)"
+                        )
+                        self._save()
+                # si les DEUX ordres ont saute et que rien n'est servi, la
+                # fenetre n'a plus d'objet : on la ferme proprement.
+                if (fills.get("a", 0.0) <= 0.01 and fills.get("b", 0.0) <= 0.01
+                        and not (e.get("a") or {}).get("order_id")
+                        and not (e.get("b") or {}).get("order_id")
+                        and ((e.get("a") or {}).get("retire_spot")
+                             or (e.get("b") or {}).get("retire_spot"))):
+                    self._maker_open_record(
+                        sym, slug, "retrait_spot", combine=None, parts=0.0,
+                        prix=(e.get("a") or {}).get("price"), vendu=0.0,
+                        sortie=None, exec_mode="passif", calm=e.get("calm", False),
+                    )
+                    mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                    st.pop(slug, None)
+                    self._save()
+                    continue
 
             # ── RETRAIT SI TOUJOURS RIEN SERVI (Steven 11/08) ────────────
             # Ne coute aucun verrou deja acquis : on ne retire que des ordres
