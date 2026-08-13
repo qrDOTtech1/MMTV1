@@ -1089,6 +1089,10 @@ def api_arb_quality():
         "symbols": list(getattr(trader_mod, "MAKER_OPEN_SYMBOLS", ())),
         "prix": float(getattr(trader_mod, "MAKER_OPEN_PRICE", 0.46)),
         "tp_mult": float(getattr(trader_mod, "MAKER_OPEN_TP_MULT", 1.8)),
+        # plafond de combine accepte pour la completion, affiche par
+        # l'onglet MSF a cote de son interrupteur
+        "completion_max": float(
+            getattr(trader_mod, "MAKER_OPEN_COMPLETION_MAX", 1.05)),
         "tp_min_hold_s": float(getattr(trader_mod, "MAKER_OPEN_TP_MIN_HOLD_S", 15)),
         "attempts": mo_n,
         "locked": mo_ok,
