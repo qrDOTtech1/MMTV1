@@ -1072,6 +1072,31 @@ def _abandon_max(sym):
     return MAKER_OPEN_ABANDON_MAX_PAR_SYMBOLE.get(sym, MAKER_OPEN_ABANDON_MAX)
 
 
+# PERSISTANCE AVANT ABANDON (Steven 13/08, "le SL plombe le peu qui a a
+# plombe"). Constat sur XRP 20:55-21:00 ET : remplie a 0.35, ABANDONNEE 12
+# SECONDES plus tard a 0.18 (-49%), alors qu'il restait 4min48s dans la
+# fenetre. Le declencheur etait une lecture INSTANTANEE du combine -- sur un
+# carnet 9x plus fin que BTC, un pic de quelques secondes n'est pas forcement
+# un mouvement soutenu, c'est souvent du bruit de microstructure qui se
+# resorbe. On exige donc que le combine RESTE au-dessus du seuil pendant
+# quelques secondes avant d'agir -- un filtre anti-bruit, pas une suppression
+# de l'abandon : un vrai decrochage soutenu reste coupe, seul un pic isole
+# est desormais ignore. BTC/ETH gardent 0 (comportement mesure et valide,
+# inchange) ; les carnets fins recoivent une fenetre de tolerance -- valeur
+# posee par raisonnement, PAS mesuree (aucun backtest fiable actuellement
+# disponible pour la calibrer, cf. les 3 simulateurs qui ont echoue
+# aujourd'hui) -- A RE-EVALUER sur trades reels une fois quelques jours
+# accumules.
+MAKER_OPEN_ABANDON_PERSIST_S_PAR_SYMBOLE = {
+    "BTC": 0, "ETH": 0,
+    "SOL": 12, "XRP": 12, "DOGE": 15, "BNB": 15,
+}
+
+
+def _abandon_persist_s(sym):
+    return MAKER_OPEN_ABANDON_PERSIST_S_PAR_SYMBOLE.get(sym, 0)
+
+
 MAKER_OPEN_TOTAL_FRAC = 0.35      # TOTAL des 2 jambes, en part de l'investissable
 MAKER_OPEN_BUDGET_MIN = 4.7
 MAKER_OPEN_BUDGET_MAX = 40.0
@@ -6314,10 +6339,23 @@ class MultiTrader:
                 # Voir MAKER_OPEN_ABANDON_MAX. On ne laisse plus la jambe
                 # deriver jusqu'au solde force de T-45s : a ce stade elle ne
                 # vaut deja plus rien et le carnet s'est vide.
-                if (_n_comp >= 0.01 and _ask_c is not None
-                        and (leg_seule["price"] + _ask_c) > _abandon_max(sym)
+                _combine_actuel = (leg_seule["price"] + _ask_c) if _ask_c is not None else None
+                if _combine_actuel is not None and _combine_actuel > _abandon_max(sym):
+                    if leg_seule.get("abandon_depuis") is None:
+                        leg_seule["abandon_depuis"] = now
+                    _depuis = now - leg_seule["abandon_depuis"]
+                else:
+                    # le combine est redescendu sous le seuil : le pic s'est
+                    # resorbe tout seul, on efface le chrono -- une FUTURE
+                    # incursion au-dessus du seuil repartira de zero.
+                    leg_seule.pop("abandon_depuis", None)
+                    _depuis = None
+
+                if (_n_comp >= 0.01 and _combine_actuel is not None
+                        and _combine_actuel > _abandon_max(sym)
+                        and _depuis is not None and _depuis >= _abandon_persist_s(sym)
                         and reste > _cancel_before_s(sym)):
-                    _comb_ab = round(leg_seule["price"] + _ask_c, 3)
+                    _comb_ab = round(_combine_actuel, 3)
                     # on retire d'abord TOUT ordre encore vivant sur ce slug :
                     # l'ask de scalp (qui ne sera jamais servi a ce stade) et
                     # le bid de l'autre cote (se faire remplir maintenant
