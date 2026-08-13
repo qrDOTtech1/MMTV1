@@ -935,6 +935,25 @@ MAKER_OPEN_COMPLETION_MIN_GAIN = 0.02   # $ : en dessous ca ne vaut pas le risqu
 MAKER_OPEN_COMPLETION_MAKER_S = 60      # 0 = desactive, achat direct au marche
 MAKER_OPEN_MIN_REMAIN_S = 120     # sous 2 min restantes, trop tard pour etre servi
 MAKER_OPEN_CANCEL_BEFORE_S = 45   # a T-45s : on annule et on solde une jambe seule
+# MARGE ELARGIE PAR SYMBOLE (Steven 13/08, "35% des jambes seules XRP ne sont
+# jamais gerees"). Diagnostic : le solde force EXISTE et vend bien avant
+# resolution ("une jambe nue portee a resolution vaut -100% quand elle perd,
+# mesure sur 51 cas sur 51") -- mais sur un carnet fin (XRP : profondeur
+# mediane 75 parts contre 687 pour BTC, mesure sur 24h), une premiere
+# tentative de vente peut echouer (carnet trop mince pour absorber la
+# taille), et il ne reste alors plus assez de cycles avant la resolution
+# pour que les tentatives suivantes (voir _prix_vente_absorbant, deja
+# escaladees) aboutissent. On donne donc plus de MARGE AVANT LE CUTOFF aux
+# symboles a carnet fin -- plus de cycles de retry, pas un changement de
+# logique de vente.
+MAKER_OPEN_CANCEL_BEFORE_S_PAR_SYMBOLE = {
+    "BTC": 45, "ETH": 45,          # carnet profond : la marge de base suffit
+    "SOL": 75, "XRP": 75, "DOGE": 90, "BNB": 90,   # carnet fin : plus de retries
+}
+
+
+def _cancel_before_s(sym):
+    return MAKER_OPEN_CANCEL_BEFORE_S_PAR_SYMBOLE.get(sym, MAKER_OPEN_CANCEL_BEFORE_S)
 # ANTI-SELECTION ADVERSE (Steven 11/08) : si AUCUNE des deux jambes n'est
 # servie apres N secondes de fenetre, on retire les deux ordres. Un ordre
 # passif n'est servi que lorsque le marche vient de traverser notre prix --
@@ -1034,6 +1053,25 @@ MAKER_OPEN_TP_MIN_HOLD_S = 15
 # que le scalp apporteur ait lieu : a 1.05 le combine est soit dessous soit
 # dessus, la decision tombe des le 1er tick et aucun TP ne peut exister.
 MAKER_OPEN_ABANDON_MAX = 1.25
+# ABANDON PLUS RAPIDE SUR CARNET FIN (Steven 13/08). Mesure du 11/08 :
+# vendre tot recupere 40% de la mise, vendre tard 5%, ne jamais vendre 0%.
+# Sur un carnet 9x plus fin que BTC (XRP : profondeur mediane 75 parts
+# contre 687), une jambe qui derive vers l'abandon a moins de chances de
+# revenir (moins de flux pour la retourner) -- couper plus tot y limite la
+# casse plutot que d'esperer un retournement improbable. BTC/ETH gardent la
+# valeur mesuree et validee (1.25) ; les 4 symboles a carnet fin sont plus
+# stricts, sans preuve chiffree encore -- A RE-MESURER apres quelques jours
+# de collecte reelle sur ces symboles, cf. verite_terrain par symbole.
+MAKER_OPEN_ABANDON_MAX_PAR_SYMBOLE = {
+    "BTC": 1.25, "ETH": 1.25,
+    "SOL": 1.15, "XRP": 1.15, "DOGE": 1.15, "BNB": 1.15,
+}
+
+
+def _abandon_max(sym):
+    return MAKER_OPEN_ABANDON_MAX_PAR_SYMBOLE.get(sym, MAKER_OPEN_ABANDON_MAX)
+
+
 MAKER_OPEN_TOTAL_FRAC = 0.35      # TOTAL des 2 jambes, en part de l'investissable
 MAKER_OPEN_BUDGET_MIN = 4.7
 MAKER_OPEN_BUDGET_MAX = 40.0
@@ -2791,6 +2829,29 @@ class MultiTrader:
                 f"-> gain garanti {margin:+.2f}$ (tenue jusqu'a resolution)"
             )
         else:
+            # ALARME PERTE GARANTIE (Steven 13/08) : 2 completions XRP sur 55
+            # ont ete trouvees a combine 1.04-1.05 -- perte assuree DES
+            # L'ACHAT, pas un simple manque a gagner. Le chemin MSF verifie
+            # (_manage_maker_open, 2 controles MIN_GAIN distincts, relus
+            # ligne par ligne) est correct : combine<=1.05 ET gain>0.02$ sont
+            # bien exiges avant tout achat de 2e jambe. Les 2 cas trouves
+            # n'ont donc PAS pu passer par ce chemin -- ils viennent d'ailleurs
+            # (stagger/near_certain/favorite/preopen, chemins qui n'ont pas ce
+            # meme garde-fou), sans certitude sur lequel exactement. Plutot que
+            # de deviner et de risquer une regression sur un code que je ne
+            # comprends pas encore assez, on rend le symptome IMPOSSIBLE A
+            # MANQUER : `strat`/`maker_open` identifient la source, et le seuil
+            # de -0.01$ (perte franche, pas juste "pas encore assez") isole le
+            # signal du bruit des paires legitimement non verrouillees.
+            if margin < -0.01:
+                self._tlog(
+                    f"pairelock_perte_garantie_{pos_a.get('slug','?')}",
+                    f"🚨 [PAIRE-PERTE-GARANTIE]{tag} strat_a={pos_a.get('strat')} "
+                    f"strat_b={pos_b.get('strat')} maker_open_a={pos_a.get('maker_open')} "
+                    f"combine={round(combined,4) if combined else '?'} "
+                    f"perte={margin:+.2f}$ -> ACHETEE A PERTE ASSUREE, "
+                    f"identifier le chemin d'entree pour corriger a la source"
+                )
             self._log(
                 f"⚠️ [PAIRE-NON-VERROUILLEE]{tag} pire cas "
                 f"{min(pos_a.get('filled_shares', 0), pos_b.get('filled_shares', 0))} parts "
@@ -5920,7 +5981,7 @@ class MultiTrader:
             _ecoule = now - (e.get("debut_ts") or now)
             if (fa <= 0.01 and fb <= 0.01
                     and _ecoule >= MAKER_OPEN_NOFILL_CANCEL_S
-                    and reste > MAKER_OPEN_CANCEL_BEFORE_S):
+                    and reste > _cancel_before_s(sym)):
                 for cote in ("a", "b"):
                     oid = (e.get(cote) or {}).get("order_id")
                     if oid:
@@ -6090,7 +6151,7 @@ class MultiTrader:
                     self._save()
                     continue
                 _att = now - leg_seule.get("comp_maker_ts", now)
-                if _att < MAKER_OPEN_COMPLETION_MAKER_S and reste > MAKER_OPEN_CANCEL_BEFORE_S:
+                if _att < MAKER_OPEN_COMPLETION_MAKER_S and reste > _cancel_before_s(sym):
                     continue          # on laisse encore sa chance a l'apporteur
                 # delai epuise -> on annule et on repasse en agressif plus bas
                 self._cancel_verifie(leg_seule["comp_maker_oid"],
@@ -6107,7 +6168,7 @@ class MultiTrader:
                     and _leg_autre_c.get("token_id")
                     and not leg_seule.get("tp_passif_order_id")
                     and _hold_s >= MAKER_OPEN_COMPLETION_MIN_HOLD_S
-                    and reste > MAKER_OPEN_CANCEL_BEFORE_S):
+                    and reste > _cancel_before_s(sym)):
                 _n_comp = self._live.position_size(leg_seule["token_id"])
                 _n_comp = round(_n_comp, 2) if _n_comp and _n_comp > 0.01 else 0.0
                 _bk_c = self._live.get_book_sync(_leg_autre_c["token_id"])
@@ -6254,8 +6315,8 @@ class MultiTrader:
                 # deriver jusqu'au solde force de T-45s : a ce stade elle ne
                 # vaut deja plus rien et le carnet s'est vide.
                 if (_n_comp >= 0.01 and _ask_c is not None
-                        and (leg_seule["price"] + _ask_c) > MAKER_OPEN_ABANDON_MAX
-                        and reste > MAKER_OPEN_CANCEL_BEFORE_S):
+                        and (leg_seule["price"] + _ask_c) > _abandon_max(sym)
+                        and reste > _cancel_before_s(sym)):
                     _comb_ab = round(leg_seule["price"] + _ask_c, 3)
                     # on retire d'abord TOUT ordre encore vivant sur ce slug :
                     # l'ask de scalp (qui ne sera jamais servi a ce stade) et
@@ -6270,7 +6331,7 @@ class MultiTrader:
                         leg_seule.pop(_k, None)
                     self._log(
                         f"🏳️ [MAKER-OUVERT-ABANDON] {sym} {slug} {leg_seule['side']} "
-                        f"combine {_comb_ab} > {MAKER_OPEN_ABANDON_MAX} -> paire hors "
+                        f"combine {_comb_ab} > {_abandon_max(sym)} -> paire hors "
                         f"d'atteinte, on solde maintenant ({int(300 - reste)}s de fenetre) "
                         f"plutot que d'attendre T-{MAKER_OPEN_CANCEL_BEFORE_S}s dans un "
                         f"carnet qui se vide"
@@ -6338,7 +6399,7 @@ class MultiTrader:
                     st.pop(slug, None)
                     self._save()
                     continue
-                if reste > MAKER_OPEN_CANCEL_BEFORE_S:
+                if reste > _cancel_before_s(sym):
                     # pas encore rempli, mais il reste du temps -> on laisse
                     # l'ordre passif ouvert, aucune raison de forcer une sortie
                     # payante tant que la fenetre n'est pas sur le point de finir.
@@ -6657,7 +6718,7 @@ class MultiTrader:
             # tant qu'il reste du temps, on laisse courir : la 2e jambe peut
             # arriver bien plus tard dans la fenetre, le verrou n'exige pas la
             # simultaneite.
-            if reste > MAKER_OPEN_CANCEL_BEFORE_S:
+            if reste > _cancel_before_s(sym):
                 continue
 
             # ── FIN DE FENETRE : on annule ce qui dort ──
