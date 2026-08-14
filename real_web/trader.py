@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from core.btc_updown import find_active_markets, parse_updown_market, synced_now
 from ghost_poly.live import PolyLive, MIN_ORDER_SIZE_SHARES
 from real_web import market_maker as mm
+from real_web import rl_shadow
 from real_web.ws_feed import get_feed
 
 
@@ -6605,6 +6606,66 @@ class MultiTrader:
             if "fill_ts" not in leg_seule:
                 leg_seule["fill_ts"] = now
             _hold_s = now - leg_seule["fill_ts"]
+
+            # ── RL-SHADOW (Steven 14/08) : L'AGENT OBSERVE, NE TRADE PAS ────
+            # L'agent DQN decide ce qu'il AURAIT fait, on le journalise avec
+            # le tag MMBOT, et on continue exactement comme avant en dessous.
+            # Aucune ligne de ce bloc n'ecrit un ordre ni ne modifie l'etat.
+            # Throttle 20s par slug pour ne pas noyer le journal.
+            try:
+                if now - (leg_seule.get("_rl_shadow_ts") or 0) >= 20:
+                    leg_seule["_rl_shadow_ts"] = now
+                    _autre_side_rl = "Down" if leg_seule.get("side") == "Up" else "Up"
+                    _autre_leg_rl = e.get("b" if cote_seule == "a" else "a") or {}
+                    _tid_notre_rl = leg_seule.get("token_id")
+                    _tid_autre_rl = _autre_leg_rl.get("token_id")
+                    _bk_notre_rl = self._live.get_book_sync(_tid_notre_rl) if _tid_notre_rl else None
+                    _bk_autre_rl = self._live.get_book_sync(_tid_autre_rl) if _tid_autre_rl else None
+
+                    def _bb(bk):
+                        return bk["bids"][0][0] if bk and bk.get("bids") else None
+
+                    def _ba(bk):
+                        return bk["asks"][0][0] if bk and bk.get("asks") else None
+
+                    def _bd(bk):
+                        return sum(q for _, q in (bk or {}).get("bids", [])[:3]) or None
+
+                    def _ad(bk):
+                        return sum(q for _, q in (bk or {}).get("asks", [])[:3]) or None
+
+                    if leg_seule.get("side") == "Up":
+                        _ub_rl, _ua_rl = _bb(_bk_notre_rl), _ba(_bk_notre_rl)
+                        _db_rl, _da_rl = _bb(_bk_autre_rl), _ba(_bk_autre_rl)
+                        _ubd_rl, _uad_rl = _bd(_bk_notre_rl), _ad(_bk_notre_rl)
+                        _dbd_rl, _dad_rl = _bd(_bk_autre_rl), _ad(_bk_autre_rl)
+                    else:
+                        _db_rl, _da_rl = _bb(_bk_notre_rl), _ba(_bk_notre_rl)
+                        _ub_rl, _ua_rl = _bb(_bk_autre_rl), _ba(_bk_autre_rl)
+                        _dbd_rl, _dad_rl = _bd(_bk_notre_rl), _ad(_bk_notre_rl)
+                        _ubd_rl, _uad_rl = _bd(_bk_autre_rl), _ad(_bk_autre_rl)
+
+                    _dt_rl = now - e.get("debut_ts", now)
+                    _obs_rl = rl_shadow.observation(
+                        _ub_rl, _ua_rl, _db_rl, _da_rl,
+                        _ubd_rl, _uad_rl, _dbd_rl, _dad_rl,
+                        _dt_rl, _cancel_before_s(sym),
+                        leg_seule.get("side"), leg_seule.get("price"), False,
+                    )
+                    _action_rl, _q_rl = rl_shadow.decide(_obs_rl)
+                    if _action_rl is not None:
+                        self._tlog(
+                            f"rlshadow_{sym}",
+                            f"🤖 [MMBOT] {sym} {slug} {leg_seule.get('side')} "
+                            f"entree={leg_seule.get('price')} hold={int(_hold_s)}s -> "
+                            f"agent deciderait {_action_rl} "
+                            f"(Q={[round(x,3) for x in _q_rl]})",
+                        )
+            except Exception as _exc_rl:
+                # fail-open integral : le shadow ne doit JAMAIS interrompre
+                # ni influencer la gestion reelle de la jambe.
+                self._tlog(f"rlshadow_err_{sym}",
+                           f"⚠️ [MMBOT] {sym} erreur shadow (ignoree) : {_exc_rl}")
 
             # ── COMPLETION ACTIVE DE LA JAMBE SEULE (Steven 11/08) ──────────
             # La jambe seule est LE poste de perte de MSF : -0.249 $/part en
