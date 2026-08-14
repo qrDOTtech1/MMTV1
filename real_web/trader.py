@@ -6607,15 +6607,17 @@ class MultiTrader:
                 leg_seule["fill_ts"] = now
             _hold_s = now - leg_seule["fill_ts"]
 
-            # ── RL-SHADOW (Steven 14/08) : L'AGENT OBSERVE, NE TRADE PAS ────
-            # L'agent DQN decide ce qu'il AURAIT fait, on le journalise avec
-            # le tag MMBOT, et on continue exactement comme avant en dessous.
-            # Aucune ligne de ce bloc n'ecrit un ordre ni ne modifie l'etat.
-            # Throttle 20s par slug pour ne pas noyer le journal.
+            # ── RL-TRADE (Steven 14/08, "le RL doit vraiment trader lui meme") ──
+            # L'agent DQN entraine cette nuit PREND LA MAIN sur la gestion de
+            # la jambe seule : COMPLETE et SELL_MARKET executent un vrai
+            # ordre reel, HOLD_TO_RESOLUTION et NOOP sautent ce cycle SANS
+            # rien faire d'autre (pas d'annulation, pas de vente) -- toute la
+            # heuristique qui suit (completion auto, TPNOW, abandon, TP,
+            # cutoff) est BYPASSEE pour ce slug tant que l'agent decide.
+            # Throttle 15s/slug (plus court qu'en shadow : il faut reagir).
             try:
-                if now - (leg_seule.get("_rl_shadow_ts") or 0) >= 20:
-                    leg_seule["_rl_shadow_ts"] = now
-                    _autre_side_rl = "Down" if leg_seule.get("side") == "Up" else "Up"
+                if now - (leg_seule.get("_rl_ts") or 0) >= 15:
+                    leg_seule["_rl_ts"] = now
                     _autre_leg_rl = e.get("b" if cote_seule == "a" else "a") or {}
                     _tid_notre_rl = leg_seule.get("token_id")
                     _tid_autre_rl = _autre_leg_rl.get("token_id")
@@ -6655,17 +6657,98 @@ class MultiTrader:
                     _action_rl, _q_rl = rl_shadow.decide(_obs_rl)
                     if _action_rl is not None:
                         self._tlog(
-                            f"rlshadow_{sym}",
+                            f"rltrade_{sym}",
                             f"🤖 [MMBOT] {sym} {slug} {leg_seule.get('side')} "
                             f"entree={leg_seule.get('price')} hold={int(_hold_s)}s -> "
-                            f"agent deciderait {_action_rl} "
+                            f"agent decide {_action_rl} "
                             f"(Q={[round(x,3) for x in _q_rl]})",
                         )
+
+                    _n_rl = self._live.position_size(_tid_notre_rl) if _tid_notre_rl else 0.0
+                    _n_rl = round(_n_rl, 2) if _n_rl and _n_rl > 0.01 else 0.0
+
+                    if _action_rl == "COMPLETE" and _n_rl >= 0.01 and _tid_autre_rl:
+                        _ask_rl = _da_rl if leg_seule.get("side") == "Up" else _ua_rl
+                        if _ask_rl is not None:
+                            if _autre_leg_rl.get("order_id"):
+                                if not self._cancel_verifie(
+                                        _autre_leg_rl["order_id"],
+                                        f" {sym} {slug} {_autre_leg_rl.get('side','?')} MMBOT"):
+                                    self._tlog(f"rltrade_annul_{sym}",
+                                               f"⚠️ [MMBOT] {sym} {slug} ordre d'origine "
+                                               f"non annulable -> on renonce a completer")
+                                    continue
+                                _autre_leg_rl["order_id"] = None
+                            _budget_rl = round(_n_rl * _ask_rl, 2)
+                            with self._order_lock:
+                                _res_rl = self._live.snipe_buy_market(
+                                    _tid_autre_rl, round(min(0.99, _ask_rl + 0.01), 2), _budget_rl)
+                            _fill_rl = _res_rl.get("filled_shares", 0.0)
+                            if _fill_rl > 0.01:
+                                _avg_rl = _res_rl.get("avg_cost") or _ask_rl
+                                for _cote_rl, _n2_rl, _px2_rl in (
+                                        (cote_seule, _n_rl, leg_seule["price"]),
+                                        ("b" if cote_seule == "a" else "a", round(_fill_rl, 2), _avg_rl)):
+                                    _lg_rl = e[_cote_rl]
+                                    mk["open"][f"{slug}|{_lg_rl['side']}"] = {
+                                        "symbol": sym, "slug": slug, "side": _lg_rl["side"],
+                                        "mode": "real", "strat": "bothside", "maker_open": True,
+                                        "maker_fill": (_cote_rl == cote_seule),
+                                        "token_id": _lg_rl["token_id"], "entry_price": _px2_rl,
+                                        "filled_shares": round(_n2_rl, 2),
+                                        "cost": round(_n2_rl * _px2_rl, 2),
+                                        "start_ts": e.get("debut_ts"), "pair": None,
+                                        "end_ts": e.get("fin_ts"), "opened_ts": now,
+                                        "buffer": 0.0,
+                                    }
+                                    self._add_slug_spent(mk, slug, round(_n2_rl * _px2_rl, 2))
+                                self._tag_pair_lock(
+                                    mk["open"].get(f"{slug}|{leg_seule['side']}"),
+                                    mk["open"].get(f"{slug}|{_autre_leg_rl['side']}"),
+                                    leg_seule["price"] + _avg_rl,
+                                    tag=f" {sym} {slug} MMBOT-COMPLETE")
+                                self._maker_open_record(
+                                    sym, slug, "les_deux",
+                                    combine=round(leg_seule["price"] + _avg_rl, 4),
+                                    parts=round(min(_n_rl, _fill_rl), 2),
+                                    prix=leg_seule["price"], exec_mode="rl_complete")
+                                mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                                st.pop(slug, None)
+                                self._save()
+                        continue
+
+                    if _action_rl == "SELL_MARKET" and _n_rl >= 0.01:
+                        _vendu_rl = self._sell_orphan(
+                            _tid_notre_rl, _n_rl,
+                            f" {sym} {slug} {leg_seule['side']} MMBOT-SELL",
+                            entry_price=leg_seule["price"], symbol=sym,
+                            slug=slug, side=leg_seule["side"],
+                        )
+                        if _vendu_rl >= _n_rl - 0.01:
+                            self._maker_open_record(
+                                sym, slug, "abandon", combine=None,
+                                parts=round(_n_rl, 2), prix=leg_seule["price"],
+                                vendu=round(_vendu_rl, 2), exec_mode="rl_sell",
+                                calm=e.get("calm", False),
+                            )
+                            mk.setdefault("makeropen_cooldown", {})[slug] = e.get("fin_ts", now) + 5
+                            st.pop(slug, None)
+                            self._save()
+                        continue
+
+                    # HOLD_TO_RESOLUTION ou NOOP : on ne fait RIEN d'autre ce
+                    # cycle -- ni annulation, ni vente, ni completion. On
+                    # BYPASSE toute la heuristique en dessous (elle ne doit
+                    # plus jamais agir sur ce slug tant que le cash est la).
+                    continue
             except Exception as _exc_rl:
-                # fail-open integral : le shadow ne doit JAMAIS interrompre
-                # ni influencer la gestion reelle de la jambe.
-                self._tlog(f"rlshadow_err_{sym}",
-                           f"⚠️ [MMBOT] {sym} erreur shadow (ignoree) : {_exc_rl}")
+                # fail-open : une erreur dans le pilotage RL ne doit jamais
+                # planter le cycle -- mais ici, contrairement au shadow, on
+                # NE CONTINUE PAS : on laisse la heuristique existante gerer
+                # ce cycle comme filet de securite.
+                self._tlog(f"rltrade_err_{sym}",
+                           f"⚠️ [MMBOT] {sym} erreur pilotage RL (repli sur "
+                           f"l'heuristique ce cycle) : {_exc_rl}")
 
             # ── COMPLETION ACTIVE DE LA JAMBE SEULE (Steven 11/08) ──────────
             # La jambe seule est LE poste de perte de MSF : -0.249 $/part en
