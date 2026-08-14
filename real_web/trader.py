@@ -6675,6 +6675,34 @@ class MultiTrader:
                         _dbd_rl, _dad_rl = _bd(_bk_notre_rl), _ad(_bk_notre_rl)
                         _ubd_rl, _uad_rl = _bd(_bk_autre_rl), _ad(_bk_autre_rl)
 
+                    # NETTOYAGE DES SLUGS FANTOMES (Steven 14/08, "sa fait
+                    # deux cycles sans aucune position vraiment ouverte").
+                    # HOLD_TO_RESOLUTION ne fait deliberement RIEN -- c'est
+                    # voulu, on laisse la position aller a resolution. Mais
+                    # PERSONNE ne revenait ensuite nettoyer `st[slug]` une
+                    # fois la resolution reellement survenue (redemption
+                    # automatique, taille -> 0) : le slug restait gere pour
+                    # toujours, generant des decisions MMBOT sur un carnet
+                    # vieux de plusieurs dizaines de minutes. Observe en
+                    # direct : hold=1347s (22 min) sur une fenetre de 300s.
+                    # On lit donc la taille reelle EN PREMIER : si elle est
+                    # nulle, la position n'existe plus (deja resolue/
+                    # redimee ailleurs) -> on nettoie et on ne consulte
+                    # meme pas l'agent sur du vide.
+                    _n_rl = self._live.position_size(_tid_notre_rl) if _tid_notre_rl else 0.0
+                    _n_rl = round(_n_rl, 2) if _n_rl and _n_rl > 0.01 else 0.0
+                    if _n_rl < 0.01:
+                        self._tlog(
+                            f"rltrade_fantome_{sym}",
+                            f"🧹 [MMBOT] {sym} {slug} {leg_seule.get('side')} "
+                            f"position vide (deja resolue) apres {int(_hold_s)}s "
+                            f"-> nettoyage du slug fantome",
+                        )
+                        mk.setdefault("makeropen_cooldown", {})[slug] = now + 5
+                        st.pop(slug, None)
+                        self._save()
+                        continue
+
                     _dt_rl = now - e.get("debut_ts", now)
                     _obs_rl = rl_shadow.observation(
                         _ub_rl, _ua_rl, _db_rl, _da_rl,
@@ -6682,9 +6710,6 @@ class MultiTrader:
                         _dt_rl, _cancel_before_s(sym),
                         leg_seule.get("side"), leg_seule.get("price"), False,
                     )
-
-                    _n_rl = self._live.position_size(_tid_notre_rl) if _tid_notre_rl else 0.0
-                    _n_rl = round(_n_rl, 2) if _n_rl and _n_rl > 0.01 else 0.0
 
                     # gain garanti SI l'agent choisit COMPLETE a cet instant
                     # -- calcule AVANT decide() pour que le garde-fou
