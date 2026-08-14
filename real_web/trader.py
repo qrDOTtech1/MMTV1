@@ -6614,9 +6614,15 @@ class MultiTrader:
             # rien faire d'autre (pas d'annulation, pas de vente) -- toute la
             # heuristique qui suit (completion auto, TPNOW, abandon, TP,
             # cutoff) est BYPASSEE pour ce slug tant que l'agent decide.
-            # Throttle 15s/slug (plus court qu'en shadow : il faut reagir).
+            # Throttle 10s/slug (Steven 14/08) : calee sur la cadence REELLE
+            # de collecte des donnees d'entrainement (~10s, irreguliere,
+            # cf. rl/dataset.py). Plus lent = trop passif face au marche ;
+            # plus rapide = des etats quasi identiques d'un appel a l'autre
+            # (le prix n'a souvent pas bouge en 1-2s), donc plus de lectures
+            # de carnet sans info nouvelle, et un rythme que l'agent n'a
+            # jamais vu pendant l'entrainement.
             try:
-                if now - (leg_seule.get("_rl_ts") or 0) >= 15:
+                if now - (leg_seule.get("_rl_ts") or 0) >= 10:
                     leg_seule["_rl_ts"] = now
                     _autre_leg_rl = e.get("b" if cote_seule == "a" else "a") or {}
                     _tid_notre_rl = leg_seule.get("token_id")
