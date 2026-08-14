@@ -6621,6 +6621,28 @@ class MultiTrader:
             # (le prix n'a souvent pas bouge en 1-2s), donc plus de lectures
             # de carnet sans info nouvelle, et un rythme que l'agent n'a
             # jamais vu pendant l'entrainement.
+            # BUG CRITIQUE CORRIGE (Steven 14/08, "GROS BUG" #2, trouve en
+            # rejouant la session reelle) : le `continue` qui neutralise
+            # l'ancienne heuristique etait A L'INTERIEUR du `if throttle`.
+            # Entre deux decisions du RL (10s), la boucle principale
+            # repasse ici toutes les ~2s -- et comme le throttle n'etait
+            # PAS ecoule, RIEN ne bypassait l'ancienne heuristique : elle
+            # tournait librement en parallele du RL, sans jamais consulter
+            # ses decisions. Observe en direct sur BTC 20:15-20:17 : le RL
+            # decidait NOOP (je tiens) a repetition, et PENDANT CE TEMPS
+            # l'ancien MAKER-OUVERT-COMPLETION postait sa propre completion,
+            # puis MAKER-OUVERT-ABANDON a vendu 7.55 parts a 0.06 (entree
+            # 0.35, perte -2.19$) -- sans que le RL n'ait jamais ete
+            # consulte sur cette sortie. Le RL n'avait donc PAS le controle
+            # exclusif qu'il etait cense avoir depuis fc4801f.
+            #
+            # CORRECTIF : le bypass (`continue`) doit etre INCONDITIONNEL
+            # des qu'on gere une jambe seule -- seul le CALCUL de la
+            # decision (lecture du carnet + forward pass + execution d'un
+            # ordre) reste limite a une fois toutes les 10s. Sur les cycles
+            # entre deux decisions, on ne fait rien de NOUVEAU, mais on
+            # bypasse quand meme -- exactement comme prevu depuis le debut,
+            # sauf que maintenant c'est reellement applique a chaque cycle.
             try:
                 if now - (leg_seule.get("_rl_ts") or 0) >= 10:
                     leg_seule["_rl_ts"] = now
@@ -6755,19 +6777,34 @@ class MultiTrader:
                             self._save()
                         continue
 
-                    # HOLD_TO_RESOLUTION ou NOOP : on ne fait RIEN d'autre ce
-                    # cycle -- ni annulation, ni vente, ni completion. On
-                    # BYPASSE toute la heuristique en dessous (elle ne doit
-                    # plus jamais agir sur ce slug tant que le cash est la).
-                    continue
+                    # HOLD_TO_RESOLUTION ou NOOP : rien de NOUVEAU ce cycle
+                    # (ni annulation, ni vente, ni completion) -- le
+                    # `continue` inconditionnel juste apres ce bloc `try`
+                    # fait deja le bypass, sur CE cycle comme sur tous les
+                    # suivants avant la prochaine decision.
+                _rl_bypass_ok = True
             except Exception as _exc_rl:
+                _rl_bypass_ok = False
                 # fail-open : une erreur dans le pilotage RL ne doit jamais
                 # planter le cycle -- mais ici, contrairement au shadow, on
-                # NE CONTINUE PAS : on laisse la heuristique existante gerer
+                # NE BYPASSE PAS : on laisse la heuristique existante gerer
                 # ce cycle comme filet de securite.
                 self._tlog(f"rltrade_err_{sym}",
                            f"⚠️ [MMBOT] {sym} erreur pilotage RL (repli sur "
                            f"l'heuristique ce cycle) : {_exc_rl}")
+
+            # LE VRAI CORRECTIF (voir commentaire plus haut, "BUG CRITIQUE
+            # CORRIGE #2") : ce `continue` est INCONDITIONNEL des que le
+            # pilotage RL n'a pas leve d'exception -- qu'une decision ait
+            # ete prise ce cycle (throttle ecoule) ou non (on attend
+            # toujours la prochaine fenetre de 10s). Avant ce correctif,
+            # seuls les cycles ou le throttle etait ecoule bypassaient
+            # l'ancienne heuristique ; sur tous les autres (la grande
+            # majorite, la boucle tournant toutes les ~2s), rien
+            # n'empechait TP/completion/abandon de s'executer en parallele
+            # du RL sans jamais le consulter.
+            if _rl_bypass_ok:
+                continue
 
             # ── COMPLETION ACTIVE DE LA JAMBE SEULE (Steven 11/08) ──────────
             # La jambe seule est LE poste de perte de MSF : -0.249 $/part en
