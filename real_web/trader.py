@@ -1036,10 +1036,30 @@ MAKER_OPEN_TP_MULT_PAR_SYMBOLE = {
     "BTC": 1.8, "ETH": 1.8,
     "SOL": 1.5, "XRP": 1.5, "DOGE": 1.5, "BNB": 1.5,
 }
+# SEUIL DE TP EN PRIX ABSOLU (Steven 13/08 : "regle le tp a 0.42").
+# En ABSOLU et non en multiple : MAKER_OPEN_PRICE (0.35) est un PLAFOND, le
+# prix de pose adaptatif peut etre plus bas, et un multiple donnerait alors
+# autre chose que 0.42. Un seuil absolu vaut 0.42 quel que soit le prix
+# d'entree reel. BTC/ETH restent sur le multiplicatif x1.8, inchanges.
+MAKER_OPEN_TP_PRIX_PAR_SYMBOLE = {
+    "SOL": 0.42, "XRP": 0.42, "DOGE": 0.42, "BNB": 0.42,
+}
 
 
 def _tp_mult(sym):
     return MAKER_OPEN_TP_MULT_PAR_SYMBOLE.get(sym, MAKER_OPEN_TP_MULT)
+
+
+def _tp_seuil_prix(sym, prix_entree):
+    """Prix de declenchement du TP sur une jambe seule.
+
+    Absolu (0.42) sur les symboles listes dans
+    MAKER_OPEN_TP_PRIX_PAR_SYMBOLE, multiplicatif ailleurs.
+    """
+    abs_px = MAKER_OPEN_TP_PRIX_PAR_SYMBOLE.get(sym)
+    if abs_px is not None:
+        return abs_px
+    return prix_entree * _tp_mult(sym)
 # SCALP APPORTEUR DES L'ENTREE (Steven 12/08, "si on TP tres rapidement il y a
 # de la marge ici aussi"). Le TP multiplicatif exigeait 0.35 x 1.8 = 0.63 : il
 # ne s'est declenche ZERO fois sur 694 fenetres de backtest, TRAIN et TEST
@@ -7032,7 +7052,7 @@ class MultiTrader:
                 # RETOUR AU MULTIPLICATIF (cf. bloc SCALP DESACTIVE ci-dessus) :
                 # l'offset +0.02 vendait la jambe avant que le verrou puisse
                 # se former.
-                _tp_seuil = leg_seule["price"] * _tp_mult(sym)
+                _tp_seuil = _tp_seuil_prix(sym, leg_seule["price"])
 
             # ── SUIVI D'UN TP PASSIF DEJA POSTE (Steven 08/08, "sortie MAKER
             # au lieu d'agressive") : backteste sur 586 fenetres, frais de
