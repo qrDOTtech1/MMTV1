@@ -6660,18 +6660,31 @@ class MultiTrader:
                         _dt_rl, _cancel_before_s(sym),
                         leg_seule.get("side"), leg_seule.get("price"), False,
                     )
-                    _action_rl, _q_rl = rl_shadow.decide(_obs_rl)
+
+                    _n_rl = self._live.position_size(_tid_notre_rl) if _tid_notre_rl else 0.0
+                    _n_rl = round(_n_rl, 2) if _n_rl and _n_rl > 0.01 else 0.0
+
+                    # gain garanti SI l'agent choisit COMPLETE a cet instant
+                    # -- calcule AVANT decide() pour que le garde-fou
+                    # MIN_GAIN_COMPLETION (rl_shadow.py) puisse retirer
+                    # cette option de la course si elle est trop marginale.
+                    _gain_complete_rl = None
+                    _ask_pot_rl = _da_rl if leg_seule.get("side") == "Up" else _ua_rl
+                    if _ask_pot_rl is not None and leg_seule.get("price") is not None and _n_rl >= 0.01:
+                        _gain_complete_rl = (1.0 - leg_seule["price"] - _ask_pot_rl) * _n_rl
+
+                    _action_rl, _q_rl = rl_shadow.decide(_obs_rl, gain_complete=_gain_complete_rl)
                     if _action_rl is not None:
                         self._tlog(
                             f"rltrade_{sym}",
                             f"🤖 [MMBOT] {sym} {slug} {leg_seule.get('side')} "
                             f"entree={leg_seule.get('price')} hold={int(_hold_s)}s -> "
                             f"agent decide {_action_rl} "
-                            f"(Q={[round(x,3) for x in _q_rl]})",
+                            f"(Q={[round(x,3) for x in _q_rl]}"
+                            + (f", gain_completion={_gain_complete_rl:.3f}$"
+                               if _gain_complete_rl is not None else "")
+                            + ")",
                         )
-
-                    _n_rl = self._live.position_size(_tid_notre_rl) if _tid_notre_rl else 0.0
-                    _n_rl = round(_n_rl, 2) if _n_rl and _n_rl > 0.01 else 0.0
 
                     if _action_rl == "COMPLETE" and _n_rl >= 0.01 and _tid_autre_rl:
                         _ask_rl = _da_rl if leg_seule.get("side") == "Up" else _ua_rl

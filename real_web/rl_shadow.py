@@ -93,11 +93,43 @@ def observation(ub, ua, db, da, ubd, uad, dbd, dad, dt, cutoff_s,
     ]
 
 
-def decide(obs):
+MIN_GAIN_COMPLETION = 0.50
+# GARDE-FOU (Steven 14/08, "GROS BUG ! completion a 0.97 combine, gain
+# 0.21$ -- clairement insuffisant, on vise ~1.60$/fenetre"). L'ACTION
+# COMPLETE de l'environnement d'entrainement (rl/env.py) n'a JAMAIS eu de
+# plancher de gain -- contrairement a l'ancienne heuristique du bot qui
+# refusait deja toute completion sous 0.02$ (MAKER_OPEN_COMPLETION_MIN_GAIN).
+# L'agent a donc appris uniquement par la recompense, sans contrainte dure,
+# et complete parfois a des marges bien trop faibles pour l'objectif reel.
+#
+# CAS CONCRET : jambe Up a 0.35, completion Down a 0.62, combine 0.97,
+# gain garanti 0.208$ -- l'agent avait choisi COMPLETE alors qu'une
+# meilleure action existait dans son propre classement.
+#
+# CE N'EST PAS UNE HEURISTIQUE EXTERNE qui remplace le jugement de
+# l'agent : on retire seulement COMPLETE de la course quand son gain
+# implicite est sous ce seuil, et on garde SA propre 2e meilleure action
+# (HOLD_TO_RESOLUTION la plupart du temps, d'apres le test decisif). On ne
+# lui substitue jamais une decision qu'il n'a pas lui-meme classee haut.
+
+
+def decide(obs, gain_complete=None):
     """Rend (action_str, q_values) ou (None, None) si les poids sont
-    indisponibles (fail-open : n'affecte jamais le comportement reel)."""
+    indisponibles (fail-open : n'affecte jamais le comportement reel).
+
+    `gain_complete` : gain garanti ($) SI l'action choisie est COMPLETE,
+    calcule par l'appelant (qui connait le prix et la taille reels). Si
+    fourni et sous MIN_GAIN_COMPLETION, COMPLETE est exclue du choix --
+    l'agent retombe sur sa propre 2e option, jamais sur une regle externe.
+    """
     q = _forward(obs)
     if q is None:
         return None, None
-    a = max(range(len(q)), key=lambda i: q[i])
-    return _ACTIONS[a], q
+    ordre = sorted(range(len(q)), key=lambda i: q[i], reverse=True)
+    idx_complete = _ACTIONS.index("COMPLETE")
+    for i in ordre:
+        if (i == idx_complete and gain_complete is not None
+                and gain_complete < MIN_GAIN_COMPLETION):
+            continue  # gain insuffisant -> on saute a la prochaine option de l'agent
+        return _ACTIONS[i], q
+    return _ACTIONS[ordre[0]], q  # improbable : toutes les options filtrees
