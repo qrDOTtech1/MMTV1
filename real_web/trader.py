@@ -6741,6 +6741,65 @@ class MultiTrader:
                         _gain_complete_rl = (1.0 - leg_seule["price"] - _ask_pot_rl) * _n_rl
 
                     _action_rl, _q_rl = rl_shadow.decide(_obs_rl, gain_complete=_gain_complete_rl)
+
+                    # GARDE-FOU PRIX ABSOLU (Steven 15/08, backteste cette nuit sur
+                    # 2 periodes independantes -- ANCIEN 12-14/08 et FRAIS 16-18/08,
+                    # 6 jours calendaires, JAMAIS d'inversion de signe par symbole
+                    # ou par jour) : une fois que NOTRE bid atteint 0.95, VENDRE
+                    # bat TENIR jusqu'a resolution. Consequence directe du biais
+                    # "favori cher surpaye" deja confirme cette nuit (bootstrap
+                    # cluster, survit a verification adversariale) : le vrai taux
+                    # de victoire a ce niveau de prix est plus bas que ce que le
+                    # marche affiche, donc vendre au prix inflate (frais minimes a
+                    # ce niveau) bat rester expose au vrai taux, plus bas.
+                    # Remplace la decision de l'agent plutot que de laisser un 2e
+                    # systeme tourner en parallele -- cf le bug critique du 14/08
+                    # ou l'ancienne heuristique agissait sans jamais consulter le
+                    # RL (perte reelle -2.19$ sans consultation). Un seul point de
+                    # decision par cycle ; ce garde-fou est prioritaire sur l'agent.
+                    SEUIL_TP_ABSOLU_SURPAYE = 0.95
+                    _notre_bid_rl = _ub_rl if leg_seule.get("side") == "Up" else _db_rl
+                    if _notre_bid_rl is not None and _notre_bid_rl >= SEUIL_TP_ABSOLU_SURPAYE:
+                        if _action_rl != "SELL_MARKET":
+                            self._tlog(
+                                f"rltrade_tp_absolu_{sym}",
+                                f"💰 [MMBOT] {sym} {slug} {leg_seule.get('side')} "
+                                f"bid={_notre_bid_rl:.3f} >= {SEUIL_TP_ABSOLU_SURPAYE} "
+                                f"-> override SELL_MARKET (agent avait decide {_action_rl})",
+                            )
+                        _action_rl = "SELL_MARKET"
+
+                    # COMPLETION MEME A PERTE BORNEE (Steven 15/08, backteste cette
+                    # nuit sur 2 periodes independantes, 6 jours calendaires, jamais
+                    # d'inversion) : quand un vrai verrou (combine<1.00) n'apparait
+                    # JAMAIS sur toute la fenetre, tenir jusqu'a resolution donne un
+                    # WR catastrophique (~5% mesure -- si l'autre cote ne s'est
+                    # jamais approche de 1.00-entree, c'est que le marche a deja
+                    # tranche contre nous). Completer quand meme a perte GARANTIE et
+                    # BORNEE (combine entre 1.00 et 1.10) bat les deux alternatives :
+                    # tenir jusqu'a resolution (+0.20$/part en moyenne, mesure) ET
+                    # vendre notre propre jambe au bid courant, ce que fait
+                    # l'abandon actuel (+0.017$/part, aussi mesure). Ne remplace QUE
+                    # les decisions passives (HOLD_TO_RESOLUTION/NOOP) -- n'interrompt
+                    # jamais un COMPLETE/SELL_MARKET deja choisi par l'agent, et exige
+                    # le meme plancher de detention que l'abandon existant pour ne pas
+                    # couper une vraie chance de verrou encore toute fraiche.
+                    TOLERANCE_COMPLETION_PERTE = 0.10
+                    if (_action_rl in ("HOLD_TO_RESOLUTION", "NOOP")
+                            and _ask_pot_rl is not None
+                            and leg_seule.get("price") is not None
+                            and _hold_s >= _abandon_min_hold_s(sym)):
+                        _combine_perte_rl = leg_seule["price"] + _ask_pot_rl
+                        if 1.00 <= _combine_perte_rl <= 1.00 + TOLERANCE_COMPLETION_PERTE:
+                            self._tlog(
+                                f"rltrade_completion_perte_{sym}",
+                                f"🩹 [MMBOT] {sym} {slug} {leg_seule.get('side')} "
+                                f"combine={_combine_perte_rl:.3f} (perte bornee "
+                                f"{_combine_perte_rl - 1.0:.3f}) -> override COMPLETE "
+                                f"plutot que {_action_rl} (verrou improbable ici)",
+                            )
+                            _action_rl = "COMPLETE"
+
                     if _action_rl is not None:
                         self._tlog(
                             f"rltrade_{sym}",
