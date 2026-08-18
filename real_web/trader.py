@@ -841,7 +841,29 @@ MAKER_OPEN_ENABLED = True
 #      ce soit. Steven garde donc la main, symbole par symbole, depuis le
 #      dashboard.
 MAKER_OPEN_SYMBOLS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB")
-MAKER_OPEN_PRICE = 0.35           # prix de pose, PLAFOND (jamais depasse)
+# PRIX 0.35 -> 0.10 (Steven 19/08, prolonge la meme piste que 0.46->0.35 du
+# 06/08 ci-dessus -- meme mecanisme, teste plus loin). Simulation d'ordre
+# resident causale (achat au 1er ask<=P, jambe seule tenue a resolution, P&L
+# COMPLET pas seulement les verrous) sur 2 periodes disjointes (12-14/08 et
+# 16-18/08, 6 jours calendaires, jamais chevauchees), grille P=0.30 a 0.01 :
+# amelioration MONOTONE a chaque palier plus bas, jamais d'inversion, jamais
+# de signe different par jour ou par symbole (0.05 : 6/6 symboles
+# significatifs individuellement sur les deux jeux). A 0.05 -- l'optimum
+# mesure -- \$/h = +26.5 (frais) / +14.7 (ancien) contre -38.9 / -30.7 a
+# 0.35 (le prix actuel). RETENU A 0.10 PLUTOT QUE L'OPTIMUM 0.05, avec la
+# meme philosophie de marge de securite que le choix 0.35 (vs 0.33) du
+# 06/08 : 0.05 = exactement DEAD_MARKET_THRESHOLD, le plancher deja etabli
+# ailleurs dans ce fichier pour dire "ce cote est quasi resolu, ne pas y
+# toucher" -- coller pile dessus pour la pose initiale est plus risque que
+# ce que le backtest (execution idealisee, pas de modele de profondeur
+# reelle a des prix aussi extremes) peut garantir. A 0.10, deja tres
+# largement valide (\$/h = +13.4 / +5.9) et loin de ce plancher.
+# ATTENTION OPERATIONNELLE (non testee ici) : le modele RL deploye
+# (rl_qnet_weights.json) a ete entraine sur des entrees pres de 0.35 --
+# des entrees systematiquement pres de 0.10 sont hors de la distribution
+# vue a l'entrainement. A surveiller en reel ; un reentrainement (v6) sur
+# des donnees a ce nouveau prix serait la suite logique si ca se confirme.
+MAKER_OPEN_PRICE = 0.10           # prix de pose, PLAFOND (jamais depasse)
 # PRIX ADAPTATIF (Steven 09/08, "il pourrait pas s'adapter au marche ?") :
 # au lieu d'abandonner toute la fenetre quand l'ask est deja sous 0.35
 # (PRENEUR), on pose EN DESSOUS de l'ask actuel -- jamais au-dessus de
