@@ -7980,7 +7980,7 @@ class MultiTrader:
         if comb > _comb_max:
             return
 
-        budget = self._maker_open_budget()
+        budget = self._maker_open_budget(sym)
         parts = round(max(MIN_ORDER_SIZE_SHARES, budget / max(0.01, comb)) + 0.01, 2)
         besoin = round(parts * comb, 2)
         if besoin > self._investable():
@@ -8180,7 +8180,43 @@ class MultiTrader:
         st[slug] = pose
         self._save()
 
-    def _maker_open_budget(self):
+    # CORRELATION CROSS-SYMBOLE (Steven 19/08) : mesure cette nuit sur 5804
+    # fenetres (2 periodes disjointes, 6 jours calendaires) -- quand plusieurs
+    # symboles ouvrent une fenetre 5m au meme instant, leurs issues Up/Down
+    # sont d'accord ~77% du temps (contre 50% si independantes), survit a
+    # verification adversariale severe (bootstrap cluster, test de
+    # permutation, split par periode, split par taille de groupe). 6 symboles
+    # ouverts en meme temps ne sont donc PAS 6 paris independants -- plutot
+    # ~1.6-1.7 "paris effectifs" (N_eff = 6/(1+5*rho), rho=2*taux-1=0.54).
+    # CHIFFRE RETENU ICI = 2.0, PAS le 1.6-1.7 mesure : la mesure structurelle
+    # est dominee a 85% par des groupes de 5-6 symboles co-ouverts, alors que
+    # le regime qui compte en pratique (2-3 symboles ouverts en meme temps,
+    # le seul observe jusqu'ici sur les vrais trades) n'a jamais ete mesure
+    # directement -- verifie cette nuit lors d'une tentative de chiffrer un
+    # plafond precis (27%), qui n'a PAS survecu a la verification pour cette
+    # raison. 2.0 est le choix conservateur qui ne penalise PAS le cas k<=2
+    # (le plus frequent en reel) tout en reduisant l'exposition simultanee
+    # quand 3+ symboles s'alignent -- a affiner plus tard avec des donnees
+    # reelles sur k>=3, pas a prendre comme un chiffre definitif.
+    CORRELATION_N_EFF = 2.0
+
+    def _maker_open_facteur_correlation(self, sym):
+        """Reduit le budget d'une nouvelle position MSF quand d'autres
+        symboles ont deja une tentative MSF active en meme temps -- le risque
+        reel n'est pas divise par le nombre de symboles ouverts (ils bougent
+        ensemble ~77% du temps), donc empiler des positions sur 4-6 symboles
+        au meme instant n'est pas la diversification qu'elle parait etre."""
+        try:
+            autres_actifs = sum(
+                1 for s in MAKER_OPEN_SYMBOLS
+                if s != sym and self.state["markets"].get(s, {}).get("maker_open")
+            )
+        except Exception:
+            return 1.0  # fail-open : jamais bloquant si l'etat est inattendu
+        k = autres_actifs + 1  # +1 pour la tentative qu'on est en train de dimensionner
+        return min(1.0, self.CORRELATION_N_EFF / k)
+
+    def _maker_open_budget(self, sym=None):
         # BUG TROUVE EN LIVE (Steven 09/08, "je ne vois toujours aucun
         # mouvement") : MAKER_OPEN_TOTAL_FRAC=0.35 > MAX_MARKET_EXPOSURE_FRAC
         # =0.25 -> des que investable() depasse ~25$, ce budget demande
@@ -8198,12 +8234,13 @@ class MultiTrader:
         # demande jamais plus que ce que _exposure_ok acceptera juste apres --
         # mais elle ne doit borner qu'au vrai plafond, pas a un plafond
         # etranger plus bas.
+        _facteur_corr = self._maker_open_facteur_correlation(sym) if sym else 1.0
         return round(
             min(
                 MAKER_OPEN_BUDGET_MAX,
                 self._maker_open_expo_max(),
                 max(MAKER_OPEN_BUDGET_MIN, self._investable() * MAKER_OPEN_TOTAL_FRAC),
-            ),
+            ) * _facteur_corr,
             2,
         )
 
