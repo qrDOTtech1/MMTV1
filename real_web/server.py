@@ -1438,6 +1438,7 @@ def api_trades_export():
             "resolved_by",
             "loss_tag",
             "realized_pnl",
+            "hold_s",
         ]
     )
     for t in paged:
@@ -1459,6 +1460,7 @@ def api_trades_export():
                 t.get("resolved_by", ""),
                 t.get("loss_tag", ""),
                 t.get("realized_pnl", ""),
+                t.get("hold_s", ""),
             ]
         )
     output = si.getvalue()

@@ -5648,7 +5648,7 @@ class MultiTrader:
         return round(max(0.01, prix), 2), round(cum, 2)
 
     def _sell_orphan(self, token_id, shares, tag="", entry_price=None, symbol=None, slug=None,
-                     side=None, urgence=0):
+                     side=None, urgence=0, loss_tag=None, entry_ts=None):
         """Revend `shares` parts au meilleur bid et VERIFIE ON-CHAIN que la vente
         est reellement passee (Steven 22/07 : plus jamais de vente supposee).
         Retourne le nombre de parts effectivement vendues. Log explicite.
@@ -5662,7 +5662,18 @@ class MultiTrader:
         les cycles achat-puis-revente-immediate (unwind d'orphelin) depensaient
         et recuperaient du vrai argent SANS JAMAIS que le delta (souvent une
         petite perte de spread) soit compte nulle part -> pnl_total_real
-        mentait par omission, ecart de plusieurs dollars invisible."""
+        mentait par omission, ecart de plusieurs dollars invisible.
+        `loss_tag`/`entry_ts` (Steven 15/08, backtest "10 idees") : le champ
+        `loss_tag` existait deja dans le schema mais n'etait JAMAIS rempli --
+        chaque appelant taguait un texte de LOG different (ABANDON, TP-PASSIF-
+        REPLI, CALM-SL, MMBOT-SELL...) mais le trade PERSISTE ne gardait que
+        resolved_by="unwind", identique pour tous -- impossible ensuite de
+        savoir quel declencheur a cause quelle perte sans fouiller les logs
+        texte. `entry_ts`, quand fourni par l'appelant (ex: leg_seule['fill_ts']),
+        remplace le timestamp de VENTE par le vrai timestamp d'ENTREE pour
+        `opened_ts`/`start_ts` -- avant ce fix les deux etaient identiques
+        (les deux tamponnes a l'instant de la vente), rendant toute mesure de
+        duree de detention impossible a reconstruire apres coup."""
         if shares < 0.01:
             return 0.0
         # TOP-UP DESACTIVE (Steven 05/08) : ce bloc partait du principe que le
@@ -5752,11 +5763,19 @@ class MultiTrader:
             mk_rec = self.state["markets"].get(symbol)
             if mk_rec is not None:
                 _now_ts = time.time()
+                # opened_ts/start_ts restent _now_ts par defaut (FIX Steven
+                # 30/07 ci-dessous, ne jamais les laisser vides) -- seulement
+                # remplaces par le vrai entry_ts quand l'appelant le fournit,
+                # pour ne rien casser sur les chemins qui ne le passent pas
+                # encore.
+                _open_ts = entry_ts if entry_ts else _now_ts
                 mk_rec["trades"].append({
                     "symbol": symbol, "slug": slug, "side": side, "mode": "real",
                     "strat": "orphan", "entry_price": entry_price, "exit_price": bid,
                     "filled_shares": sold, "cost": round(sold * entry_price, 2),
                     "pnl": _pnl, "win": _pnl > 0, "resolved_by": "unwind",
+                    "loss_tag": loss_tag,
+                    "hold_s": round(_now_ts - entry_ts, 1) if entry_ts else None,
                     # FIX (Steven 30/07, "je vois toujours pas nos dernieres
                     # trades") : le dashboard trie/filtre sur "opened_ts", pas
                     # "ts" -> mes trades UNWIND n'avaient pas ce champ, donc
@@ -5764,7 +5783,7 @@ class MultiTrader:
                     # remontaient EN PREMIER en tri desc (devant les vrais
                     # trades recents qui, eux, ont un opened_ts). Les 2 champs
                     # sont maintenant remplis, coherent avec le reste du code.
-                    "opened_ts": _now_ts, "start_ts": _now_ts, "ts": _now_ts,
+                    "opened_ts": _open_ts, "start_ts": _open_ts, "ts": _now_ts,
                 })
                 _icon2 = "✅ WIN " if _pnl > 0 else "❌ LOSS"
                 self._log(
@@ -6192,6 +6211,7 @@ class MultiTrader:
                 leg["token_id"], round(n, 2),
                 f" {sym} {slug} {leg['side']} PRE-OUVERTURE-SOLO",
                 entry_price=leg["price"], symbol=sym, slug=slug, side=leg["side"],
+                loss_tag="pre_ouverture_solo",
             )
             if sold < n - 0.01:
                 # invendable pour l'instant -> on la track pour gestion normale
@@ -6789,6 +6809,8 @@ class MultiTrader:
                             f" {sym} {slug} {leg_seule['side']} MMBOT-SELL",
                             entry_price=leg_seule["price"], symbol=sym,
                             slug=slug, side=leg_seule["side"],
+                            loss_tag="rl_sell_market",
+                            entry_ts=leg_seule.get("fill_ts"),
                         )
                         if _vendu_rl >= _n_rl - 0.01:
                             self._maker_open_record(
@@ -7101,6 +7123,8 @@ class MultiTrader:
                                     f" {sym} {slug} {leg_seule['side']} MSF-TPNOW",
                                     entry_price=leg_seule["price"], symbol=sym,
                                     slug=slug, side=leg_seule["side"],
+                                    loss_tag="tpnow_prefere_a_completion",
+                                    entry_ts=leg_seule.get("fill_ts"),
                                 )
                                 if _vendu_tn >= _n_comp - 0.01:
                                     self._log(
@@ -7252,6 +7276,8 @@ class MultiTrader:
                         f" {sym} {slug} {leg_seule['side']} MAKER-OUVERT-ABANDON",
                         entry_price=leg_seule["price"], symbol=sym,
                         slug=slug, side=leg_seule["side"],
+                        loss_tag="abandon_combine_hors_atteinte",
+                        entry_ts=leg_seule.get("fill_ts"),
                     )
                     if _vendu_ab >= _n_comp - 0.01:
                         self._maker_open_record(
@@ -7335,6 +7361,8 @@ class MultiTrader:
                     leg_seule["token_id"], _n_repli,
                     f" {sym} {slug} {leg_seule['side']} MAKER-OUVERT-TP-PASSIF-REPLI",
                     entry_price=leg_seule["price"], symbol=sym, slug=slug, side=leg_seule["side"],
+                    loss_tag="tp_passif_jamais_rempli_repli_cutoff",
+                    entry_ts=leg_seule.get("fill_ts"),
                 )
                 self._maker_open_record(
                     sym, slug, "tp", combine=None, parts=_n_repli, prix=leg_seule["price"],
@@ -7506,6 +7534,8 @@ class MultiTrader:
                     f" {sym} {slug} {leg_seule['side']} MAKER-OUVERT-TP",
                     entry_price=leg_seule["price"], symbol=sym, slug=slug,
                     side=leg_seule["side"],
+                    loss_tag="tp_seuil_atteint_post_passif_echec",
+                    entry_ts=leg_seule.get("fill_ts"),
                 )
                 if vendu_tp < n_tp - 0.01:
                     mk["open"][f"{slug}|{leg_seule['side']}"] = {
@@ -7611,6 +7641,8 @@ class MultiTrader:
                             f" {sym} {slug} {leg_seule['side']} MAKER-OUVERT-CALM-SL",
                             entry_price=leg_seule["price"], symbol=sym, slug=slug,
                             side=leg_seule["side"],
+                            loss_tag="calm_sl_bid_sous_seuil",
+                            entry_ts=leg_seule.get("fill_ts"),
                         )
                         if _vendu_sl < _n_sl - 0.01:
                             mk["open"][f"{slug}|{leg_seule['side']}"] = {
@@ -7705,6 +7737,8 @@ class MultiTrader:
                 leg["token_id"], round(n, 2),
                 f" {sym} {slug} {leg['side']} MAKER-OUVERT-SOLO",
                 entry_price=leg["price"], symbol=sym, slug=slug, side=leg["side"],
+                loss_tag="cutoff_final_t45s",
+                entry_ts=leg.get("fill_ts"),
             )
             if vendu < n - 0.01:
                 mk["open"][f"{slug}|{leg['side']}"] = {

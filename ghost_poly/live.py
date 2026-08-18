@@ -111,6 +111,16 @@ class PolyLive:
         self._pk = private_key
         self._client = None
         self._keepalive_started = False
+        # DIAGNOSTIC RUST (Steven 15/08, "rust_usage_pct" mesure a 5.6% en
+        # prod alors que le service tourne et que le fallback est cense etre
+        # rare). _resign_via_rust avalait l'exception sans jamais dire
+        # laquelle -- impossible de savoir si c'est un timeout (0.3s, tres
+        # serre pour un appel local sur un container Railway partage), un
+        # service absent (connection refused), ou une reponse invalide.
+        # Compteurs simples + log throttle pour enfin voir la repartition
+        # des causes d'echec au prochain redeploiement.
+        self._rust_fail_counts = {}
+        self._rust_fail_log_ts = 0.0
 
     # ── état / prérequis ──
 
@@ -1111,6 +1121,12 @@ class PolyLive:
         if int(order.signatureType) not in (0, 3):
             return order, None
         url = os.environ.get("RUST_SIGN_URL", "http://127.0.0.1:9931/sign")
+        # TIMEOUT (Steven 15/08) : 0.3s etait tres serre pour un appel local
+        # sur un container Railway partage -- le chemin Python seul coute deja
+        # ~450ms en moyenne (mesure sur 240 executions reelles), donc rater
+        # Rust pour 0.2s de marge en plus est une mauvaise affaire. 0.5s
+        # laisse une vraie chance au service tout en restant tres largement
+        # sous le budget Python.
         try:
             payload = {
                 "maker": order.maker,
@@ -1127,16 +1143,35 @@ class PolyLive:
                 "chain_id": chain_id,
                 "exchange": exchange_address,
             }
-            r = requests.post(url, json=payload, timeout=0.3)
+            r = requests.post(url, json=payload, timeout=0.5)
             if r.status_code != 200:
+                self._log_rust_fail(f"http_{r.status_code}")
                 return order, None
             sig = r.json().get("signature")
             if not sig:
+                self._log_rust_fail("no_signature_in_response")
                 return order, None
             order.signature = sig
             return order, r.json().get("sign_us")
-        except Exception:
+        except requests.exceptions.Timeout:
+            self._log_rust_fail("timeout")
+            return order, None
+        except requests.exceptions.ConnectionError:
+            self._log_rust_fail("connection_error")  # service pas demarre / plante
+            return order, None
+        except Exception as e:
+            self._log_rust_fail(type(e).__name__)
             return order, None  # jamais fatal -- Python a deja signe correctement
+
+    def _log_rust_fail(self, reason: str):
+        """Compteur + log throttle (1x/30s max) des raisons d'echec du resign
+        Rust -- avant ce fix, `except Exception: pass` rendait le probleme
+        invisible (rust_usage_pct mesure a 5.6% en prod sans aucune piste)."""
+        self._rust_fail_counts[reason] = self._rust_fail_counts.get(reason, 0) + 1
+        now = time.time()
+        if now - self._rust_fail_log_ts >= 30:
+            self._rust_fail_log_ts = now
+            print(f"[rust-sign] echecs depuis le demarrage : {self._rust_fail_counts}")
 
     def _signed_post_timed(self, token_id: str, args, order_type, neg_risk: bool = False):
         """Signe et poste UN ordre en chronometrant chaque etape (Steven 08/08,
