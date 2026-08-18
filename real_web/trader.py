@@ -6769,36 +6769,20 @@ class MultiTrader:
                             )
                         _action_rl = "SELL_MARKET"
 
-                    # COMPLETION MEME A PERTE BORNEE (Steven 15/08, backteste cette
-                    # nuit sur 2 periodes independantes, 6 jours calendaires, jamais
-                    # d'inversion) : quand un vrai verrou (combine<1.00) n'apparait
-                    # JAMAIS sur toute la fenetre, tenir jusqu'a resolution donne un
-                    # WR catastrophique (~5% mesure -- si l'autre cote ne s'est
-                    # jamais approche de 1.00-entree, c'est que le marche a deja
-                    # tranche contre nous). Completer quand meme a perte GARANTIE et
-                    # BORNEE (combine entre 1.00 et 1.10) bat les deux alternatives :
-                    # tenir jusqu'a resolution (+0.20$/part en moyenne, mesure) ET
-                    # vendre notre propre jambe au bid courant, ce que fait
-                    # l'abandon actuel (+0.017$/part, aussi mesure). Ne remplace QUE
-                    # les decisions passives (HOLD_TO_RESOLUTION/NOOP) -- n'interrompt
-                    # jamais un COMPLETE/SELL_MARKET deja choisi par l'agent, et exige
-                    # le meme plancher de detention que l'abandon existant pour ne pas
-                    # couper une vraie chance de verrou encore toute fraiche.
-                    TOLERANCE_COMPLETION_PERTE = 0.10
-                    if (_action_rl in ("HOLD_TO_RESOLUTION", "NOOP")
-                            and _ask_pot_rl is not None
-                            and leg_seule.get("price") is not None
-                            and _hold_s >= _abandon_min_hold_s(sym)):
-                        _combine_perte_rl = leg_seule["price"] + _ask_pot_rl
-                        if 1.00 <= _combine_perte_rl <= 1.00 + TOLERANCE_COMPLETION_PERTE:
-                            self._tlog(
-                                f"rltrade_completion_perte_{sym}",
-                                f"🩹 [MMBOT] {sym} {slug} {leg_seule.get('side')} "
-                                f"combine={_combine_perte_rl:.3f} (perte bornee "
-                                f"{_combine_perte_rl - 1.0:.3f}) -> override COMPLETE "
-                                f"plutot que {_action_rl} (verrou improbable ici)",
-                            )
-                            _action_rl = "COMPLETE"
+                    # COMPLETION A PERTE BORNEE -- RETIRE (Steven 15/08). Code le
+                    # 15/08 sur la base d'un backtest utilisant le MEILLEUR combine
+                    # jamais atteint sur TOUTE la fenetre -- une information qu'on
+                    # n'a pas en temps reel (biais retrospectif/look-ahead). Rejoue
+                    # en causal strict (declenchement au 1er instant reel ou la
+                    # condition est remplie, pas au meilleur moment retrospectif) :
+                    # le resultat s'INVERSE. Completer a ce moment perd contre TENIR
+                    # jusqu'a resolution (-0.02 a -0.10$/part selon le jeu, IC95
+                    # cluster exclut 0 sur 5/6 tests), meme s'il bat encore vendre
+                    # la jambe au bid courant (+0.012 a +0.017$/part). Comme ce
+                    # garde-fou ne remplacait QUE les decisions HOLD_TO_RESOLUTION/
+                    # NOOP -- precisement le cas ou tenir est superieur -- il aurait
+                    # degrade la performance reelle. Retire avant tout impact sur
+                    # de l'argent reel.
 
                     if _action_rl is not None:
                         self._tlog(
