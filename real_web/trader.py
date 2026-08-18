@@ -1152,24 +1152,31 @@ def _tp_min_hold_s(sym):
 # Le seuil 1.25 (plutot que 1.05) laisse vivre la jambe assez longtemps pour
 # que le scalp apporteur ait lieu : a 1.05 le combine est soit dessous soit
 # dessus, la decision tombe des le 1er tick et aucun TP ne peut exister.
-MAKER_OPEN_ABANDON_MAX = 1.25
-# ABANDON PLUS RAPIDE SUR CARNET FIN (Steven 13/08). Mesure du 11/08 :
-# vendre tot recupere 40% de la mise, vendre tard 5%, ne jamais vendre 0%.
-# Sur un carnet 9x plus fin que BTC (XRP : profondeur mediane 75 parts
-# contre 687), une jambe qui derive vers l'abandon a moins de chances de
-# revenir (moins de flux pour la retourner) -- couper plus tot y limite la
-# casse plutot que d'esperer un retournement improbable. BTC/ETH gardent la
-# valeur mesuree et validee (1.25) ; les 4 symboles a carnet fin sont plus
-# stricts, sans preuve chiffree encore -- A RE-MESURER apres quelques jours
-# de collecte reelle sur ces symboles, cf. verite_terrain par symbole.
-MAKER_OPEN_ABANDON_MAX_PAR_SYMBOLE = {
-    "BTC": 1.25, "ETH": 1.25,
-    "SOL": 1.15, "XRP": 1.15, "DOGE": 1.15, "BNB": 1.15,
+# BUG TROUVE EN AUDIT (Steven 19/08, avant depot reel) : ce seuil etait un
+# NOMBRE ABSOLU (combine = notre_entree + ask_de_l_autre_cote), derive a
+# l'epoque pour une entree a MAKER_OPEN_PRICE=0.35 ("abandon si l'autre cote
+# devient plus cher que 0.90"). Le 19/08 MAKER_OPEN_PRICE est passe a 0.10,
+# et PERSONNE n'avait recalcule ce seuil -- a 0.10, il faudrait un ask de
+# l'autre cote > 1.25-0.10 = 1.15 (ou 1.05 pour les 4 symboles carnet fin),
+# alors qu'un ask ne depasse jamais ~0.99-1.00 : L'ABANDON NE POUVAIT PLUS
+# JAMAIS SE DECLENCHER. Corrige en exprimant le seuil comme une TOLERANCE
+# sur l'ask de l'autre cote (independante du prix d'entree), pour que ce
+# genre de bug ne revienne pas silencieusement la prochaine fois que
+# MAKER_OPEN_PRICE change. Tolerances (= anciens seuils - 0.35, l'entree en
+# vigueur quand ces valeurs ont ete mesurees) inchangees, donc AUCUN
+# changement de comportement pour l'entree actuelle a 0.35 -- seulement
+# corrige pour continuer a fonctionner correctement quel que soit
+# MAKER_OPEN_PRICE.
+MAKER_OPEN_ABANDON_TOLERANCE = 0.90   # BTC/ETH : abandon si l'autre ask > cette valeur
+MAKER_OPEN_ABANDON_TOLERANCE_PAR_SYMBOLE = {
+    "BTC": 0.90, "ETH": 0.90,
+    "SOL": 0.80, "XRP": 0.80, "DOGE": 0.80, "BNB": 0.80,
 }
 
 
 def _abandon_max(sym):
-    return MAKER_OPEN_ABANDON_MAX_PAR_SYMBOLE.get(sym, MAKER_OPEN_ABANDON_MAX)
+    tol = MAKER_OPEN_ABANDON_TOLERANCE_PAR_SYMBOLE.get(sym, MAKER_OPEN_ABANDON_TOLERANCE)
+    return MAKER_OPEN_PRICE + tol
 
 
 # INTERDICTION D'ABANDONNER JUSTE APRES LE REMPLISSAGE (Steven 13/08,
