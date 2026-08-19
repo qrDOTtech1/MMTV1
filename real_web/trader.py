@@ -47,7 +47,7 @@ MARKET_DATA_FILE = ROOT / "data" / "market_snapshots.jsonl"
 MARKET_DATA_MAX_MB = 400
 
 # ── garde-fous & sizing (valeurs validees par Steven) ──
-FLOOR_USD = 20.0  # ne jamais engager de capital sous ce plancher (protege le capital,
+FLOOR_USD = 0.0  # Steven 19/08 -- ne jamais engager de capital sous ce plancher (protege le capital,
 # ne risque que les profits au-dessus de 20$)
 STOP_CONSEC_LOSSES = 2  # stop apres 2 pertes consecutives (resserre le temps de valider
 # l'entree plus tot, plus agressive ; reset des un win)
@@ -1417,9 +1417,9 @@ def _score_risque_retournement(sym, slug, reste):
     return round(d * facteur_temps)
 
 
-MAKER_OPEN_TOTAL_FRAC = 0.35      # TOTAL des 2 jambes, en part de l'investissable
+MAKER_OPEN_TOTAL_FRAC = 0.95      # TOTAL des 2 jambes, en part de l'investissable (Steven 19/08)
 MAKER_OPEN_BUDGET_MIN = 4.7
-MAKER_OPEN_BUDGET_MAX = 40.0
+MAKER_OPEN_BUDGET_MAX = 500.0
 # ── PLAFOND D'EXPOSITION PROPRE A MSF (Steven 13/08, "au lieu d'un budget
 # fixe, un pourcentage ? comme ca ca suit l'evolution sans palier stricte").
 #
@@ -1503,7 +1503,7 @@ CALM_MSF_TP_PRICE = 0.85
 CALM_MSF_AUTOSTOP_N = 20           # apres 20 trades calme, on coupe le mode si ROI < 0
 
 PAIR_MAX_IMBALANCE = 1.05
-PAIR_COMPLETION_MAX_COMBINED = 0.95
+PAIR_COMPLETION_MAX_COMBINED = 0.995  # Steven 19/08
 # ── ZONE DE COUVERTURE TOLEREE (Steven 05/08, decision explicite) ──────
 # Cas reel qui a motive ce palier : 13:20:47 achat Up 4.976 @ 0.410, puis
 # 6 SECONDES plus tard achat Down 4.919 @ 0.620 -> combine 1.030. Le prix
@@ -1523,7 +1523,7 @@ PAIR_COMPLETION_MAX_COMBINED = 0.95
 # perdantes au-dessus de 1.20) tout en gardant la bande que le TP/SL sait
 # reellement gerer (seulement 6 des 55 paires perdantes etaient en 1.00-1.05,
 # et elles l'ont ete SANS TP/SL fonctionnel, faussement taggees risk-free).
-PAIR_COMPLETION_HEDGE_MAX = 1.03
+PAIR_COMPLETION_HEDGE_MAX = 1.05  # Steven 19/08
 
 # ── RENFORT DE LA JAMBE GAGNANTE (Steven 05/08) ────────────────────────
 # Idee de Steven : "des qu'on a fait un SL, meme de 25%, ca devient
@@ -1996,7 +1996,7 @@ FAV_MAX_PRICE = 0.85
 FAV_BINANCE_MARGIN = 0.0025   # 0.25% = signal "clair", pas juste "devant"
 FAV_MIN_SECS = 30             # sous 30s : plus le temps de sortir si ca tourne
 FAV_MAX_SECS = 150            # au-dela : trop de temps pour se retourner
-FAV_BUDGET_USD = 1.60         # mise directionnelle volontairement petite
+FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par investable
 # TP INSTANTANE UNIVERSEL (Steven 19/08, "meme prix 0.10, 0.35, 0.52, 0.65,
 # toujours meme chose") : s'applique a TOUTE position geree par
 # _manage_pnl_tier_exits (bothside/swing/fav/nearcert/copy), quel que soit le
