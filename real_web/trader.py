@@ -8775,8 +8775,9 @@ class MultiTrader:
             # le prix depasse l'entree de TP_INSTANT_PCT, on vend TOUT.
             _tp_entry = pos.get("entry_price", 0)
             if _tp_entry > 0:
-                _tp_px = self._live_price(pos.get("token_id"), None, pos.get("side"))
-                if _tp_px is not None and (_tp_px - _tp_entry) / _tp_entry >= TP_INSTANT_PCT:
+                _tp_ask = self._live_ask(pos.get("token_id"))
+                _tp_px = _tp_ask if _tp_ask is not None else self._live_price(pos.get("token_id"), None, pos.get("side"))
+                if _tp_ask is not None and _tp_ask > _tp_entry:
                     _tp_shares = pos.get("filled_shares", 0)
                     if _tp_shares > 0:
                         _tp_sold = self._sell_orphan(
@@ -8791,7 +8792,7 @@ class MultiTrader:
                             pos["filled_shares"] = round(_tp_shares - _tp_sold, 2)
                             self._log(
                                 f"⚡ [TP-INSTANT-ORPHAN] {sym} {pos['slug']} {pos['side']} "
-                                f"@ entree {_tp_entry:.3f} +{100 * (_tp_px - _tp_entry) / _tp_entry:.1f}% "
+                                f"@ entree {_tp_entry:.3f} ask={_tp_ask:.3f} "
                                 f"-> vendu {_tp_sold} parts @ {_tp_px:.3f}"
                             )
                             if pos["filled_shares"] <= 0.01:
@@ -13353,6 +13354,19 @@ class MultiTrader:
     # ── PNL-BASED TIERED TP/SL V3.2 (Steven 27/07) ──
     # ══════════════════════════════════════════════════════════════════════════
 
+    def _live_ask(self, token_id):
+        """Prix d'ACHAT courant (meilleur ask du carnet) -- Steven 19/08,
+        "si prix achat superieur au prix auquel on a achete = vente"."""
+        try:
+            book = self._live.get_book_sync(token_id)
+            if book:
+                asks = book.get("asks") or []
+                if asks:
+                    return round(asks[0][0], 3)
+        except Exception:
+            pass
+        return None
+
     def _gamma_market(self, slug):
         import requests as _rq
         try:
@@ -13753,8 +13767,11 @@ class MultiTrader:
 
             stage = pos.get("pnl_tp_stage", 0)
 
-            # ── TP INSTANTANE UNIVERSEL, sort TOUT des que possible (Steven 19/08) ──
-            if pnl_pct >= TP_INSTANT_PCT:
+            # ── TP INSTANTANE UNIVERSEL : se fie au prix d'ACHAT courant, pas
+            # au mid (Steven 19/08) -- des que l'ask direct depasse l'entree,
+            # vente TOUT immediate.
+            _tp_ask = self._live_ask(pos.get("token_id")) if pos["mode"] == "real" else cur
+            if _tp_ask is not None and _tp_ask > entry:
                 exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
                 if exit_price is None:
                     continue
@@ -13778,7 +13795,7 @@ class MultiTrader:
                 self._record_trade_pnl(sym, pnl)
                 self._log(
                     f"⚡ [TP-INSTANT] {sym} {slug} {pos['side']} @ entree {entry:.3f} "
-                    f"+{pnl_pct * 100:.1f}% -> vendu TOUT @ {exit_price:.3f} pnl={pnl:+.3f}$"
+                    f"ask={_tp_ask:.3f} -> vendu TOUT @ {exit_price:.3f} pnl={pnl:+.3f}$"
                 )
                 self._log_trade_exit(
                     sym, slug, pos["side"], "tp_instant", entry, exit_price,
