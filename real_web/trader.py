@@ -1990,13 +1990,17 @@ NEARCERT_MIN_SECS = 8
 # mesure et positif, sur un cash actuel de ~8$.
 NEARCERT_BUDGET_USD = 4.0
 
-FAV_ENABLED = False
+FAV_ENABLED = True
 FAV_MIN_PRICE = 0.70
 FAV_MAX_PRICE = 0.85
 FAV_BINANCE_MARGIN = 0.0025   # 0.25% = signal "clair", pas juste "devant"
 FAV_MIN_SECS = 30             # sous 30s : plus le temps de sortir si ca tourne
 FAV_MAX_SECS = 150            # au-dela : trop de temps pour se retourner
 FAV_BUDGET_USD = 1.60         # mise directionnelle volontairement petite
+# TP INSTANTANE (Steven 19/08, "TP DES QUE POSSIBLE, le plus rapidement
+# possible") : contourne les paliers 25/50/75 -- sort la position fav EN
+# ENTIER des que ce seuil de PnL est atteint, au lieu d'attendre +25%.
+FAV_TP_INSTANT_PCT = 0.02
 # GROSSE MISE SUR RISK-FREE (Steven 29/07, "je veux grosse mise sur les arb
 # risk free") : contrairement au directionnel, l'arb garanti (2 jambes achetees
 # EN MEME TEMPS, profit fige quel que soit le resultat) n'expose PAS a un
@@ -13604,6 +13608,40 @@ class MultiTrader:
                         continue
 
             stage = pos.get("pnl_tp_stage", 0)
+
+            # ── FAV : TP INSTANTANE, sort TOUT des que possible (Steven 19/08) ──
+            if pos.get("strat") == "fav" and pnl_pct >= FAV_TP_INSTANT_PCT:
+                exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
+                if exit_price is None:
+                    continue
+                sold = shares
+                if pos["mode"] == "real":
+                    sold = self._sell_orphan(
+                        pos["token_id"], shares, f" {sym} {slug} {pos['side']} FAV-TP-INSTANT"
+                    )
+                    if sold <= 0:
+                        continue
+                realized = round(sold * (exit_price - entry), 3)
+                pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + realized, 3)
+                pos["filled_shares"] = 0.0
+                pnl = pos["realized_pnl"]
+                pos.update(win=pnl > 0, pnl=pnl, resolved_by="fav_tp_instant", exit_price=round(exit_price, 3))
+                self._record_reversal(sym, pos, min_pct, pnl)
+                if pos["mode"] == "paper":
+                    mk["paper_balance"] = round(mk["paper_balance"] + pnl, 3)
+                mk["trades"].append(pos)
+                del mk["open"][key]
+                self._record_trade_pnl(sym, pnl)
+                self._log(
+                    f"⚡ [FAV-TP-INSTANT] {sym} {slug} {pos['side']} +{pnl_pct * 100:.1f}% "
+                    f"-> vendu TOUT @ {exit_price:.3f} pnl={pnl:+.3f}$"
+                )
+                self._log_trade_exit(
+                    sym, slug, pos["side"], "fav_tp_instant", entry, exit_price,
+                    realized, 0, 0, pnl, now - pos.get("opened_ts", pos["start_ts"]),
+                    "sold", "open",
+                )
+                continue
 
             # ── STOP LOSS : -30% du prix d'entree (ou override RL) ──
             effective_sl_pct = pos.get("rl_stop_pct", PNL_SL_PCT)
