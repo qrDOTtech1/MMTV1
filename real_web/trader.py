@@ -1992,8 +1992,8 @@ NEARCERT_BUDGET_USD = 4.0
 
 FAV_ENABLED = True
 FAV_MIN_PRICE = 0.70
-FAV_MAX_PRICE = 0.999
-FAV_BINANCE_MARGIN = 0.0   # Steven 19/08 -- desactive, le prix marche suffit comme signal
+FAV_MAX_PRICE = 0.85
+FAV_BINANCE_MARGIN = 0.0025   # 0.25% = signal "clair", pas juste "devant"
 FAV_MIN_SECS = 30             # sous 30s : plus le temps de sortir si ca tourne
 FAV_MAX_SECS = 150            # au-dela : trop de temps pour se retourner
 FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par investable
