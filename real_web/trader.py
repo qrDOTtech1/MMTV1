@@ -1503,7 +1503,7 @@ CALM_MSF_TP_PRICE = 0.85
 CALM_MSF_AUTOSTOP_N = 20           # apres 20 trades calme, on coupe le mode si ROI < 0
 
 PAIR_MAX_IMBALANCE = 1.05
-PAIR_COMPLETION_MAX_COMBINED = 0.995  # Steven 19/08
+PAIR_COMPLETION_MAX_COMBINED = 99.0  # Steven 19/08 -- desactive (TP instantane gere le risque, plus besoin du gate combine)
 # ── ZONE DE COUVERTURE TOLEREE (Steven 05/08, decision explicite) ──────
 # Cas reel qui a motive ce palier : 13:20:47 achat Up 4.976 @ 0.410, puis
 # 6 SECONDES plus tard achat Down 4.919 @ 0.620 -> combine 1.030. Le prix
@@ -1523,7 +1523,7 @@ PAIR_COMPLETION_MAX_COMBINED = 0.995  # Steven 19/08
 # perdantes au-dessus de 1.20) tout en gardant la bande que le TP/SL sait
 # reellement gerer (seulement 6 des 55 paires perdantes etaient en 1.00-1.05,
 # et elles l'ont ete SANS TP/SL fonctionnel, faussement taggees risk-free).
-PAIR_COMPLETION_HEDGE_MAX = 1.05  # Steven 19/08
+PAIR_COMPLETION_HEDGE_MAX = 99.0  # Steven 19/08 -- desactive (idem)
 
 # ── RENFORT DE LA JAMBE GAGNANTE (Steven 05/08) ────────────────────────
 # Idee de Steven : "des qu'on a fait un SL, meme de 25%, ca devient
