@@ -13315,6 +13315,106 @@ class MultiTrader:
     # ── PNL-BASED TIERED TP/SL V3.2 (Steven 27/07) ──
     # ══════════════════════════════════════════════════════════════════════════
 
+    def _gamma_market(self, slug):
+        import requests as _rq
+        try:
+            r = _rq.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"slug": slug}, timeout=8,
+            )
+            d = r.json()
+            return d[0] if isinstance(d, list) and d else None
+        except Exception:
+            return None
+
+    MANUAL_SCAN_EVERY_S = 20
+
+    def _adopt_manual_positions(self, sym):
+        """Detecte les positions ouvertes A LA MAIN sur Polymarket (hors bot)
+        et les ajoute a mk['open'] avec strat='manual' (Steven 19/08, "gerer
+        meme mes trade manuel pour tp des que possible"). Le bot ne voit
+        normalement QUE ce qu'il a lui-meme ouvert -- ceci comble ce trou en
+        relisant l'activite on-chain du wallet, comme deja fait cette nuit
+        pour auditer TWAP-SNIPER. Throttle a MANUAL_SCAN_EVERY_S : c'est un
+        appel HTTP externe, pas question de le faire au rythme fast-exit
+        (WS, ~1-2s)."""
+        mk = self.state["markets"][sym]
+        if mk.get("mode") != "real":
+            return
+        now_t = time.time()
+        if now_t - mk.get("_last_manual_scan", 0) < self.MANUAL_SCAN_EVERY_S:
+            return
+        mk["_last_manual_scan"] = now_t
+        funder = os.environ.get("POLY_FUNDER_ADDRESS", "")
+        if not funder:
+            return
+        import requests as _rq
+        try:
+            r = _rq.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": funder, "limit": 100},
+                timeout=8, headers={"User-Agent": "GHOST/3"},
+            )
+            raw = r.json() if r.status_code == 200 else []
+        except Exception:
+            return
+        if not isinstance(raw, list):
+            return
+        prefix = f"{sym.lower()}-updown-5m-"
+        legs = {}
+        for a in raw:
+            slug = a.get("slug") or ""
+            if not slug.startswith(prefix) or a.get("type") != "TRADE":
+                continue
+            outcome = a.get("outcome")
+            e = legs.setdefault((slug, outcome), {"buy_sh": 0.0, "buy_usd": 0.0, "sell_sh": 0.0})
+            sz = float(a.get("size") or 0)
+            usdc = float(a.get("usdcSize") or 0)
+            if (a.get("side") or "").upper() == "BUY":
+                e["buy_sh"] += sz
+                e["buy_usd"] += usdc
+            else:
+                e["sell_sh"] += sz
+        for (slug, outcome), e in legs.items():
+            key = f"{slug}|{outcome}"
+            if key in mk["open"]:
+                continue
+            if any(t.get("slug") == slug and t.get("side") == outcome for t in mk.get("trades", [])):
+                continue
+            remaining = round(e["buy_sh"] - e["sell_sh"], 3)
+            if remaining < MIN_SELL_SHARES or e["buy_sh"] <= 0:
+                continue
+            avg = e["buy_usd"] / e["buy_sh"]
+            if not (0.005 < avg < 0.995):
+                continue
+            m = self._gamma_market(slug)
+            if not m:
+                continue
+            try:
+                outcomes = json.loads(m.get("outcomes") or "[]")
+                token_ids = json.loads(m.get("clobTokenIds") or "[]")
+                token_id = token_ids[outcomes.index(outcome)]
+            except Exception:
+                continue
+            try:
+                start_ts = int(slug.rsplit("-", 1)[-1])
+            except Exception:
+                start_ts = int(now_t) - 150
+            end_ts = start_ts + 300
+            if now_t > end_ts:
+                continue  # fenetre deja resolue, trop tard pour un TP
+            mk["open"][key] = {
+                "symbol": sym, "slug": slug, "side": outcome, "mode": "real",
+                "strat": "manual", "token_id": token_id, "entry_price": round(avg, 4),
+                "filled_shares": remaining, "cost": round(remaining * avg, 2),
+                "start_ts": start_ts, "end_ts": end_ts,
+                "opened_ts": now_t, "buffer": 0.0, "is_risk_free": False,
+            }
+            self._log(
+                f"🖐️ [MANUEL] {sym} {slug} {outcome} {remaining} parts @ {avg:.3f} "
+                f"detectee (hors bot) -> adoptee, TP instantane actif"
+            )
+
     def _manage_pnl_tier_exits(self, sym):
         """TP/SL PALIERS PNL-BASED V3.2 : sort 25% a +25%, 25% a +50%,
         25% a +75%, laisse 25% runner avec trailing stop.
@@ -13322,13 +13422,17 @@ class MultiTrader:
         S'applique aux positions bothside/swing (pas orphan, pas ARB pur).
         Les orphans ont leur propre gestion dans _manage_orphans."""
         mk = self.state["markets"][sym]
+        try:
+            self._adopt_manual_positions(sym)
+        except Exception as e:
+            self._tlog(f"manual_adopt_err_{sym}", f"💥 [MANUEL] {sym} scan erreur: {e}")
         now = synced_now()
         for key, pos in list(mk["open"].items()):
             # "fav" ajoute (Steven 05/08) : le pari directionnel sur le favori
             # DOIT etre gere ici, c'est toute sa raison d'etre. Sans ca il
             # serait skippe et tiendrait jusqu'a resolution sans TP ni SL --
             # exactement le bug qu'on a corrige partout ailleurs aujourd'hui.
-            if pos.get("strat") not in ("bothside", "swing", "fav", "nearcert", "copy"):
+            if pos.get("strat") not in ("bothside", "swing", "fav", "nearcert", "copy", "manual"):
                 continue
             # RISK-FREE : NE JAMAIS GERER INDIVIDUELLEMENT (Steven 29/07, bug
             # trouve en prod : une paire d'arb garanti a comb=0.93 (edge 7%,
