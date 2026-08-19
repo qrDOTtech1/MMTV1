@@ -8770,6 +8770,38 @@ class MultiTrader:
             if secs_left <= 3:
                 continue  # trop tard, la resolution normale prendra le relais
 
+            # ── TP INSTANTANE UNIVERSEL, meme sur les orphelines (Steven 19/08) ──
+            # Prend le pas sur tout le reste (y compris must_close) : des que
+            # le prix depasse l'entree de TP_INSTANT_PCT, on vend TOUT.
+            _tp_entry = pos.get("entry_price", 0)
+            if _tp_entry > 0:
+                _tp_px = self._live_price(pos.get("token_id"), None, pos.get("side"))
+                if _tp_px is not None and (_tp_px - _tp_entry) / _tp_entry >= TP_INSTANT_PCT:
+                    _tp_shares = pos.get("filled_shares", 0)
+                    if _tp_shares > 0:
+                        _tp_sold = self._sell_orphan(
+                            pos["token_id"], _tp_shares,
+                            f" {sym} {pos['slug']} {pos['side']} TP-INSTANT-ORPHAN",
+                            entry_price=_tp_entry, symbol=sym,
+                            slug=pos.get("slug"), side=pos.get("side"),
+                        )
+                        if _tp_sold > 0:
+                            realized = round(_tp_sold * (_tp_px - _tp_entry), 3)
+                            pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + realized, 3)
+                            pos["filled_shares"] = round(_tp_shares - _tp_sold, 2)
+                            self._log(
+                                f"⚡ [TP-INSTANT-ORPHAN] {sym} {pos['slug']} {pos['side']} "
+                                f"@ entree {_tp_entry:.3f} +{100 * (_tp_px - _tp_entry) / _tp_entry:.1f}% "
+                                f"-> vendu {_tp_sold} parts @ {_tp_px:.3f}"
+                            )
+                            if pos["filled_shares"] <= 0.01:
+                                pnl = pos["realized_pnl"]
+                                pos.update(win=pnl > 0, pnl=pnl, resolved_by="tp_instant_orphan", exit_price=round(_tp_px, 3))
+                                mk["trades"].append(pos)
+                                del mk["open"][key]
+                                self._record_trade_pnl(sym, pnl)
+                            continue
+
             # ── ZERO JAMBE NUE (Steven 05/08, "pas de demi-mesure") ──
             # Une jambe issue d'une paire qui n'a pas pu se completer est un
             # pari directionnel non voulu. Mesure on-chain sur 27.9h : les 64
@@ -12373,6 +12405,12 @@ class MultiTrader:
                     )
             return legs_held > 0
         for i, (side, token_id) in enumerate(zip(outcomes, token_ids)):
+            # PLUS DE PAIRE (Steven 19/08, "on s'en fou de la jambe down ...
+            # vu qu'on va tp directement la premiere leg ouvrir la deuxieme
+            # n'a plus d'interet") : TP instantane universel rend le
+            # hedging inutile -> une seule jambe par fenetre, jamais de 2e.
+            if i > 0:
+                break
             key = f"{slug}|{side}"
             # SKIP : jambe deja tenue (pas de rachat)
             if key in mk["open"]:
