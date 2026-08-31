@@ -286,7 +286,7 @@ NEARCERT_BUDGET_FRAC = 0.06       # near-certain : ~1/4 de Kelly, prudent car ed
 MAX_MARKET_EXPOSURE_CEIL = 60.0   # garde-fou absolu tant que la strategie n'est pas
 NEARCERT_BUDGET_CEIL = 20.0       # validee sur gros volume -- a relever plus tard
 MAX_FRACTION = 0.40  # ... et au plus 40% du capital investissable (releve 0.30->0.40)
-MIN_BUDGET_USD = 1.0
+MIN_BUDGET_USD = 0.10  # Steven 19/08 -- exploiter meme un cash tres bas (0.55$)
 PAPER_START_BAL = 20.0  # solde papier de depart (par marche paper)
 
 # ── sizing KELLY FRACTIONNE 1/4 (Steven 22/07, remplace score+STAKE_MULTIPLIER x2) ──
@@ -1418,7 +1418,7 @@ def _score_risque_retournement(sym, slug, reste):
 
 
 MAKER_OPEN_TOTAL_FRAC = 0.95      # TOTAL des 2 jambes, en part de l'investissable (Steven 19/08)
-MAKER_OPEN_BUDGET_MIN = 4.7
+MAKER_OPEN_BUDGET_MIN = 0.20  # Steven 19/08 -- exploiter meme un cash tres bas
 MAKER_OPEN_BUDGET_MAX = 500.0
 # ── PLAFOND D'EXPOSITION PROPRE A MSF (Steven 13/08, "au lieu d'un budget
 # fixe, un pourcentage ? comme ca ca suit l'evolution sans palier stricte").
