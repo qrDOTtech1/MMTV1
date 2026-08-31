@@ -2003,6 +2003,24 @@ FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par invest
 # prix d'entree -- contourne les paliers 25/50/75 et sort TOUT des que ce
 # seuil de PnL est atteint.
 TP_INSTANT_PCT = 0.02
+# MARKET MAKING ASYMETRIQUE (Steven 19/08, "poser un ordre d'achat + un ordre
+# de revente, encaisser le spread en boucle") : des qu'une position remplit,
+# on pose IMMEDIATEMENT un ordre de vente GTC passif a entree+SPREAD, en plus
+# du TP instantane au marche qui reste le filet de secours.
+SPREAD_CAPTURE_PRICE = 0.01
+
+# SNIPE OVER-REACTION (Steven 19/08, "le carnet se vide temporairement a
+# cause de la panique") : si le prix Polymarket a chute bien plus que le
+# mouvement reel Binance sur la meme fenetre, on achete le cote qui a
+# sur-reagi en pariant sur le retour a la moyenne.
+OVERREACT_ENABLED = True
+OVERREACT_LOOKBACK_S = 120
+OVERREACT_MULT = 3.0
+OVERREACT_MIN_POLY_DROP = 0.05
+OVERREACT_BUDGET_USD = 500.0  # borne par investable, comme FAV_BUDGET_USD
+OVERREACT_MIN_SECS = 20
+OVERREACT_MAX_SECS = 250
+
 # GROSSE MISE SUR RISK-FREE (Steven 29/07, "je veux grosse mise sur les arb
 # risk free") : contrairement au directionnel, l'arb garanti (2 jambes achetees
 # EN MEME TEMPS, profit fige quel que soit le resultat) n'expose PAS a un
@@ -8640,6 +8658,102 @@ class MultiTrader:
         )
         return True
 
+    def _try_overreaction(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+        """SNIPE OVER-REACTION (Steven 19/08, "le carnet se vide temporairement
+        a cause de la panique, achete au fond du trou"). Compare la chute du
+        prix Polymarket sur OVERREACT_LOOKBACK_S a la chute REELLE Binance sur
+        la meme fenetre -- si Polymarket a chute >= OVERREACT_MULT fois plus
+        que la realite, on achete le cote qui a sur-reagi en pariant sur le
+        retour a la moyenne. Non backteste avec des donnees propres -- petite
+        mise, geree en TP/SL normal comme fav/nearcert."""
+        if not OVERREACT_ENABLED or mode != "real":
+            return False
+        if self._preopen_only(sym):
+            return False
+        from core.btc_updown import momentum as _momentum
+
+        now = synced_now()
+        secs_left = p.get("end_ts", now) - now
+        if not (OVERREACT_MIN_SECS <= secs_left <= OVERREACT_MAX_SECS):
+            return False
+        if mk.setdefault("overreact_tried", {}).get(slug):
+            return False
+        if any(k.startswith(f"{slug}|") for k in mk["open"]):
+            return False
+        ticks = mk.get("price_log", {}).get(slug, [])
+        if len(ticks) < 2:
+            return False
+        t_now = ticks[-1]
+        t_ref = None
+        for t in reversed(ticks):
+            if t_now["ts"] - t["ts"] >= OVERREACT_LOOKBACK_S:
+                t_ref = t
+                break
+        if t_ref is None:
+            return False
+        best_side, best_drop = None, 0.0
+        for side in outcomes:
+            a_ref, a_now = t_ref.get(f"{side}_ask"), t_now.get(f"{side}_ask")
+            if a_ref is None or a_now is None or a_ref <= 0:
+                continue
+            drop = (a_ref - a_now) / a_ref
+            if drop > best_drop:
+                best_drop, best_side = drop, side
+        if best_side is None or best_drop < OVERREACT_MIN_POLY_DROP:
+            return False
+        pair = p.get("pair")
+        mom = _momentum(pair) if pair else None
+        binance_move_pct = abs(mom["slow_pct_s"]) * OVERREACT_LOOKBACK_S / 100 if mom else 0.0
+        if binance_move_pct <= 0 or best_drop < OVERREACT_MULT * binance_move_pct:
+            self._tlog(
+                f"overreact_weak_{sym}",
+                f"🌫️ [OVERREACT] {sym} {slug} {best_side} chute {100*best_drop:.1f}% "
+                f"vs Binance {100*binance_move_pct:.2f}% -> pas assez disproportionne",
+            )
+            return False
+        tid = token_ids[outcomes.index(best_side)]
+        _, ask, _ = quotes.get(best_side, (None, None, None))
+        if ask is None:
+            return False
+        cash, _ = self._read_cash(max_age=0)
+        if cash is None:
+            return False
+        investable = max(0.0, cash - self.floor())
+        budget = round(min(OVERREACT_BUDGET_USD, investable), 2)
+        budget = max(budget, round(MIN_SELL_SHARES * ask, 2))
+        if budget > investable or budget < MIN_BUDGET_USD:
+            return False
+        ok_exp, why_exp = self._exposure_ok(sym, mk, slug, budget)
+        if not ok_exp:
+            self._tlog(f"overreactexp_{sym}", f"⛔ [OVERREACT] {sym} {slug} refuse : {why_exp}")
+            return False
+        mk["overreact_tried"][slug] = time.time()
+        self._log(
+            f"🕳️ [OVERREACT] {sym} {slug} {best_side} @ {ask:.3f} budget={budget:.2f}$ "
+            f"-- chute Polymarket {100*best_drop:.1f}% vs Binance {100*binance_move_pct:.2f}% "
+            f"-> snipe du retour a la moyenne"
+        )
+        with self._order_lock:
+            res = self._live.snipe_buy_market(tid, round(ask + 0.02, 2), budget)
+        filled = res.get("filled_shares", 0.0)
+        if filled <= 0:
+            self._log(f"⚠️ [OVERREACT] {sym} {slug} {best_side} non rempli (err={res.get('error', '')})")
+            return False
+        avg = res.get("avg_cost") or ask
+        self._add_slug_spent(mk, slug, round(filled * avg, 2))
+        mk["open"][f"{slug}|{best_side}"] = {
+            "symbol": sym, "slug": slug, "side": best_side, "mode": "real",
+            "strat": "overreact", "token_id": tid, "entry_price": avg,
+            "filled_shares": filled, "cost": round(filled * avg, 2),
+            "start_ts": p["start_ts"], "pair": pair, "end_ts": p["end_ts"],
+            "opened_ts": time.time(), "buffer": 0.0,
+        }
+        self._log(
+            f"✅ [OVERREACT] {sym} {slug} {best_side} {filled} parts @ {avg:.3f} "
+            f"-> ouverte, TP/SL actifs"
+        )
+        return True
+
     def _manage_reinforce(self, sym):
         """RENFORT DE LA JAMBE GAGNANTE (Steven 05/08).
 
@@ -8769,6 +8883,21 @@ class MultiTrader:
             secs_left = pos["end_ts"] - now
             if secs_left <= 3:
                 continue  # trop tard, la resolution normale prendra le relais
+
+            # ── MARKET MAKING ASYMETRIQUE, meme sur les orphelines (Steven 19/08) ──
+            _oe = pos.get("entry_price", 0)
+            if not pos.get("_spread_sell_posted") and _oe > 0 and pos.get("filled_shares", 0) > 0:
+                _sc_price = min(0.99, round(_oe + SPREAD_CAPTURE_PRICE, 2))
+                try:
+                    _sc_res = self._live.post_limit_sell(pos["token_id"], _sc_price, pos["filled_shares"])
+                    pos["_spread_sell_posted"] = True
+                    if _sc_res.get("success"):
+                        self._log(
+                            f"📌 [SPREAD-CAPTURE] {sym} {pos['slug']} {pos['side']} ordre vente "
+                            f"pose @ {_sc_price:.3f} (entree {_oe:.3f}) {pos['filled_shares']} parts"
+                        )
+                except Exception as e:
+                    self._tlog(f"spreadcapture_orphan_err_{sym}", f"💥 [SPREAD-CAPTURE] {sym} erreur: {e}")
 
             # ── TP INSTANTANE UNIVERSEL, meme sur les orphelines (Steven 19/08) ──
             # Prend le pas sur tout le reste (y compris must_close) : des que
@@ -12034,6 +12163,8 @@ class MultiTrader:
                     # -- ils ne se marchent donc jamais dessus.
                     if self._try_stagger_entry(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
                         pass
+                    elif self._try_overreaction(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+                        pass
                     elif not self._try_near_certain(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
                         self._try_favorite(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug)
                     return legs_held > 0
@@ -13484,7 +13615,7 @@ class MultiTrader:
             # DOIT etre gere ici, c'est toute sa raison d'etre. Sans ca il
             # serait skippe et tiendrait jusqu'a resolution sans TP ni SL --
             # exactement le bug qu'on a corrige partout ailleurs aujourd'hui.
-            if pos.get("strat") not in ("bothside", "swing", "fav", "nearcert", "copy", "manual"):
+            if pos.get("strat") not in ("bothside", "swing", "fav", "nearcert", "copy", "manual", "overreact"):
                 continue
             # RISK-FREE : NE JAMAIS GERER INDIVIDUELLEMENT (Steven 29/07, bug
             # trouve en prod : une paire d'arb garanti a comb=0.93 (edge 7%,
@@ -13766,6 +13897,23 @@ class MultiTrader:
                         continue
 
             stage = pos.get("pnl_tp_stage", 0)
+
+            # ── MARKET MAKING ASYMETRIQUE : ordre de vente GTC pose des le
+            # remplissage (Steven 19/08). Complement du TP au marche ci-dessous
+            # -- si un acheteur presse croise ce prix, le spread est encaisse
+            # sans meme attendre le prochain cycle de scan.
+            if pos["mode"] == "real" and not pos.get("_spread_sell_posted") and entry > 0:
+                _sc_price = min(0.99, round(entry + SPREAD_CAPTURE_PRICE, 2))
+                try:
+                    _sc_res = self._live.post_limit_sell(pos["token_id"], _sc_price, shares)
+                    pos["_spread_sell_posted"] = True
+                    if _sc_res.get("success"):
+                        self._log(
+                            f"📌 [SPREAD-CAPTURE] {sym} {slug} {pos['side']} ordre vente "
+                            f"pose @ {_sc_price:.3f} (entree {entry:.3f}) {shares} parts"
+                        )
+                except Exception as e:
+                    self._tlog(f"spreadcapture_err_{sym}", f"💥 [SPREAD-CAPTURE] {sym} erreur: {e}")
 
             # ── TP INSTANTANE UNIVERSEL : se fie au prix d'ACHAT courant, pas
             # au mid (Steven 19/08) -- des que l'ask direct depasse l'entree,
