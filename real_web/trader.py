@@ -7897,6 +7897,11 @@ class MultiTrader:
         if not meta:
             return
         outcomes, token_ids = meta
+        # PLUS DE PAIRE (Steven 19/08, meme decision que BOTHSIDE-SEQ) : une
+        # seule jambe posee ici aussi -- divise par ~2 le besoin en cash
+        # (5 parts x 1 jambe au lieu de 2) et le TP instantane rend la
+        # 2e jambe inutile de toute facon.
+        outcomes, token_ids = outcomes[:1], token_ids[:1]
 
         # ── MODE CALME vs CROISEMENT (Steven 09/08) ──
         # danger_score bas (< CALM_MSF_DANGER_MAX) = marche calme qui prend une
