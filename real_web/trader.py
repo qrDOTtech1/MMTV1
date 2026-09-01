@@ -14234,31 +14234,51 @@ class MultiTrader:
                 exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
                 if exit_price is None:
                     continue
-                sold = shares
+                # ── VENTE EN ESCALIER (Steven 01/09, "pas oblige de tp a
+                # 100%, on peut faire en escalier") : vend une fraction
+                # (PNL_TP_FRACTIONS) au lieu de tout d'un coup -- le reste
+                # continue d'etre suivi, un nouveau pic/retracement doit se
+                # former pour la tranche suivante (peak reinitialise apres
+                # chaque vente partielle).
+                _tp_stage = pos.get("pnl_tp_stage", 0)
+                _tp_target = round(init_shares * PNL_TP_FRACTIONS[min(_tp_stage, len(PNL_TP_FRACTIONS) - 1)], 2)
+                _tp_target = min(_tp_target, shares)
+                if shares - _tp_target < MIN_SELL_SHARES or _tp_stage >= len(PNL_TP_FRACTIONS) - 1:
+                    _tp_target = shares  # derniere tranche ou reste sous le plancher -> tout vendre
+                sold = _tp_target
                 if pos["mode"] == "real":
                     sold = self._sell_orphan(
-                        pos["token_id"], shares, f" {sym} {slug} {pos['side']} TP-INSTANT"
+                        pos["token_id"], _tp_target, f" {sym} {slug} {pos['side']} TP-ESCALIER{_tp_stage + 1}"
                     )
                     if sold <= 0:
                         continue
                 realized = round(sold * (exit_price - entry), 3)
                 pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + realized, 3)
-                pos["filled_shares"] = 0.0
-                pnl = pos["realized_pnl"]
-                pos.update(win=pnl > 0, pnl=pnl, resolved_by="tp_instant", exit_price=round(exit_price, 3))
-                self._record_reversal(sym, pos, min_pct, pnl)
-                if pos["mode"] == "paper":
-                    mk["paper_balance"] = round(mk["paper_balance"] + pnl, 3)
-                mk["trades"].append(pos)
-                del mk["open"][key]
-                self._record_trade_pnl(sym, pnl)
-                self._log(
-                    f"⚡ [TP-INSTANT] {sym} {slug} {pos['side']} @ entree {entry:.3f} "
-                    f"ask={_tp_ask:.3f} -> vendu TOUT @ {exit_price:.3f} pnl={pnl:+.3f}$"
-                )
+                pos["filled_shares"] = round(shares - sold, 2)
+                pos["pnl_tp_stage"] = _tp_stage + 1
+                pos["_tp_peak_pct"] = _tp_pct  # nouveau cycle pour la tranche restante
+                if pos["filled_shares"] < MIN_SELL_SHARES:
+                    pnl = pos["realized_pnl"]
+                    pos.update(win=pnl > 0, pnl=pnl, resolved_by="tp_instant", exit_price=round(exit_price, 3))
+                    self._record_reversal(sym, pos, min_pct, pnl)
+                    if pos["mode"] == "paper":
+                        mk["paper_balance"] = round(mk["paper_balance"] + pnl, 3)
+                    mk["trades"].append(pos)
+                    del mk["open"][key]
+                    self._record_trade_pnl(sym, pnl)
+                    self._log(
+                        f"⚡ [TP-ESCALIER] {sym} {slug} {pos['side']} @ entree {entry:.3f} "
+                        f"ask={_tp_ask:.3f} -> DERNIERE tranche vendue @ {exit_price:.3f} pnl={pnl:+.3f}$"
+                    )
+                else:
+                    self._log(
+                        f"⚡ [TP-ESCALIER] {sym} {slug} {pos['side']} @ entree {entry:.3f} "
+                        f"ask={_tp_ask:.3f} -> tranche {_tp_stage + 1} vendue ({sold} parts) "
+                        f"@ {exit_price:.3f}, {pos['filled_shares']} parts restantes sous suivi"
+                    )
                 self._log_trade_exit(
                     sym, slug, pos["side"], "tp_instant", entry, exit_price,
-                    realized, 0, 0, pnl, now - pos.get("opened_ts", pos["start_ts"]),
+                    realized, 0, 0, realized, now - pos.get("opened_ts", pos["start_ts"]),
                     "sold", "open",
                 )
                 continue
@@ -14280,33 +14300,48 @@ class MultiTrader:
                 exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
                 if exit_price is None:
                     continue
-                sold = shares
+                # ── SL EN ESCALIER (Steven 01/09, "pas oblige de sl a 100%
+                # non plus") : coupe la moitie d'abord, le reste seulement
+                # si le prix continue de se degrader au 2e franchissement.
+                _sl_stage = pos.get("sl_stage", 0)
+                _sl_target = shares if _sl_stage >= 1 else round(shares / 2, 2)
+                if shares - _sl_target < MIN_SELL_SHARES:
+                    _sl_target = shares
+                sold = _sl_target
                 if pos["mode"] == "real":
                     sold = self._sell_orphan(
-                        pos["token_id"], shares, f" {sym} {slug} {pos['side']} PNL-SL"
+                        pos["token_id"], _sl_target, f" {sym} {slug} {pos['side']} SL-ESCALIER{_sl_stage + 1}"
                     )
                     if sold <= 0:
                         continue
                 realized = round(sold * (exit_price - entry), 3)
                 pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + realized, 3)
-                pos["filled_shares"] = 0.0
-                pnl = pos["realized_pnl"]
-                pos.update(
-                    win=pnl > 0,
-                    pnl=pnl,
-                    resolved_by="pnl_stoploss",
-                    exit_price=round(exit_price, 3),
-                )
-                self._record_reversal(sym, pos, min_pct, pnl)
-                if pos["mode"] == "paper":
-                    mk["paper_balance"] = round(mk["paper_balance"] + pnl, 3)
-                mk["trades"].append(pos)
-                del mk["open"][key]
-                self._record_trade_pnl(sym, pnl)
-                self._log(
-                    f"🛑 [PNL-SL] {sym} {slug} {pos['side']} -{abs(pnl_pct) * 100:.1f}% "
-                    f"-> coupe @ {exit_price:.3f} pnl={pnl:+.3f}$ [{pos.get('tier', '?')}]"
-                )
+                pos["filled_shares"] = round(shares - sold, 2)
+                pos["sl_stage"] = _sl_stage + 1
+                if pos["filled_shares"] < MIN_SELL_SHARES:
+                    pnl = pos["realized_pnl"]
+                    pos.update(
+                        win=pnl > 0,
+                        pnl=pnl,
+                        resolved_by="pnl_stoploss",
+                        exit_price=round(exit_price, 3),
+                    )
+                    self._record_reversal(sym, pos, min_pct, pnl)
+                    if pos["mode"] == "paper":
+                        mk["paper_balance"] = round(mk["paper_balance"] + pnl, 3)
+                    mk["trades"].append(pos)
+                    del mk["open"][key]
+                    self._record_trade_pnl(sym, pnl)
+                    self._log(
+                        f"🛑 [SL-ESCALIER] {sym} {slug} {pos['side']} -{abs(pnl_pct) * 100:.1f}% "
+                        f"-> DERNIERE tranche coupee @ {exit_price:.3f} pnl={pnl:+.3f}$ [{pos.get('tier', '?')}]"
+                    )
+                else:
+                    self._log(
+                        f"🛑 [SL-ESCALIER] {sym} {slug} {pos['side']} -{abs(pnl_pct) * 100:.1f}% "
+                        f"-> tranche {_sl_stage + 1} coupee ({sold} parts) @ {exit_price:.3f}, "
+                        f"{pos['filled_shares']} parts restantes sous suivi"
+                    )
                 self._log_trade_exit(
                     sym,
                     slug,
@@ -14317,7 +14352,7 @@ class MultiTrader:
                     realized,
                     0,
                     0,
-                    pnl,
+                    realized,
                     now - pos.get("opened_ts", pos["start_ts"]),
                     "sold",
                     "open",
