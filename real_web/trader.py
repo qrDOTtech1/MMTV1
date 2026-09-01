@@ -12150,6 +12150,21 @@ class MultiTrader:
                     ask_vals.append(ask_q)
                     leg_data_immediate.append((side_q, tid_q, ask_q))
                     is_fav = side_q == fav_side
+                    # PLANCHER DE PRIX SUR LE FAVORI (Steven 01/09, "c'est
+                    # une blague ?" -- vu en reel : Down achete a 0.001$
+                    # (1600 parts, -44%) et 0.01$ (100 parts, -95%) parce que
+                    # le signal Binance designait ce cote "favori" alors que
+                    # le MARCHE l'avait deja envoye vers zero. "Favori" sans
+                    # accord du prix de marche n'en est pas un -- le marche a
+                    # plus d'info que le signal spot seul en fin de fenetre.
+                    if is_fav and ask_q < FAV_MIN_PRICE:
+                        self._tlog(
+                            f"favprice_low_{sym}",
+                            f"🌫️ [BOTHSIDE-FAV] {sym} {side_q} designe favori mais "
+                            f"prix marche {ask_q:.3f} < {FAV_MIN_PRICE} -> le marche "
+                            f"n'est pas d'accord, on n'achete pas",
+                        )
+                        is_fav = False
                     if is_fav:
                         # FAVORITE-FIRST (Steven 28/07) : la favorite est achetee
                         # en 1er, meme si >0.52. max_entry=1.0 pour favorite.
