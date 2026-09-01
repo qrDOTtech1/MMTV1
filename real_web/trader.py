@@ -12154,8 +12154,15 @@ class MultiTrader:
                         # FAVORITE-FIRST (Steven 28/07) : la favorite est achetee
                         # en 1er, meme si >0.52. max_entry=1.0 pour favorite.
                         first_target = (side_q, ask_q, True)
-                    elif first_target is None and ask_q < BOTH_SIDE_MAX_ENTRY:
-                        first_target = (side_q, ask_q, False)
+                    # PLUS DE REPLI SUR LE PERDANT (Steven 01/09, "on ne parie
+                    # plus sur le perdant, on parie sur le gagnant"). Avant :
+                    # si fav_side etait indetermine (spot/strike indispo), ce
+                    # elif achetait quand meme le premier cote sous
+                    # BOTH_SIDE_MAX_ENTRY (~0.52), souvent le cote pas cher/
+                    # perdant par construction (ex: Down @ 0.09 vu en reel,
+                    # perte quasi totale). Desormais : sans favori identifie,
+                    # on n'achete rien du tout sur cette fenetre plutot que de
+                    # parier a l'aveugle sur le cote bon marche.
             # FAVORI D'ABORD (Steven 04/08, "en achetant favori d'abord") : les
             # 2 jambes partent ensemble, mais l'ordre dans lequel on les envoie
             # decide laquelle a le plus de chances d'etre servie en premier si
