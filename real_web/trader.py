@@ -8703,31 +8703,23 @@ class MultiTrader:
             return False
         if any(k.startswith(f"{slug}|") for k in mk["open"]):
             return False
-        # Binance doit trancher NETTEMENT
+        # LE MARCHE SEUL DECIDE (Steven 01/09, "il voit down favoris mais
+        # l'achete pas !!!!!! c'est inacceptable" -- Binance exigeait un
+        # ecart de 0.25% au strike meme quand le marche montrait Down a
+        # 84-87%, sans ambiguite aucune). Meme regle que partout ailleurs
+        # ce soir : le cote au-dessus de FAV_MIN_PRICE est le favori, plus
+        # aucun role pour Binance dans cette decision.
         pair = p.get("pair")
-        if not pair:
-            return False
-        spot = _binance_price(pair)
-        strike = _strike_at(pair, p.get("start_ts"), slug=slug)
-        if spot is None or strike is None:
-            return False
-        gap = abs(spot - strike)
-        if gap < spot * FAV_BINANCE_MARGIN:
-            self._tlog(
-                f"favweak_{sym}",
-                f"🌫️ [FAV] {sym} {slug} signal Binance trop faible "
-                f"(ecart {gap:.4f} < {spot * FAV_BINANCE_MARGIN:.4f} = {FAV_BINANCE_MARGIN * 100:.2f}%) "
-                f"-> pas de pari directionnel",
-            )
-            return False
-        fav_side = "Up" if spot > strike else "Down"
-        if fav_side not in outcomes:
+        _fav_prices2 = [(s, a) for s, (_, a, _) in zip(outcomes, [quotes.get(s, (None, None, None)) for s in outcomes]) if a is not None]
+        fav_side = None
+        if len(_fav_prices2) == 2:
+            fav_side = max(_fav_prices2, key=lambda x: x[1])[0]
+        if fav_side is None or fav_side not in outcomes:
             return False
         tid = token_ids[outcomes.index(fav_side)]
         _, ask, _ = quotes.get(fav_side, (None, None, None))
         if ask is None:
             return False
-        # le favori doit etre CHER (le marche doit etre d'accord avec Binance)
         if not (FAV_MIN_PRICE <= ask <= FAV_MAX_PRICE):
             self._tlog(
                 f"favpx_{sym}",
@@ -8751,8 +8743,7 @@ class MultiTrader:
         mk["fav_tried"][slug] = time.time()
         self._log(
             f"🎯 [FAV] {sym} {slug} {fav_side} @ {ask:.3f} budget={budget:.2f}$ "
-            f"-- arb impossible, Binance NET (ecart {gap:.4f} = "
-            f"{100 * gap / spot:.3f}% > {FAV_BINANCE_MARGIN * 100:.2f}%), "
+            f"-- arb impossible, marche tranche NET, "
             f"{secs_left:.0f}s restantes -> pari directionnel assume, gere en TP/SL"
         )
         with self._order_lock:
@@ -8771,7 +8762,6 @@ class MultiTrader:
             "filled_shares": filled, "cost": round(filled * avg, 2),
             "start_ts": p["start_ts"], "pair": pair, "end_ts": p["end_ts"],
             "opened_ts": time.time(), "buffer": 0.0,
-            "fav_binance_gap_pct": round(100 * gap / spot, 4),
         }
         self._log(
             f"✅ [FAV] {sym} {slug} {fav_side} {filled} parts @ {avg:.3f} "
