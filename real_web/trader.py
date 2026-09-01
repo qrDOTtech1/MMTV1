@@ -3340,6 +3340,16 @@ class MultiTrader:
             return 0.0
         return max(0.0, cash - self.floor())
 
+    def _partitioned_investable(self):
+        """Partitionnement du capital entre marches actifs (Steven 19/08,
+        "Liquidity Manager" -- eviter qu'un marche engage tout le cash et
+        bloque les autres au meme instant, tous les marches 5min fermant en
+        meme temps). Divise l'investissable par le nombre de symboles en
+        mode='real' -- poche egale par marche, pas de sous-comptes figes en
+        dur (s'adapte si un symbole est desactive)."""
+        n_actifs = sum(1 for s in SYMBOLS if self.state["modes"].get(s) == "real")
+        return round(self._investable() / max(1, n_actifs), 2)
+
     def _max_market_exposure(self):
         """Plafond d'exposition par marche, PROPORTIONNEL au capital.
         Grandit avec le compte au lieu de rester fige (cf. commentaire de
@@ -8642,7 +8652,7 @@ class MultiTrader:
         cash, _ = self._read_cash(max_age=0)
         if cash is None:
             return False
-        investable = max(0.0, cash - self.floor())
+        investable = self._partitioned_investable()
         budget = round(min(FAV_BUDGET_USD, investable), 2)
         # plancher vendable : jamais une position qu'on ne pourra pas sortir
         budget = max(budget, round(MIN_SELL_SHARES * ask, 2))
@@ -8743,7 +8753,7 @@ class MultiTrader:
         cash, _ = self._read_cash(max_age=0)
         if cash is None:
             return False
-        investable = max(0.0, cash - self.floor())
+        investable = self._partitioned_investable()
         budget = round(min(OVERREACT_BUDGET_USD, investable), 2)
         budget = max(budget, round(MIN_SELL_SHARES * ask, 2))
         if budget > investable or budget < MIN_BUDGET_USD:
@@ -8844,7 +8854,7 @@ class MultiTrader:
         cash, _ = self._read_cash(max_age=0)
         if cash is None:
             return False
-        investable = max(0.0, cash - self.floor())
+        investable = self._partitioned_investable()
         budget = round(min(investable * TWAP_LOCK_BUDGET_FRAC, investable), 2)
         budget = max(budget, round(MIN_SELL_SHARES * ask, 2))
         if budget > investable or budget < MIN_BUDGET_USD:
