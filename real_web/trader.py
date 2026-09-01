@@ -4738,6 +4738,7 @@ class MultiTrader:
                         for s in SYMBOLS
                     )
                     self._log(f"💓 vivant scan#{scan} | {parts}")
+                    self._check_polymarket_status()
                     # VERITE TERRAIN (Steven 04/08) : PnL reel on-chain a cote
                     # du heartbeat -> on ne peut plus piloter a l'aveugle sur
                     # un compteur interne qui s'ecartait de ~51$ de la realite.
@@ -13502,6 +13503,51 @@ class MultiTrader:
         except Exception:
             pass
         return None
+
+    _POLY_STATUS_URLS = (
+        "https://status.polymarket.com/v3/summary.json",
+        "https://polymarket.instatus.com/summary.json",
+    )
+    _POLY_STATUS_EVERY_S = 60
+
+    def _check_polymarket_status(self):
+        """Lit la status page publique de Polymarket (Steven 19/08, "on
+        aurait vu que ils sont en plein update") : les prix figes et le
+        'trading is disabled' de ce soir venaient d'un incident reel cote
+        Polymarket ('Issues with delayed open order read responses',
+        cancel-only mode) -- ce log evite de le re-diagnostiquer a la main
+        la prochaine fois."""
+        now_t = time.time()
+        if now_t - getattr(self, "_last_poly_status_check", 0) < self._POLY_STATUS_EVERY_S:
+            return
+        self._last_poly_status_check = now_t
+        import requests as _rq
+
+        data = None
+        for url in self._POLY_STATUS_URLS:
+            try:
+                r = _rq.get(url, timeout=6)
+                if r.status_code == 200:
+                    data = r.json()
+                    break
+            except Exception:
+                continue
+        if not data:
+            return
+        status = data.get("page", {}).get("status", "UNKNOWN")
+        incidents = data.get("activeIncidents", [])
+        was_ok = getattr(self, "_last_poly_status_ok", True)
+        if status != "UP" or incidents:
+            self._last_poly_status_ok = False
+            for inc in incidents or [{"name": status, "impact": "?", "status": "?"}]:
+                self._log(
+                    f"🚧 [POLYMARKET-STATUS] {status} -- {inc.get('name')} "
+                    f"(impact={inc.get('impact')}, statut={inc.get('status')}) "
+                    f"-> voir status.polymarket.com"
+                )
+        elif not was_ok:
+            self._last_poly_status_ok = True
+            self._log("✅ [POLYMARKET-STATUS] retour a UP, plus d'incident actif")
 
     def _gamma_market(self, slug):
         import requests as _rq
