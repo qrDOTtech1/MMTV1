@@ -2040,6 +2040,12 @@ TWAP_MAX_MOVE_PCT_S = 0.0006  # 0.06%/s = mouvement extreme plausible (marge lar
 TWAP_LOCK_BUDGET_FRAC = 0.95  # quasi tout le capital investissable
 TWAP_LOCK_MAX_PRICE = 0.995   # jamais payer plus que ca (rejet Polymarket a 1.0 pile)
 
+# MARKET MAKING PAR SPLIT (Steven 19/08, analyse wallet 0x6748...ee08).
+SPLIT_MAKER_ENABLED = True
+SPLIT_MAKER_MIN_SECS = 60      # assez de temps pour revendre les 2 jambes
+SPLIT_MAKER_BUDGET_USD = 500.0  # borne par investable de toute facon
+SPLIT_MAKER_MIN_BUDGET_USD = 1.0  # $1 = 1 part de chaque -> en dessous, poussiere
+
 # GROSSE MISE SUR RISK-FREE (Steven 29/07, "je veux grosse mise sur les arb
 # risk free") : contrairement au directionnel, l'arb garanti (2 jambes achetees
 # EN MEME TEMPS, profit fige quel que soit le resultat) n'expose PAS a un
@@ -8892,6 +8898,65 @@ class MultiTrader:
         )
         return True
 
+    def _try_split_maker(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+        """MARKET MAKING PAR SPLIT (Steven 19/08, analyse du wallet
+        0x6748...ee08, $35.6k splits/2.5h, quasi break-even -> mecanisme
+        viable, pas magique). Au lieu d'acheter chaque jambe separement au
+        carnet (risque de jambe manquante, slippage), on convertit
+        ATOMIQUEMENT du USDC en 1 part de CHAQUE issue via CTF.splitPosition
+        -- cout exact, jamais de jambe orpheline. On pose ensuite un ordre
+        de vente passif sur les DEUX cotes (capture du spread, meme logique
+        que SPREAD_CAPTURE_PRICE), et le TP instantane universel reste le
+        filet de secours si le prix ne coopere pas."""
+        if not SPLIT_MAKER_ENABLED or mode != "real":
+            return False
+        if self._preopen_only(sym):
+            return False
+        now = synced_now()
+        secs_left = p.get("end_ts", now) - now
+        if secs_left < SPLIT_MAKER_MIN_SECS:
+            return False
+        if mk.setdefault("split_tried", {}).get(slug):
+            return False
+        if any(k.startswith(f"{slug}|") for k in mk["open"]):
+            return False
+        cond = m.get("conditionId")
+        if not cond:
+            return False
+        investable = self._partitioned_investable()
+        budget = round(min(SPLIT_MAKER_BUDGET_USD, investable), 2)
+        if budget < SPLIT_MAKER_MIN_BUDGET_USD or budget > investable:
+            return False
+        ok_exp, why_exp = self._exposure_ok(sym, mk, slug, budget)
+        if not ok_exp:
+            self._tlog(f"splitexp_{sym}", f"⛔ [SPLIT-MAKER] {sym} {slug} refuse : {why_exp}")
+            return False
+
+        mk["split_tried"][slug] = time.time()
+        self._log(f"🔀 [SPLIT-MAKER] {sym} {slug} split de {budget:.2f}$ -> 1 part de chaque issue en cours...")
+        res = self._live.split_position(cond, budget)
+        if not res.get("success"):
+            self._log(f"⚠️ [SPLIT-MAKER] {sym} {slug} split echoue : {res.get('error', '')}")
+            return False
+
+        shares = budget  # 1 part de chaque issue par $ de collateral
+        for side, tid in zip(outcomes, token_ids):
+            key = f"{slug}|{side}"
+            self._add_slug_spent(mk, slug, round(budget / 2, 2))
+            mk["open"][key] = {
+                "symbol": sym, "slug": slug, "side": side, "mode": "real",
+                "strat": "splitpair", "token_id": tid, "entry_price": 0.50,
+                "filled_shares": shares, "cost": round(budget / 2, 2),
+                "start_ts": p["start_ts"], "pair": p.get("pair"), "end_ts": p["end_ts"],
+                "opened_ts": time.time(), "buffer": 0.0, "is_risk_free": False,
+                "_spread_sell_posted": False,
+            }
+        self._log(
+            f"✅ [SPLIT-MAKER] {sym} {slug} split reussi (tx={res.get('tx_hash', '')[:12]}...) "
+            f"-> {shares} parts Up + {shares} parts Down, TP/spread-capture actifs"
+        )
+        return True
+
     def _manage_reinforce(self, sym):
         """RENFORT DE LA JAMBE GAGNANTE (Steven 05/08).
 
@@ -12301,6 +12366,8 @@ class MultiTrader:
                     # -- ils ne se marchent donc jamais dessus.
                     if self._try_twap_lock(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
                         pass
+                    elif self._try_split_maker(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+                        pass
                     elif self._try_stagger_entry(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
                         pass
                     elif self._try_overreaction(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
@@ -13800,7 +13867,7 @@ class MultiTrader:
             # DOIT etre gere ici, c'est toute sa raison d'etre. Sans ca il
             # serait skippe et tiendrait jusqu'a resolution sans TP ni SL --
             # exactement le bug qu'on a corrige partout ailleurs aujourd'hui.
-            if pos.get("strat") not in ("bothside", "swing", "fav", "nearcert", "copy", "manual", "overreact", "twaplock"):
+            if pos.get("strat") not in ("bothside", "swing", "fav", "nearcert", "copy", "manual", "overreact", "twaplock", "splitpair"):
                 continue
             # RISK-FREE : NE JAMAIS GERER INDIVIDUELLEMENT (Steven 29/07, bug
             # trouve en prod : une paire d'arb garanti a comb=0.93 (edge 7%,

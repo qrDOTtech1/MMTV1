@@ -75,6 +75,17 @@ CTF_REDEEM_ABI = json.loads(
     '{"name":"conditionId","type":"bytes32"},{"name":"indexSets","type":"uint256[]"}],'
     '"name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"}]'
 )
+# CTF splitPosition — cree ATOMIQUEMENT 1 part de CHAQUE issue par $1 de
+# collateral, signature standard Gnosis Conditional Tokens (Steven 19/08,
+# analyse du wallet 0x6748... qui construit son inventaire ainsi plutot que
+# par 2 achats CLOB separes -- cout d'entree exact, aucun risque de jambe
+# non remplie).
+CTF_SPLIT_ABI = json.loads(
+    '[{"inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},'
+    '{"name":"conditionId","type":"bytes32"},{"name":"partition","type":"uint256[]"},'
+    '{"name":"amount","type":"uint256"}],'
+    '"name":"splitPosition","outputs":[],"stateMutability":"nonpayable","type":"function"}]'
+)
 
 
 def _w3() -> Web3:
@@ -391,6 +402,54 @@ class PolyLive:
             except Exception:
                 continue  # ce redeem échoue (negRisk, déjà réclamé...) — on saute
         return claimed
+
+    def split_position(self, condition_id: str, amount_usdc: float) -> dict:
+        """Convertit `amount_usdc` en 1 part de CHAQUE issue (Up et Down) du
+        marche binaire `condition_id`, via CTF.splitPosition (Steven 19/08).
+        Cout d'entree EXACT (amount_usdc pour amount_usdc$ de parts, aucun
+        slippage) et ATOMIQUE (jamais de jambe manquante) -- contrairement a
+        2 achats CLOB separes qui peuvent echouer independamment.
+
+        Meme prudence que redeem_resolved : allowance verifiee/posee si besoin,
+        puis estimate_gas en dry-run AVANT tout envoi -- un split est une vraie
+        transaction on-chain qui coute du gas et deplace du collateral reel,
+        jamais envoyee a l'aveugle."""
+        try:
+            amount_wei = int(round(amount_usdc * 1e6))  # USDC.e = 6 decimales
+            if amount_wei <= 0:
+                return {"success": False, "error": "montant invalide"}
+
+            usdc = self.w3.eth.contract(address=USDC_E, abi=ERC20_ABI)
+            allowance = usdc.functions.allowance(self.address, CTF).call()
+            if allowance < amount_wei:
+                fn_approve = usdc.functions.approve(CTF, 2**256 - 1)
+                fn_approve.estimate_gas({"from": self.address})  # dry-run
+                self._send(fn_approve, self.w3.eth.get_transaction_count(self.address))
+
+            cond = condition_id
+            cond_b = bytes.fromhex(cond[2:] if cond.startswith("0x") else cond)
+            ZERO32 = b"\x00" * 32
+            ctf = self.w3.eth.contract(address=CTF, abi=CTF_SPLIT_ABI)
+            fn = ctf.functions.splitPosition(USDC_E, ZERO32, cond_b, [1, 2], amount_wei)
+            fn.estimate_gas({"from": self.address})  # dry-run : leve si invalide
+
+            params = {
+                "from": self.address,
+                "nonce": self.w3.eth.get_transaction_count(self.address),
+                "gasPrice": int(self.w3.eth.gas_price * 1.2),
+                "chainId": CHAIN_ID,
+            }
+            params["gas"] = int(fn.estimate_gas({"from": self.address}) * 1.3)
+            signed = self.account.sign_transaction(fn.build_transaction(params))
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            rcpt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            return {
+                "success": rcpt["status"] == 1,
+                "tx_hash": tx_hash.hex(),
+                "amount_usdc": amount_usdc,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)[:200]}
 
     def settled_outcome(self, slug: str, token_id: str) -> dict:
         """Résolution AUTORITATIVE via Polymarket (data-api), PAS via Binance.
