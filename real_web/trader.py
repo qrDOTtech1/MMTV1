@@ -12131,7 +12131,18 @@ class MultiTrader:
             _fav_prices = [(s, a) for s, (_, a, _) in zip(outcomes, [quotes.get(s, (None, None, None)) for s in outcomes]) if a is not None]
             if len(_fav_prices) == 2:
                 _fav_poly = max(_fav_prices, key=lambda x: x[1])[0]
-            fav_side = _fav_binance if _fav_binance is not None else _fav_poly
+            # LE MARCHE D'ABORD, PAS LE SPOT BINANCE BRUT (Steven 01/09, "il
+            # n'achete jamais Down meme quand c'est obvious que c'est lui le
+            # favori"). Vu en reel : Down @ 0.72/0.88/0.99 (favori evident,
+            # ecart enorme) et le log designait quand meme "Up" favori --
+            # cause : _fav_binance (simple spot > strike, signal bruyant,
+            # seconde par seconde) passait AVANT _fav_poly et l'ecrasait des
+            # qu'il etait disponible, meme quand le marche etait tranche a
+            # 70-90%. Le marche agrege plus d'info qu'un spot instantane
+            # (c'est tout le sens de la decouverte TWAP de cette nuit) --
+            # on lui fait confiance en premier, Binance ne sert plus que de
+            # repli quand le marche est indecis (2 prix indisponibles).
+            fav_side = _fav_poly if _fav_poly is not None else _fav_binance
             fav_side_ordering = fav_side
         # ── mode INDEPENDANT (legacy) ──
         combined = None  # V3.1 : init pour eviter UnboundLocalError
