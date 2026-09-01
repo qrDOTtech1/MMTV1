@@ -5843,8 +5843,9 @@ class MultiTrader:
             # etc). Rend enfin la vraie cause visible dans les logs.
             if _sell_resp is not None and not _sell_resp.get("success", True):
                 self._log(
-                    f"❗ [VENTE-ERREUR]{tag} sell_position a echoue : "
-                    f"{str(_sell_resp.get('error', ''))[:250]}"
+                    f"❗ [VENTE-ERREUR]{tag} px={_px_vente} shares={round(shares,2)} "
+                    f"sell_position a echoue : "
+                    f"{str(_sell_resp.get('error', ''))[:1200]}"
                 )
             # CHRONO SORTIE (Steven 08/08) : c'est le chemin TP/cutoff/unwind
             # MSF -- jusqu'ici zero mesure, contrairement a l'entree bothside.
