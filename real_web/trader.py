@@ -12161,6 +12161,19 @@ class MultiTrader:
             # repli quand le marche est indecis (2 prix indisponibles).
             fav_side = _fav_poly if _fav_poly is not None else _fav_binance
             fav_side_ordering = fav_side
+            # DIAGNOSTIC (Steven 01/09, "il n'achete jamais Down meme quand
+            # c'est obvious" -- toujours reproduit APRES le fix de priorite
+            # marche>Binance). Log les 3 valeurs brutes a chaque cycle pour
+            # voir EXACTEMENT laquelle merde au prochain cas au lieu de
+            # deviner : _fav_poly peut rester None si UN SEUL cote a un ask
+            # dispo dans `quotes` a cet instant precis (meme si les 2 etaient
+            # visibles l'instant d'avant dans le log [MARCHE]).
+            self._tlog(
+                f"favdiag_{sym}",
+                f"🔎 [FAV-DIAG] {sym} {slug} "
+                f"binance={_fav_binance} poly={_fav_poly} retenu={fav_side} "
+                f"prix_dispo={_fav_prices}",
+            )
         # ── mode INDEPENDANT (legacy) ──
         combined = None  # V3.1 : init pour eviter UnboundLocalError
         force_hedge = legs_held == 1 and secs_left <= BOTH_SIDE_FORCE_HEDGE_SECS_LEFT
