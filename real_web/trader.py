@@ -2006,7 +2006,8 @@ FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par invest
 # _manage_pnl_tier_exits (bothside/swing/fav/nearcert/copy), quel que soit le
 # prix d'entree -- contourne les paliers 25/50/75 et sort TOUT des que ce
 # seuil de PnL est atteint.
-TP_INSTANT_PCT = 0.50  # Steven 19/08 -- backtest corrige (frais 4% sur GAINS
+TP_INSTANT_PCT = 0.75  # Steven 01/09 -- laisse courir un peu plus longtemps
+# (etait 0.50). Backtest corrige (frais 4% sur GAINS
 # uniquement, jamais sur les pertes -- correction du modele precedent qui
 # appliquait les frais partout). Sweep 2D SL x TP sur 5656 series reelles :
 # +2.85%/trade au reglage precedent (SL 0.5%/TP 2%) vs +6.21%/trade a
