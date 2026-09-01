@@ -812,7 +812,10 @@ POLY_FEE_RATE_VENTE = 0.062     # mediane 0.0595 + marge de securite
 # bloque -- le dimensionnement proportionnel (35% de l'investissable) amplifie
 # les series, bonnes et mauvaises. Pas de fix demande sur ce point pour
 # l'instant, juste un fait mesure.
-MAKER_OPEN_ENABLED = True
+MAKER_OPEN_ENABLED = False  # Steven 01/09 -- "on ne parie plus sur le perdant,
+# on parie sur le gagnant desormais" : coupe l'achat passif cote pas cher
+# (perdant par construction), tout passe par _try_favorite (achat du cote
+# cher/gagnant identifie par Binance).
 # EXTENSION AUX 6 MARCHES (Steven 12/08). MSF n'etait autorise que sur BTC et
 # ETH alors que la collecte tourne sur 6 marches depuis le 11/08. Mesure sur
 # 24h de carnet reel, 289 fenetres 5m par symbole, meme critere partout
@@ -1991,11 +1994,12 @@ NEARCERT_MIN_SECS = 8
 NEARCERT_BUDGET_USD = 4.0
 
 FAV_ENABLED = True
-FAV_MIN_PRICE = 0.70
-FAV_MAX_PRICE = 0.85
+FAV_MIN_PRICE = 0.60
+FAV_MAX_PRICE = 0.99  # Steven 01/09 -- "on parie sur le gagnant", exemple donne = 90c
 FAV_BINANCE_MARGIN = 0.0025   # 0.25% = signal "clair", pas juste "devant"
-FAV_MIN_SECS = 30             # sous 30s : plus le temps de sortir si ca tourne
-FAV_MAX_SECS = 150            # au-dela : trop de temps pour se retourner
+FAV_MIN_SECS = 10             # Steven 01/09 -- devenu le mecanisme PRINCIPAL, plus
+# une strategie de repli rare -- doit pouvoir tirer sur presque toute la fenetre
+FAV_MAX_SECS = 280
 FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par investable
 # TP INSTANTANE UNIVERSEL (Steven 19/08, "meme prix 0.10, 0.35, 0.52, 0.65,
 # toujours meme chose") : s'applique a TOUTE position geree par
