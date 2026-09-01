@@ -5833,6 +5833,18 @@ class MultiTrader:
             _sell_resp = self._live.sell_position(token_id, _px_vente, round(shares, 2),
                                                   aggressive=True, marge=0.0)
             _chrono_sell_ms = round((time.time() - _chrono_sell_t0) * 1000)
+            # LOG DE LA VRAIE ERREUR API (Steven 01/09, "pourquoi le tp
+            # n'agit pas" -- vente a 0/N repetee malgre une profondeur de
+            # carnet enorme). Avant : la reponse de sell_position n'etait
+            # JAMAIS inspectee ici, seule la verification on-chain APRES
+            # coup determinait "0 vendues", sans jamais dire pourquoi
+            # l'ordre lui-meme avait echoue (rejet API, erreur de signature,
+            # etc). Rend enfin la vraie cause visible dans les logs.
+            if _sell_resp is not None and not _sell_resp.get("success", True):
+                self._log(
+                    f"❗ [VENTE-ERREUR]{tag} sell_position a echoue : "
+                    f"{str(_sell_resp.get('error', ''))[:250]}"
+                )
             # CHRONO SORTIE (Steven 08/08) : c'est le chemin TP/cutoff/unwind
             # MSF -- jusqu'ici zero mesure, contrairement a l'entree bothside.
             _tim_sell = (_sell_resp or {}).get("timing") or {}
