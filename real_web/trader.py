@@ -6500,7 +6500,7 @@ class MultiTrader:
         ce serait le notre. D'ou le journal des tentatives, qui mesurera le
         taux de remplissage effectif. Le risque est borne : ce qui n'est pas
         servi ne coute rien, et une jambe seule est soldee avant la fin."""
-        if not MAKER_OPEN_ENABLED or sym not in MAKER_OPEN_SYMBOLS:
+        if sym not in MAKER_OPEN_SYMBOLS:
             return
         if self.state["modes"].get(sym) != "real":
             return
@@ -7938,6 +7938,14 @@ class MultiTrader:
             self._save()
 
         # ── POSE SUR LA FENETRE EN COURS ────────────────────────────────
+        # MAKER_OPEN_ENABLED verifie ICI seulement (Steven 01/09, "on doit
+        # suivre toute les pos !") -- desactiver ne doit JAMAIS couper le
+        # suivi (SUIVI DES ORDRES POSES ci-dessus) des ordres deja en carnet
+        # ou positions deja remplies. Avant ce correctif le meme flag
+        # coupait aussi le suivi, ce qui abandonnait toute position en
+        # attente de fill sans TP/SL des que le flag passait a False.
+        if not MAKER_OPEN_ENABLED:
+            return
         if st:
             return                      # une seule fenetre a la fois
         debut = int(now // 300) * 300
