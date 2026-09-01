@@ -2006,8 +2006,16 @@ FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par invest
 # _manage_pnl_tier_exits (bothside/swing/fav/nearcert/copy), quel que soit le
 # prix d'entree -- contourne les paliers 25/50/75 et sort TOUT des que ce
 # seuil de PnL est atteint.
-TP_INSTANT_PCT = 0.75  # Steven 01/09 -- laisse courir un peu plus longtemps
-# (etait 0.50). Backtest corrige (frais 4% sur GAINS
+# TRAILING TP (Steven 01/09, "pas forcement que ça grimpe de 15, si ça monte
+# 5.6.7.8 puis redescend à 7 on TP à 7") : plus un seuil fixe unique -- des
+# qu'un vrai gain est vu (TP_TRAIL_ARM_PCT), on suit le pic et on vend des
+# que le prix retombe de TP_TRAIL_GIVEBACK_PCT depuis ce pic, plutôt que
+# d'attendre un objectif qui peut ne jamais arriver.
+TP_TRAIL_ARM_PCT = 0.03       # arme le suivi des le premier vrai vert
+TP_TRAIL_GIVEBACK_PCT = 0.15  # vend si le prix redonne 15% de son pic depuis l'entree
+TP_INSTANT_PCT = 0.75  # plafond dur : vend TOUT de suite si atteint, meme
+# sans jamais avoir retrace (evite d'attendre indefiniment sur un mouvement
+# tres fort et lineaire). Backtest corrige (frais 4% sur GAINS
 # uniquement, jamais sur les pertes -- correction du modele precedent qui
 # appliquait les frais partout). Sweep 2D SL x TP sur 5656 series reelles :
 # +2.85%/trade au reglage precedent (SL 0.5%/TP 2%) vs +6.21%/trade a
@@ -9139,7 +9147,16 @@ class MultiTrader:
             if _tp_entry > 0:
                 _tp_ask = self._live_ask(pos.get("token_id"))
                 _tp_px = _tp_ask if _tp_ask is not None else self._live_price(pos.get("token_id"), None, pos.get("side"))
-                if _tp_ask is not None and (_tp_ask - _tp_entry) / _tp_entry >= TP_INSTANT_PCT:
+                _tp_pct_o = ((_tp_ask - _tp_entry) / _tp_entry) if _tp_ask is not None else None
+                _tp_peak_o = pos.get("_tp_peak_pct", 0.0)
+                if _tp_pct_o is not None and _tp_pct_o > _tp_peak_o:
+                    pos["_tp_peak_pct"] = _tp_peak_o = _tp_pct_o
+                _tp_trigger_o = _tp_pct_o is not None and (
+                    _tp_pct_o >= TP_INSTANT_PCT
+                    or (_tp_peak_o >= TP_TRAIL_ARM_PCT
+                        and _tp_pct_o <= _tp_peak_o * (1 - TP_TRAIL_GIVEBACK_PCT))
+                )
+                if _tp_trigger_o:
                     _tp_shares = pos.get("filled_shares", 0)
                     if _tp_shares > 0:
                         _tp_sold = self._sell_orphan(
@@ -14197,13 +14214,23 @@ class MultiTrader:
                 except Exception as e:
                     self._tlog(f"spreadcapture_err_{sym}", f"💥 [SPREAD-CAPTURE] {sym} erreur: {e}")
 
-            # ── TP INSTANTANE UNIVERSEL : se fie au prix d'ACHAT courant, pas
-            # au mid (Steven 19/08). Seuil TP_INSTANT_PCT (pas juste >entree,
-            # 2e correction du soir) -- le backtest avec le bon modele de
-            # frais montre que laisser courir jusqu'a +50% capture les gros
-            # mouvements et double l'esperance vs vendre au 1er centime vert.
+            # ── TP TRAILING : se fie au prix d'ACHAT courant, pas au mid
+            # (Steven 19/08), et suit le pic plutot qu'un seuil fixe unique
+            # (Steven 01/09, "ca monte 5.6.7.8 puis redescend a 7, on TP a
+            # 7"). Arme des TP_TRAIL_ARM_PCT, vend au retracement de
+            # TP_TRAIL_GIVEBACK_PCT depuis le pic ; TP_INSTANT_PCT reste un
+            # plafond dur pour ne jamais attendre indefiniment.
             _tp_ask = self._live_ask(pos.get("token_id")) if pos["mode"] == "real" else cur
-            if _tp_ask is not None and (_tp_ask - entry) / entry >= TP_INSTANT_PCT:
+            _tp_pct = ((_tp_ask - entry) / entry) if _tp_ask is not None else None
+            _tp_peak = pos.get("_tp_peak_pct", 0.0)
+            if _tp_pct is not None and _tp_pct > _tp_peak:
+                pos["_tp_peak_pct"] = _tp_peak = _tp_pct
+            _tp_trigger = _tp_pct is not None and (
+                _tp_pct >= TP_INSTANT_PCT
+                or (_tp_peak >= TP_TRAIL_ARM_PCT
+                    and _tp_pct <= _tp_peak * (1 - TP_TRAIL_GIVEBACK_PCT))
+            )
+            if _tp_trigger:
                 exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
                 if exit_price is None:
                     continue
