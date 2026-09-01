@@ -2003,11 +2003,12 @@ FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par invest
 # prix d'entree -- contourne les paliers 25/50/75 et sort TOUT des que ce
 # seuil de PnL est atteint.
 TP_INSTANT_PCT = 0.02
-# SL DESACTIVE (Steven 19/08) : backtest complet (sweep -10% a -70%, sizing
-# compose sequentiel) montre que TOUT seuil de SL est negatif une fois le TP
-# instantane actif -- 100$->229.70$ sans SL contre 100$->28.01$ avec l'ancien
-# SL -20%, sur 235 trades. Voir le commentaire au point d'usage.
-TP_INSTANT_SL_DISABLED = True
+# SL REACTIVE (Steven 19/08, correction le meme soir) : la desactivation
+# precedente reposait sur seulement 235 series (petit buffer memoire, pas
+# representatif). Sur le dataset RECHERCHE complet (142 135 lignes, 5656
+# series), le SL serre (voir PNL_SL_PCT) est nettement meilleur que pas de
+# SL du tout. Voir le commentaire de PNL_SL_PCT pour le detail du sweep.
+TP_INSTANT_SL_DISABLED = False
 # MARKET MAKING ASYMETRIQUE (Steven 19/08, "poser un ordre d'achat + un ordre
 # de revente, encaisser le spread en boucle") : des qu'une position remplit,
 # on pose IMMEDIATEMENT un ordre de vente GTC passif a entree+SPREAD, en plus
@@ -2075,11 +2076,17 @@ PNL_TP_FRACTIONS = (0.25, 0.25, 0.25, 0.25)  # fraction de la taille INITIALE pa
 PNL_TP_TARGETS = (0.25, 0.50, 0.75)  # paliers de PnL% pour TP1/TP2/TP3
 PNL_TRAIL_ACTIVATION = 0.25  # trailing s'armee des TP1 (+25%)
 PNL_TRAIL_GIVEBACK = 0.10  # 10% du pic depuis le palier atteint -> vente runner
-PNL_SL_PCT = 0.20  # stop loss (Steven 29/07, resserre de -30% -> -20% : perte
-# moyenne realisee -1.49$ contre gain moyen +1.25$ sur TP -> le SL breche
-# largement son seuil nominal avant declenchement (pire perte vue -3.8$ pour
-# un seuil "-30%"), le prix crashe plus vite que le check ne l'attrape. Coupe
-# plus tot -> perte moyenne plus petite, meme avec le check rapide (1.5s).
+PNL_SL_PCT = 0.01  # Steven 19/08 -- backtest sur 142 135 lignes reelles (5656
+# series, dataset RECHERCHE complet, PAS le petit buffer de la veille) :
+# sweep complet de -50% a -0.01%, AMELIORATION MONOTONE a mesure que le SL se
+# resserre (-50%=-6.7%, -20%=-3.2%, -10%=-0.7%, -2%=+2.2%, -0.5%=+3.0%,
+# -0.01%=+3.3%). Win rate seulement 26% -- le mecanisme qui marche est
+# "coupe au moindre rouge, laisse courir jusqu'au TP au moindre vert". 1%
+# choisi (pas 0%) pour laisser une marge face aux frais/slippage reels que
+# ce backtest ne capture pas entierement. ATTENTION : la veille, un SL
+# desactive avait ete recommande sur un echantillon de seulement 235 series
+# (le petit buffer memoire, pas representatif) -- ce chiffre-la etait faux,
+# corrige ici avec 24x plus de donnees.
 PNL_SL_MIN_SECS_LEFT = 20  # trop peu de temps = pas de SL
 # ESCALADE TP (Steven 05/08, "on voit l'argent filer entre nos doigts") :
 # apres ce nombre d'echecs consecutifs a vendre la fraction du palier vise,
