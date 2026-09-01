@@ -12136,43 +12136,24 @@ class MultiTrader:
             fav_side = None
             fav_side_ordering = None
         else:
-            from core.btc_updown import _binance_price as _bp
-            _fav_binance = None
-            try:
-                spot = self._ws.spot_price(p["pair"]) or _bp(p["pair"])
-                if spot is not None and strike is not None:
-                    _fav_binance = "Up" if spot > strike else "Down"
-            except Exception:
-                pass
-            _fav_poly = None
+            # PLUS DE BINANCE DU TOUT DANS CETTE DECISION (Steven 01/09,
+            # "il n'achete jamais Down meme quand c'est obvious" -- persistait
+            # meme apres avoir mis le marche en priorite, parce que
+            # _fav_poly retombait a None des qu'UN SEUL cote manquait de prix
+            # a l'instant du calcul, et _fav_binance (bruyant) reprenait la
+            # main). Regle desormais simple et unique : le cote au-dessus de
+            # 0.50$ est le favori. Binance ne decide plus jamais rien ici.
             _fav_prices = [(s, a) for s, (_, a, _) in zip(outcomes, [quotes.get(s, (None, None, None)) for s in outcomes]) if a is not None]
+            fav_side = None
             if len(_fav_prices) == 2:
-                _fav_poly = max(_fav_prices, key=lambda x: x[1])[0]
-            # LE MARCHE D'ABORD, PAS LE SPOT BINANCE BRUT (Steven 01/09, "il
-            # n'achete jamais Down meme quand c'est obvious que c'est lui le
-            # favori"). Vu en reel : Down @ 0.72/0.88/0.99 (favori evident,
-            # ecart enorme) et le log designait quand meme "Up" favori --
-            # cause : _fav_binance (simple spot > strike, signal bruyant,
-            # seconde par seconde) passait AVANT _fav_poly et l'ecrasait des
-            # qu'il etait disponible, meme quand le marche etait tranche a
-            # 70-90%. Le marche agrege plus d'info qu'un spot instantane
-            # (c'est tout le sens de la decouverte TWAP de cette nuit) --
-            # on lui fait confiance en premier, Binance ne sert plus que de
-            # repli quand le marche est indecis (2 prix indisponibles).
-            fav_side = _fav_poly if _fav_poly is not None else _fav_binance
+                fav_side = max(_fav_prices, key=lambda x: x[1])[0]
+            elif len(_fav_prices) == 1 and _fav_prices[0][1] >= 0.50:
+                fav_side = _fav_prices[0][0]
             fav_side_ordering = fav_side
-            # DIAGNOSTIC (Steven 01/09, "il n'achete jamais Down meme quand
-            # c'est obvious" -- toujours reproduit APRES le fix de priorite
-            # marche>Binance). Log les 3 valeurs brutes a chaque cycle pour
-            # voir EXACTEMENT laquelle merde au prochain cas au lieu de
-            # deviner : _fav_poly peut rester None si UN SEUL cote a un ask
-            # dispo dans `quotes` a cet instant precis (meme si les 2 etaient
-            # visibles l'instant d'avant dans le log [MARCHE]).
             self._tlog(
                 f"favdiag_{sym}",
-                f"🔎 [FAV-DIAG] {sym} {slug} "
-                f"binance={_fav_binance} poly={_fav_poly} retenu={fav_side} "
-                f"prix_dispo={_fav_prices}",
+                f"🔎 [FAV-DIAG] {sym} {slug} retenu={fav_side} prix_dispo={_fav_prices} "
+                f"(marche seul, Binance retire de cette decision)",
             )
         # ── mode INDEPENDANT (legacy) ──
         combined = None  # V3.1 : init pour eviter UnboundLocalError
@@ -12488,6 +12469,19 @@ class MultiTrader:
                 in_cd, cd_reason = self._in_cooldown(sym, slug, mk)
                 if in_cd:
                     self._log(f"⏸️ [FIRST-LEG-COOLDOWN] {sym} {slug} -> {cd_reason}")
+                    return legs_held > 0
+                # PLANCHER DUR ANTI-ACHAT SOUS 0.50$ (Steven 01/09, "ajoute
+                # un filtre anti achat under 50c"). Filet de securite final,
+                # independant de fav_side (qui a deja bugue plusieurs fois
+                # ce soir) -- peu importe comment ce prix a ete choisi, on ne
+                # paye jamais moins de 0.50$ ici.
+                if first_target[1] < FAV_MIN_PRICE:
+                    self._tlog(
+                        f"firstleg_floor_{sym}",
+                        f"⛔ [FIRST-LEG-FLOOR] {sym} {slug} {first_target[0]} "
+                        f"@ {first_target[1]:.3f} < {FAV_MIN_PRICE} -> refuse, "
+                        f"jamais d'achat sous ce plancher",
+                    )
                     return legs_held > 0
                 _tag = "FAVORITE-LEG" if first_target[2] else "FIRST-LEG"
                 self._log(
