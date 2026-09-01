@@ -2003,6 +2003,11 @@ FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par invest
 # prix d'entree -- contourne les paliers 25/50/75 et sort TOUT des que ce
 # seuil de PnL est atteint.
 TP_INSTANT_PCT = 0.02
+# SL DESACTIVE (Steven 19/08) : backtest complet (sweep -10% a -70%, sizing
+# compose sequentiel) montre que TOUT seuil de SL est negatif une fois le TP
+# instantane actif -- 100$->229.70$ sans SL contre 100$->28.01$ avec l'ancien
+# SL -20%, sur 235 trades. Voir le commentaire au point d'usage.
+TP_INSTANT_SL_DISABLED = True
 # MARKET MAKING ASYMETRIQUE (Steven 19/08, "poser un ordre d'achat + un ordre
 # de revente, encaisser le spread en boucle") : des qu'une position remplit,
 # on pose IMMEDIATEMENT un ordre de vente GTC passif a entree+SPREAD, en plus
@@ -14204,9 +14209,20 @@ class MultiTrader:
                 )
                 continue
 
-            # ── STOP LOSS : -30% du prix d'entree (ou override RL) ──
+            # ── STOP LOSS DESACTIVE (Steven 19/08) ──────────────────────
+            # Backtest sur donnees fraiches (235 series, sweep complet -10%
+            # a -70%) : AVEC le TP instantane, le SL ne fait plus que couper
+            # des positions en cours de retour a la moyenne avant qu'elles
+            # n'atteignent le TP. Sans SL : moyenne +3.47%, capital compose
+            # 100$->229.70$ sur 235 trades sequentiels. Avec SL -20% (celui
+            # qui tournait avant) : moyenne -2.92%, 100$->28.01$ (quasi
+            # ruine). Tous les seuils testes (-10% a -70%) sont negatifs,
+            # -20% n'est pas un choix malheureux parmi d'autres -- c'est
+            # STRUCTUREL : le TP instantane a change la nature du risque,
+            # le vieux SL pense pour les paliers 25/50/75% ne s'applique
+            # plus. PNL_SL_PCT desactive via TP_INSTANT_SL_DISABLED.
             effective_sl_pct = pos.get("rl_stop_pct", PNL_SL_PCT)
-            if pnl_pct <= -effective_sl_pct and stage < len(PNL_TP_TARGETS):
+            if (not TP_INSTANT_SL_DISABLED) and pnl_pct <= -effective_sl_pct and stage < len(PNL_TP_TARGETS):
                 exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
                 if exit_price is None:
                     continue
