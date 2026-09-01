@@ -2093,10 +2093,11 @@ DYN_MAX_FLOORED_MULT = 2.5  # max multiplicateur total (ne depasse pas 2.5x le t
 # Sortie progressive basee sur le PnL% du contrat (pas le prix absolu).
 # 4 niveaux : 25% a +25%, 25% a +50%, 25% a +75%, 25% runner avec trailing stop.
 PNL_TP_FRACTIONS = (0.25, 0.25, 0.25, 0.25)  # fraction de la taille INITIALE par palier
-PNL_TP_TARGETS = (0.25, 0.50, 0.75)  # paliers de PnL% pour TP1/TP2/TP3
+PNL_TP_TARGETS = (0.05, 0.15, 0.35)  # Steven 01/09 -- resserre (etait 0.25/0.50/0.75) : "doit s'enclencher vite et par palier"
 PNL_TRAIL_ACTIVATION = 0.25  # trailing s'armee des TP1 (+25%)
 PNL_TRAIL_GIVEBACK = 0.10  # 10% du pic depuis le palier atteint -> vente runner
-PNL_SL_PCT = 0.002  # Steven 19/08 -- 2e correction le meme soir : le modele
+PNL_SL_PCT = 0.001  # Steven 01/09 -- resserre 0.2%->0.1%, coherent avec le
+# sweep qui s'ameliorait de facon monotone jusqu'a l'extreme testee. Steven 19/08 -- 2e correction le meme soir : le modele
 # de frais initial (4% sur CHAQUE sortie) etait faux -- les frais ne
 # s'appliquent que sur les GAINS, jamais sur les pertes (confirme). Refait
 # le sweep 2D SL x TP sur les 5656 series reelles avec le bon modele :
