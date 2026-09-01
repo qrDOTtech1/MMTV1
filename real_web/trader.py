@@ -2021,6 +2021,25 @@ OVERREACT_BUDGET_USD = 500.0  # borne par investable, comme FAV_BUDGET_USD
 OVERREACT_MIN_SECS = 20
 OVERREACT_MAX_SECS = 250
 
+# CALCULATEUR TWAP (Steven 19/08, "l'impossibilite mathematique du marche").
+# La resolution reelle des marches 5min utilise le TWAP Chainlink 30s (voir
+# docs.polymarket.com/market-data/chainlink-twap) : moyenne du prix sur les
+# 30 DERNIERES secondes de la fenetre, comparee au prix de depart. Dans cette
+# fenetre de 30s, une fois qu'une bonne partie s'est ecoulee avec un ecart
+# suffisant, le pire mouvement plausible restant ne peut plus faire basculer
+# la moyenne -- c'est calculable, pas une intuition.
+# HONNETETE : "mathematiquement impossible" suppose un pire mouvement borne
+# (TWAP_MAX_MOVE_PCT_S). Le crypto peut gapper plus vite qu'un historique
+# recent -- ce n'est donc pas une garantie absolue a 100%, d'ou une marge de
+# securite (le pire cas des DEUX bornes doit s'accorder, pas juste la
+# moyenne actuelle).
+TWAP_LOCK_ENABLED = True
+TWAP_WINDOW_S = 30            # duree reelle de la fenetre TWAP Chainlink (5min markets)
+TWAP_MIN_ELAPSED_S = 15       # assez de la fenetre TWAP deja ecoulee pour juger
+TWAP_MAX_MOVE_PCT_S = 0.0006  # 0.06%/s = mouvement extreme plausible (marge large)
+TWAP_LOCK_BUDGET_FRAC = 0.95  # quasi tout le capital investissable
+TWAP_LOCK_MAX_PRICE = 0.995   # jamais payer plus que ca (rejet Polymarket a 1.0 pile)
+
 # GROSSE MISE SUR RISK-FREE (Steven 29/07, "je veux grosse mise sur les arb
 # risk free") : contrairement au directionnel, l'arb garanti (2 jambes achetees
 # EN MEME TEMPS, profit fige quel que soit le resultat) n'expose PAS a un
@@ -8760,6 +8779,109 @@ class MultiTrader:
         )
         return True
 
+    def _try_twap_lock(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+        """CALCULATEUR TWAP (Steven 19/08). La resolution reelle utilise le
+        TWAP Chainlink sur les 30 DERNIERES secondes de la fenetre vs le prix
+        de depart. On accumule les echantillons Binance de cette fenetre de
+        30s ; une fois assez de temps ecoule, on calcule les DEUX bornes
+        (pire mouvement bas et pire mouvement haut plausibles sur le temps
+        restant) -- si les deux bornes tombent du meme cote du prix de
+        depart, c'est mathematiquement tranche : on charge le cote gagnant
+        avec la quasi-totalite du capital.
+        Approximation Binance spot du TWAP Chainlink -- pas la donnee exacte
+        de resolution, d'ou la marge de securite TWAP_MAX_MOVE_PCT_S."""
+        if not TWAP_LOCK_ENABLED or mode != "real":
+            return False
+        from core.btc_updown import _binance_price, _strike_at
+
+        now = synced_now()
+        secs_left = p.get("end_ts", now) - now
+        if not (0 < secs_left <= TWAP_WINDOW_S):
+            return False
+        pair = p.get("pair")
+        if not pair:
+            return False
+        spot = _binance_price(pair)
+        strike = _strike_at(pair, p.get("start_ts"), slug=slug)
+        if spot is None or strike is None:
+            return False
+
+        buf = mk.setdefault("twap_buf", {}).setdefault(slug, [])
+        buf.append((now, spot))
+        # ne garder que les echantillons DANS la fenetre TWAP de 30s
+        cutoff = p["end_ts"] - TWAP_WINDOW_S
+        while buf and buf[0][0] < cutoff:
+            buf.pop(0)
+
+        elapsed = TWAP_WINDOW_S - secs_left
+        if elapsed < TWAP_MIN_ELAPSED_S or len(buf) < 3:
+            return False
+        if mk.setdefault("twap_lock_tried", {}).get(slug):
+            return False
+        if any(k.startswith(f"{slug}|") for k in mk["open"]):
+            return False
+
+        avg_so_far = sum(px for _, px in buf) / len(buf)
+        # projection : le reste de la fenetre au pire cas (hausse extreme ou
+        # baisse extreme plausible), pondere par le temps restant / 30s.
+        move = spot * TWAP_MAX_MOVE_PCT_S * secs_left
+        proj_haut = (avg_so_far * elapsed + (spot + move) * secs_left) / TWAP_WINDOW_S
+        proj_bas = (avg_so_far * elapsed + (spot - move) * secs_left) / TWAP_WINDOW_S
+
+        cote_haut = proj_haut >= strike
+        cote_bas = proj_bas >= strike
+        if cote_haut != cote_bas:
+            # les deux bornes ne s'accordent pas -> pas encore tranche
+            return False
+        winning_side = "Up" if cote_haut else "Down"
+        if winning_side not in outcomes:
+            return False
+        tid = token_ids[outcomes.index(winning_side)]
+        _, ask, _ = quotes.get(winning_side, (None, None, None))
+        if ask is None or ask > TWAP_LOCK_MAX_PRICE:
+            return False
+
+        cash, _ = self._read_cash(max_age=0)
+        if cash is None:
+            return False
+        investable = max(0.0, cash - self.floor())
+        budget = round(min(investable * TWAP_LOCK_BUDGET_FRAC, investable), 2)
+        budget = max(budget, round(MIN_SELL_SHARES * ask, 2))
+        if budget > investable or budget < MIN_BUDGET_USD:
+            return False
+        ok_exp, why_exp = self._exposure_ok(sym, mk, slug, budget)
+        if not ok_exp:
+            self._tlog(f"twaplockexp_{sym}", f"⛔ [TWAP-LOCK] {sym} {slug} refuse : {why_exp}")
+            return False
+
+        mk["twap_lock_tried"][slug] = time.time()
+        self._log(
+            f"🔒 [TWAP-LOCK] {sym} {slug} {winning_side} @ {ask:.3f} budget={budget:.2f}$ "
+            f"-- TWAP {elapsed:.0f}/{TWAP_WINDOW_S}s ecoules, moy={avg_so_far:.2f} "
+            f"vs strike={strike:.2f}, projections [{proj_bas:.2f}, {proj_haut:.2f}] "
+            f"toutes deux {'>=' if cote_haut else '<'} strike -> issue mathematiquement tranchee"
+        )
+        with self._order_lock:
+            res = self._live.snipe_buy_market(tid, round(ask + 0.02, 2), budget)
+        filled = res.get("filled_shares", 0.0)
+        if filled <= 0:
+            self._log(f"⚠️ [TWAP-LOCK] {sym} {slug} {winning_side} non rempli (err={res.get('error', '')})")
+            return False
+        avg = res.get("avg_cost") or ask
+        self._add_slug_spent(mk, slug, round(filled * avg, 2))
+        mk["open"][f"{slug}|{winning_side}"] = {
+            "symbol": sym, "slug": slug, "side": winning_side, "mode": "real",
+            "strat": "twaplock", "token_id": tid, "entry_price": avg,
+            "filled_shares": filled, "cost": round(filled * avg, 2),
+            "start_ts": p["start_ts"], "pair": pair, "end_ts": p["end_ts"],
+            "opened_ts": time.time(), "buffer": 0.0,
+        }
+        self._log(
+            f"✅ [TWAP-LOCK] {sym} {slug} {winning_side} {filled} parts @ {avg:.3f} "
+            f"-> ouverte, issue quasi-certaine"
+        )
+        return True
+
     def _manage_reinforce(self, sym):
         """RENFORT DE LA JAMBE GAGNANTE (Steven 05/08).
 
@@ -12167,7 +12289,9 @@ class MultiTrader:
                     # ARB DECALE en premier : il vise TOT dans la fenetre
                     # (>=180s), la ou le near-certain vise la fin (<=120s)
                     # -- ils ne se marchent donc jamais dessus.
-                    if self._try_stagger_entry(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+                    if self._try_twap_lock(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+                        pass
+                    elif self._try_stagger_entry(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
                         pass
                     elif self._try_overreaction(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
                         pass
@@ -13666,7 +13790,7 @@ class MultiTrader:
             # DOIT etre gere ici, c'est toute sa raison d'etre. Sans ca il
             # serait skippe et tiendrait jusqu'a resolution sans TP ni SL --
             # exactement le bug qu'on a corrige partout ailleurs aujourd'hui.
-            if pos.get("strat") not in ("bothside", "swing", "fav", "nearcert", "copy", "manual", "overreact"):
+            if pos.get("strat") not in ("bothside", "swing", "fav", "nearcert", "copy", "manual", "overreact", "twaplock"):
                 continue
             # RISK-FREE : NE JAMAIS GERER INDIVIDUELLEMENT (Steven 29/07, bug
             # trouve en prod : une paire d'arb garanti a comb=0.93 (edge 7%,
