@@ -13293,7 +13293,17 @@ class MultiTrader:
         # prendre le vrai arb suivant. On ne complete donc plus qu'en dessous de
         # PAIR_COMPLETION_MAX_COMBINED ; au-dessus, la jambe part en must_close.
         HEDGE_NEAR_SECS = 30
-        if legs_held == 1 and secs_left < HEDGE_NEAR_SECS and secs_left > 3:
+        # DESACTIVE (Steven 01/09, "il a jete 1.60$ par la fenetre") : ce
+        # mecanisme completait une jambe existante a N'IMPORTE QUEL PRIX --
+        # PAIR_COMPLETION_MAX_COMBINED valait 99.0 depuis le soir meme
+        # (desactive plus tot pour la logique "plus de paire" ailleurs),
+        # donc plus aucun plafond ne le retenait. Vu en reel : cible 0.53$,
+        # rempli a 0.01$ (l'ordre a balaye tout le carnet), sur une paire
+        # qui garantissait deja une perte (comb=1.13). Coherent avec la
+        # decision globale de la nuit : plus de paire du tout, une jambe
+        # nue en fin de fenetre part en unwind normal (ZERO-JAMBE-NUE),
+        # jamais complétée a l'aveugle.
+        if False and legs_held == 1 and secs_left < HEDGE_NEAR_SECS and secs_left > 3:
             for side_h, token_h in zip(outcomes, token_ids):
                 key_h = f"{slug}|{side_h}"
                 if key_h not in mk["open"]:
