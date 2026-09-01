@@ -9163,8 +9163,13 @@ class MultiTrader:
                 _tp_peak_o = pos.get("_tp_peak_pct", 0.0)
                 if _tp_pct_o is not None and _tp_pct_o > _tp_peak_o:
                     pos["_tp_peak_pct"] = _tp_peak_o = _tp_pct_o
+                # PALIER FIXE EN PLUS DU TRAILING (Steven 01/09, meme fix que
+                # _manage_pnl_tier_exits) : sans ca, une hausse continue sans
+                # jamais redescendre ne declenchait RIEN -- vu en reel, +52%
+                # jamais vendu, puis retombe a -88%.
                 _tp_trigger_o = _tp_pct_o is not None and (
                     _tp_pct_o >= TP_INSTANT_PCT
+                    or _tp_pct_o >= PNL_TP_TARGETS[0]
                     or (_tp_peak_o >= TP_TRAIL_ARM_PCT
                         and _tp_pct_o <= _tp_peak_o * (1 - TP_TRAIL_GIVEBACK_PCT))
                 )
@@ -14280,8 +14285,20 @@ class MultiTrader:
             _tp_peak = pos.get("_tp_peak_pct", 0.0)
             if _tp_pct is not None and _tp_pct > _tp_peak:
                 pos["_tp_peak_pct"] = _tp_peak = _tp_pct
+            # PALIER FIXE EN PLUS DU TRAILING (Steven 01/09, "j'aurais du voir
+            # 2 lignes de vente a ce stade" -- +52% sans jamais avoir
+            # retrace, donc le trailing seul ne se declenchait JAMAIS : le pic
+            # colle au prix courant quand ca monte sans redescendre). Les 2
+            # conditions cohabitent : un palier fixe (25/50/75%) vend une
+            # tranche meme sans repli, ET le retracement vend plus tot si un
+            # repli survient avant le prochain palier.
+            _tp_stage_now = pos.get("pnl_tp_stage", 0)
+            _tp_next_target = (
+                PNL_TP_TARGETS[_tp_stage_now] if _tp_stage_now < len(PNL_TP_TARGETS) else TP_INSTANT_PCT
+            )
             _tp_trigger = _tp_pct is not None and (
                 _tp_pct >= TP_INSTANT_PCT
+                or _tp_pct >= _tp_next_target
                 or (_tp_peak >= TP_TRAIL_ARM_PCT
                     and _tp_pct <= _tp_peak * (1 - TP_TRAIL_GIVEBACK_PCT))
             )
