@@ -2039,7 +2039,10 @@ SPREAD_CAPTURE_PRICE = 0.01
 # cause de la panique") : si le prix Polymarket a chute bien plus que le
 # mouvement reel Binance sur la meme fenetre, on achete le cote qui a
 # sur-reagi en pariant sur le retour a la moyenne.
-OVERREACT_ENABLED = True
+OVERREACT_ENABLED = False  # Steven 01/09 -- desactive, conflit direct avec
+# "jamais d'achat sous 0.50$" : cette strategie achete PAR CONCEPTION le
+# cote qui vient de s'effondrer (retour a la moyenne), donc toujours sous
+# le plancher par construction.
 OVERREACT_LOOKBACK_S = 120
 OVERREACT_MULT = 3.0
 OVERREACT_MIN_POLY_DROP = 0.05
@@ -4528,6 +4531,16 @@ class MultiTrader:
         book = self._live.get_book_sync(tid)
         ask = book["asks"][0][0] if book and book.get("asks") else None
         if ask is None:
+            return
+        # PLANCHER 0.50$ (Steven 01/09, audit complet des 20 points d'achat
+        # -- copy-trading est actuellement desactive mais n'avait aucun
+        # plancher si reactive un jour, contrairement aux autres strategies).
+        if ask < FAV_MIN_PRICE:
+            self._tlog(
+                f"copyfloor_{sym}",
+                f"⛔ [COPY] {sym} {slug} {side} ask={ask:.3f} < {FAV_MIN_PRICE} "
+                f"-> refuse, plancher universel",
+            )
             return
         # DERIVE DE PRIX (coeur du garde-fou copy-trading) : entre l'achat
         # source et notre detection, le marche a pu bouger. On ne poursuit
