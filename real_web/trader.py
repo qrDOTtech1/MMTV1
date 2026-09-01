@@ -2002,7 +2002,14 @@ FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par invest
 # _manage_pnl_tier_exits (bothside/swing/fav/nearcert/copy), quel que soit le
 # prix d'entree -- contourne les paliers 25/50/75 et sort TOUT des que ce
 # seuil de PnL est atteint.
-TP_INSTANT_PCT = 0.02
+TP_INSTANT_PCT = 0.50  # Steven 19/08 -- backtest corrige (frais 4% sur GAINS
+# uniquement, jamais sur les pertes -- correction du modele precedent qui
+# appliquait les frais partout). Sweep 2D SL x TP sur 5656 series reelles :
+# +2.85%/trade au reglage precedent (SL 0.5%/TP 2%) vs +6.21%/trade a
+# SL=0.2%/TP=50% -- rendement decroissant au-dela de TP=50-75%. Laisser
+# courir le gagnant plus loin capture les rares gros mouvements (jusqu'a
+# 400% observe) qui dominent l'esperance malgre un win rate plus bas (12%
+# contre 26% avant).
 # SL REACTIVE (Steven 19/08, correction le meme soir) : la desactivation
 # precedente reposait sur seulement 235 series (petit buffer memoire, pas
 # representatif). Sur le dataset RECHERCHE complet (142 135 lignes, 5656
@@ -2076,17 +2083,15 @@ PNL_TP_FRACTIONS = (0.25, 0.25, 0.25, 0.25)  # fraction de la taille INITIALE pa
 PNL_TP_TARGETS = (0.25, 0.50, 0.75)  # paliers de PnL% pour TP1/TP2/TP3
 PNL_TRAIL_ACTIVATION = 0.25  # trailing s'armee des TP1 (+25%)
 PNL_TRAIL_GIVEBACK = 0.10  # 10% du pic depuis le palier atteint -> vente runner
-PNL_SL_PCT = 0.01  # Steven 19/08 -- backtest sur 142 135 lignes reelles (5656
-# series, dataset RECHERCHE complet, PAS le petit buffer de la veille) :
-# sweep complet de -50% a -0.01%, AMELIORATION MONOTONE a mesure que le SL se
-# resserre (-50%=-6.7%, -20%=-3.2%, -10%=-0.7%, -2%=+2.2%, -0.5%=+3.0%,
-# -0.01%=+3.3%). Win rate seulement 26% -- le mecanisme qui marche est
-# "coupe au moindre rouge, laisse courir jusqu'au TP au moindre vert". 1%
-# choisi (pas 0%) pour laisser une marge face aux frais/slippage reels que
-# ce backtest ne capture pas entierement. ATTENTION : la veille, un SL
-# desactive avait ete recommande sur un echantillon de seulement 235 series
-# (le petit buffer memoire, pas representatif) -- ce chiffre-la etait faux,
-# corrige ici avec 24x plus de donnees.
+PNL_SL_PCT = 0.002  # Steven 19/08 -- 2e correction le meme soir : le modele
+# de frais initial (4% sur CHAQUE sortie) etait faux -- les frais ne
+# s'appliquent que sur les GAINS, jamais sur les pertes (confirme). Refait
+# le sweep 2D SL x TP sur les 5656 series reelles avec le bon modele :
+# SL=0.2%/TP=50% (voir TP_INSTANT_PCT) donne +6.21%/trade contre
+# +2.85%/trade au reglage precedent (SL 0.5%/TP 2%). Le SL plus serre
+# coupe des pertes minuscules sans frais associes ; le TP plus large laisse
+# le gagnant capturer les gros mouvements (jusqu'a 400% observes) qui
+# dominent l'esperance malgre un WR plus bas (12%).
 PNL_SL_MIN_SECS_LEFT = 20  # trop peu de temps = pas de SL
 # ESCALADE TP (Steven 05/08, "on voit l'argent filer entre nos doigts") :
 # apres ce nombre d'echecs consecutifs a vendre la fraction du palier vise,
@@ -9121,7 +9126,7 @@ class MultiTrader:
             if _tp_entry > 0:
                 _tp_ask = self._live_ask(pos.get("token_id"))
                 _tp_px = _tp_ask if _tp_ask is not None else self._live_price(pos.get("token_id"), None, pos.get("side"))
-                if _tp_ask is not None and _tp_ask > _tp_entry:
+                if _tp_ask is not None and (_tp_ask - _tp_entry) / _tp_entry >= TP_INSTANT_PCT:
                     _tp_shares = pos.get("filled_shares", 0)
                     if _tp_shares > 0:
                         _tp_sold = self._sell_orphan(
@@ -14180,10 +14185,12 @@ class MultiTrader:
                     self._tlog(f"spreadcapture_err_{sym}", f"💥 [SPREAD-CAPTURE] {sym} erreur: {e}")
 
             # ── TP INSTANTANE UNIVERSEL : se fie au prix d'ACHAT courant, pas
-            # au mid (Steven 19/08) -- des que l'ask direct depasse l'entree,
-            # vente TOUT immediate.
+            # au mid (Steven 19/08). Seuil TP_INSTANT_PCT (pas juste >entree,
+            # 2e correction du soir) -- le backtest avec le bon modele de
+            # frais montre que laisser courir jusqu'a +50% capture les gros
+            # mouvements et double l'esperance vs vendre au 1er centime vert.
             _tp_ask = self._live_ask(pos.get("token_id")) if pos["mode"] == "real" else cur
-            if _tp_ask is not None and _tp_ask > entry:
+            if _tp_ask is not None and (_tp_ask - entry) / entry >= TP_INSTANT_PCT:
                 exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
                 if exit_price is None:
                     continue
