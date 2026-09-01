@@ -5163,6 +5163,21 @@ class MultiTrader:
                 or (not force and ask < BOTH_SIDE_LEG_MIN)
             ):
                 return False, 0.0
+            # PLANCHER UNIVERSEL 0.50$ (Steven 01/09, "ou est mon filtre qui
+            # aurait du forcer achat a 60 down ????" -- le filtre pose plus
+            # haut dans le premier appelant a ete contourne par un chemin
+            # different qui arrive ICI directement). _open_leg est le POINT
+            # UNIQUE par lequel tout achat reel passe -- plancher applique
+            # ici, aucun appelant ne peut plus le contourner. force=True
+            # reste exempte (reserve aux completions d'urgence explicites,
+            # aucune n'est active actuellement).
+            if not force and ask < FAV_MIN_PRICE:
+                self._tlog(
+                    f"openleg_floor_{sym}",
+                    f"⛔ [OPEN-LEG-FLOOR] {sym} {slug} {side} @ {ask:.3f} < "
+                    f"{FAV_MIN_PRICE} -> refuse, plancher universel",
+                )
+                return False, 0.0
             with self._order_lock:
                 cash, _ = self._read_cash(max_age=0)
                 if cash is None:
