@@ -1239,7 +1239,14 @@ def api_export_snapshots():
     if kind == "book_snapshots":
         # depuis le 11/08 les releves de marche vivent dans un fichier dedie
         # (cf. MARKET_DATA_FILE) et non plus dans multi_state.json
-        hist = trader.lire_market_data()
+        # ?lines=N (Steven 19/08) : le defaut 200000 tronquait l'historique
+        # a ~1.6 jour alors que le fichier en contient plus -- permet de
+        # demander tout l'historique dispo pour un backtest plus large.
+        try:
+            n_lignes = int(request.args.get("lines", 200000))
+        except ValueError:
+            n_lignes = 200000
+        hist = trader.lire_market_data(max_lignes=n_lignes)
     elif kind == "slippage":
         hist = trader.state.get("slippage_history", [])
     else:
