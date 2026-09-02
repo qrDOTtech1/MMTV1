@@ -5966,6 +5966,19 @@ class MultiTrader:
         # de l'argent : observe on-chain sur btc-updown-5m-1785900300, achat
         # de 8.30 parts a 0.20 (1.75$) immediatement revendues a 0.13 (1.01$)
         # = -0.74$ jetes pour "pouvoir vendre" ce qui etait deja vendable.
+        # FIX (Steven 02/09, "les 2 mecanismes se battent pour le meme
+        # solde") : un ordre PASSIF encore ouvert (SPREAD-CAPTURE, TP-PASSIF)
+        # sur ce meme slug peut se faire servir PENDANT qu'on tente une vente
+        # AGRESSIVE ici -- les deux consomment le meme solde on-chain en
+        # parallele. Confirme en prod : "not enough balance ... sum of
+        # matched orders: 5090000" (un ordre concurrent avait deja matche
+        # une partie du solde), et une verification avant/apres qui a
+        # attribue TOUT le mouvement (5.09 parts, la position entiere) a un
+        # appel qui n'en demandait que la moitie (2.54). On annule tout
+        # ordre resident du slug AVANT de tenter la vente agressive -> une
+        # seule main sur le solde a la fois.
+        if symbol and slug:
+            self._annuler_ordres_slug(symbol, slug)
         book = self._live.get_book_sync(token_id)
         bid = book["bids"][0][0] if book and book.get("bids") else None
         if bid is None:
