@@ -8869,16 +8869,41 @@ class MultiTrader:
         if side not in outcomes:
             return False
         key = f"{slug}|{side}"
+        # LOGS DE REFUS (Steven 02/09, "oracle a fait prediction mais je n'ai
+        # pas constate de trade") : ces 3 sorties etaient TOTALEMENT
+        # SILENCIEUSES -- confirme sur un cas reel (ETH eth-updown-5m-
+        # 1788360900, certain=True 4 cycles de suite, jamais d'ordre, jamais
+        # une ligne pour dire pourquoi). Cause reelle trouvee : ask absent
+        # du carnet sur le cote predit (personne ne vend, FAV-DIAG confirmait
+        # prix_dispo=[('Up', ...)] seul, rien sur Down). Desormais loggue a
+        # chaque refus, throttled pour ne pas spammer un cycle de 4s.
         if key in mk["open"]:
+            self._tlog(
+                f"twaporacle_skip_pos_{sym}",
+                f"🔮 [TWAP-ORACLE] {sym} {slug} {side} certain mais position deja ouverte sur ce cote -> skip",
+                every=10.0,
+            )
             return False
         tid = token_ids[outcomes.index(side)]
         _, ask, _ = quotes.get(side, (None, None, None))
         if ask is None or ask <= 0 or ask >= 1:
+            self._tlog(
+                f"twaporacle_skip_ask_{sym}",
+                f"🔮 [TWAP-ORACLE] {sym} {slug} {side} certain mais AUCUN ASK dispo dans le "
+                f"carnet Polymarket (ask={ask}) -> impossible d'acheter, skip",
+                every=5.0,
+            )
             return False
         mk["twap_oracle_tried"][slug] = time.time()
         investable = self._investable()
         budget = round(min(TWAP_ORACLE_BET_USD, investable), 2)
         if budget < MIN_BUDGET_USD:
+            self._tlog(
+                f"twaporacle_skip_budget_{sym}",
+                f"🔮 [TWAP-ORACLE] {sym} {slug} {side} certain mais budget insuffisant "
+                f"({budget:.2f}$ < {MIN_BUDGET_USD}$) -> skip",
+                every=10.0,
+            )
             return False
         self._log(
             f"🔮 [TWAP-ORACLE] {sym} {slug} {side} @ {ask:.3f} budget={budget:.2f}$ "
