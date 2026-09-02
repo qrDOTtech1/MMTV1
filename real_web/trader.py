@@ -2030,7 +2030,8 @@ FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par invest
 TWAP_ORACLE_ENABLED = True
 TWAP_ORACLE_BET_USD = 5.0      # Steven 02/09 -- plancher demande, "augmenter si ca tourne bien"
 TWAP_ORACLE_MIN_SECS_LEFT = 5
-TWAP_ORACLE_MAX_SECS_LEFT = 50  # la formule n'est valide que dans la fenetre TWAP 60s
+TWAP_ORACLE_MAX_SECS_LEFT = 58  # Steven 02/09 -- releve 50->58, la formule (r=min(secs_left,60))
+# n'est de toute facon valide que sous 60s ; capture le peu de fenetre utile en plus qui restait.
 # PALIER DE MISE DEGRESSIF PAR PRIX (Steven 02/09, "si ca passe on gagne quand
 # meme bcp mais sinon ca perd que 1$") : une mise FIXE de 5$ traite pareil un
 # pari a 90c (variance faible) et un pari a 1c (variance maximale : soit -100%
@@ -4074,12 +4075,18 @@ class MultiTrader:
                 # SL/TP passe desormais en 1ere chose faite chaque cycle, pour
                 # TOUS les symboles, avant tout le reste (qui peut attendre
                 # 1.5s de plus sans consequence sur le capital engage).
-                for sym in SYMBOLS:
-                    mode = self.state["modes"].get(sym)
-                    if mode not in ("real", "paper"):
-                        continue
-                    if not self.state["markets"][sym]["open"]:
-                        continue
+                # PARALLELE ENTRE SYMBOLES (Steven 02/09, "il fait n'importe
+                # quoi avec son SL" -- confirme sur incident reel : meme
+                # place en 1ere passe, un SL ETH s'est declenche a -28.7% au
+                # lieu de -0.1%, parce que _sell_orphan attend jusqu'a 4s de
+                # verification on-chain APRES chaque vente -- une execution
+                # lente sur BTC retardait d'autant la relecture du prix ETH,
+                # meme en 1ere position dans une boucle sequentielle. Chaque
+                # symbole tourne desormais dans son propre thread (pool deja
+                # utilise partout ailleurs dans ce fichier pour le meme
+                # besoin) -- une verification lente sur l'un n'affecte plus
+                # les autres.
+                def _pass1_sl_tp(sym):
                     try:
                         self._log_position_prices(sym)
                     except Exception as e:
@@ -4088,6 +4095,18 @@ class MultiTrader:
                         self._manage_pnl_tier_exits(sym)
                     except Exception as e:
                         self._tlog(f"fastexit_pnl_err_{sym}", f"💥 [FAST-EXIT] {sym} pnl-exits erreur: {e}")
+
+                _pass1_syms = [
+                    sym for sym in SYMBOLS
+                    if self.state["modes"].get(sym) in ("real", "paper")
+                    and self.state["markets"][sym]["open"]
+                ]
+                _pass1_futs = [self._pool.submit(_pass1_sl_tp, sym) for sym in _pass1_syms]
+                for _f in _pass1_futs:
+                    try:
+                        _f.result(timeout=8.0)
+                    except Exception as e:
+                        self._tlog("fastexit_pass1_err", f"💥 [FAST-EXIT] passe 1 parallele erreur: {e}")
 
                 # PASSE 2 -- tout le reste, moins sensible au delai
                 for sym in SYMBOLS:
@@ -8889,10 +8908,47 @@ class MultiTrader:
         exception assumee a la regle generale (decidee avec Steven)."""
         if not TWAP_ORACLE_ENABLED or mode != "real":
             return False
-        if mk.setdefault("twap_oracle_tried", {}).get(slug):
-            return False
         now = synced_now()
         secs_left = p.get("end_ts", now) - now
+        # SUIVI DE L'ORDRE PASSIF (Steven 02/09) : DOIT passer AVANT le gate
+        # "tried" ci-dessous -- sinon un ordre passif pose puis marque
+        # "tried" n'est plus jamais reverifie/finalise les cycles suivants
+        # (bug trouve en ecrivant ce fix : le gate aurait sorti la fonction
+        # avant meme d'atteindre ce bloc).
+        _pending = mk.setdefault("twap_oracle_pending", {})
+        _pend = _pending.get(slug)
+        if _pend:
+            _held = self._live.position_size(_pend["token_id"])
+            if _held and _held > 0.01:
+                avg = _pend.get("price", 0.98)
+                filled = round(_held, 2)
+                self._add_slug_spent(mk, slug, round(filled * avg, 2))
+                mk["open"][f"{slug}|{_pend['side']}"] = {
+                    "symbol": sym, "slug": slug, "side": _pend["side"], "mode": "real",
+                    "strat": "twap_oracle", "token_id": _pend["token_id"], "entry_price": avg,
+                    "filled_shares": filled, "cost": round(filled * avg, 2),
+                    "start_ts": p["start_ts"], "pair": p.get("pair"), "end_ts": p["end_ts"],
+                    "opened_ts": time.time(), "buffer": 0.0, "hold_to_resolution": True,
+                }
+                del _pending[slug]
+                self._log(
+                    f"✅ [TWAP-ORACLE] {sym} {slug} {_pend['side']} {filled} parts @ {avg:.3f} "
+                    f"(ordre passif rempli) -> ouverte, HOLD TO RESOLUTION (pas de TP/SL)"
+                )
+                return True
+            if secs_left <= 3:
+                try:
+                    self._live.cancel_order(_pend["order_id"])
+                except Exception:
+                    pass
+                del _pending[slug]
+                self._log(
+                    f"🔮 [TWAP-ORACLE] {sym} {slug} {_pend['side']} ordre passif jamais rempli "
+                    f"({secs_left:.0f}s restantes) -> annule"
+                )
+            return False  # ordre deja en attente sur ce slug, rien d'autre a faire ce cycle
+        if mk.setdefault("twap_oracle_tried", {}).get(slug):
+            return False
         if not (TWAP_ORACLE_MIN_SECS_LEFT <= secs_left <= TWAP_ORACLE_MAX_SECS_LEFT):
             return False
         pair = p.get("pair")
@@ -8931,14 +8987,6 @@ class MultiTrader:
         if side not in outcomes:
             return False
         key = f"{slug}|{side}"
-        # LOGS DE REFUS (Steven 02/09, "oracle a fait prediction mais je n'ai
-        # pas constate de trade") : ces 3 sorties etaient TOTALEMENT
-        # SILENCIEUSES -- confirme sur un cas reel (ETH eth-updown-5m-
-        # 1788360900, certain=True 4 cycles de suite, jamais d'ordre, jamais
-        # une ligne pour dire pourquoi). Cause reelle trouvee : ask absent
-        # du carnet sur le cote predit (personne ne vend, FAV-DIAG confirmait
-        # prix_dispo=[('Up', ...)] seul, rien sur Down). Desormais loggue a
-        # chaque refus, throttled pour ne pas spammer un cycle de 4s.
         if key in mk["open"]:
             self._tlog(
                 f"twaporacle_skip_pos_{sym}",
@@ -8947,14 +8995,49 @@ class MultiTrader:
             )
             return False
         tid = token_ids[outcomes.index(side)]
+
+        # ORDRE PASSIF EN SECOURS (Steven 02/09, "l'oracle n'arrive plus a
+        # acheter") : confirme sur des dizaines de cas reels -- l'oracle ne
+        # tire que dans les toutes dernieres secondes, precisement quand un
+        # contrat quasi-certain (0.01/0.99) n'a plus AUCUN vendeur au marche
+        # (les acheteurs ont deja nettoye le carnet, personne ne cede un
+        # quasi-gagnant). Le marche market echouait alors 100% du temps. Si
+        # aucun ask n'est disponible, poste desormais un ordre LIMITE passif
+        # (GTC) au lieu d'attendre un match instantane, et le laisse vivre
+        # le temps restant de la fenetre (suivi/finalise en haut de
+        # fonction, voir _pending).
         _, ask, _ = quotes.get(side, (None, None, None))
         if ask is None or ask <= 0 or ask >= 1:
-            self._tlog(
-                f"twaporacle_skip_ask_{sym}",
-                f"🔮 [TWAP-ORACLE] {sym} {slug} {side} certain mais AUCUN ASK dispo dans le "
-                f"carnet Polymarket (ask={ask}) -> impossible d'acheter, skip",
-                every=5.0,
-            )
+            mk["twap_oracle_tried"][slug] = time.time()
+            _passive_budget = round(min(_twap_oracle_bet_usd(0.98), self._investable()), 2)
+            if _passive_budget < MIN_BUDGET_USD:
+                self._tlog(
+                    f"twaporacle_skip_ask_{sym}",
+                    f"🔮 [TWAP-ORACLE] {sym} {slug} {side} certain, aucun ask, budget "
+                    f"insuffisant pour un ordre passif -> skip",
+                    every=5.0,
+                )
+                return False
+            _passive_price = 0.98
+            _passive_shares = round(_passive_budget / _passive_price, 2)
+            res_p = self._live.post_limit_buy(tid, _passive_price, _passive_shares)
+            if res_p.get("success") and res_p.get("order_id"):
+                _pending[slug] = {
+                    "side": side, "token_id": tid, "order_id": res_p["order_id"],
+                    "price": _passive_price, "posted_ts": time.time(),
+                }
+                self._log(
+                    f"🔮 [TWAP-ORACLE] {sym} {slug} {side} certain, aucun ask -> ordre PASSIF "
+                    f"pose @ {_passive_price:.2f} ({_passive_shares} parts, {_passive_budget:.2f}$), "
+                    f"{secs_left:.0f}s pour se remplir"
+                )
+            else:
+                self._tlog(
+                    f"twaporacle_skip_ask_{sym}",
+                    f"🔮 [TWAP-ORACLE] {sym} {slug} {side} certain, aucun ask, ordre passif "
+                    f"a echoue aussi (err={res_p.get('error', '')}) -> skip",
+                    every=5.0,
+                )
             return False
         mk["twap_oracle_tried"][slug] = time.time()
         investable = self._investable()
