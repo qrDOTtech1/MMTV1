@@ -2118,7 +2118,7 @@ DYN_MAX_FLOORED_MULT = 2.5  # max multiplicateur total (ne depasse pas 2.5x le t
 # Sortie progressive basee sur le PnL% du contrat (pas le prix absolu).
 # 4 niveaux : 25% a +25%, 25% a +50%, 25% a +75%, 25% runner avec trailing stop.
 PNL_TP_FRACTIONS = (0.25, 0.25, 0.25, 0.25)  # fraction de la taille INITIALE par palier
-PNL_TP_TARGETS = (0.05, 0.15, 0.35)  # Steven 01/09 -- resserre (etait 0.25/0.50/0.75) : "doit s'enclencher vite et par palier"
+PNL_TP_TARGETS = (0.05, 0.15, 0.20)  # Steven 02/09 -- 3e palier resserre 35%->20%
 PNL_TRAIL_ACTIVATION = 0.25  # trailing s'armee des TP1 (+25%)
 PNL_TRAIL_GIVEBACK = 0.10  # 10% du pic depuis le palier atteint -> vente runner
 PNL_SL_PCT = 0.001  # Steven 01/09 -- resserre 0.2%->0.1%, coherent avec le
