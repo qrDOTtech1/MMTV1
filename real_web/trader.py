@@ -2209,7 +2209,10 @@ SWING_ENTER_MAX_SECS = 240  # peut entrer tot (jusqu'a 240s de la fin) pendant l
 
 # ── MOMENTUM FALLBACK (Steven 26/07) : quand l'ARB est bloquee (combined > 0.95),
 # achete le côté cheap directionnel si le momentum Binance confirme -> scalp le bruit.
-MOMENTUM_FALLBACK_ENABLED = True
+MOMENTUM_FALLBACK_ENABLED = False  # Steven 02/09 -- desactive par coherence
+# (achete PAR CONCEPTION sous 0.50$, meme logique qu'OVERREACT). Verifie :
+# _try_momentum_fallback n'a aucun appelant dans le fichier -- code mort,
+# aucun risque actif, mais le flag doit refleter l'intention.
 MOMENTUM_FALLBACK_MAX_ENTRY = 0.50  # n'achete que si le contrat < 0.50
 MOMENTUM_FALLBACK_MIN_FAST_PCT = 0.01  # momentum court minimum (%/s) pour confirmer
 MOMENTUM_FALLBACK_BUDGET = 1.0  # $ par trade momentum (petit, risque dir.)
