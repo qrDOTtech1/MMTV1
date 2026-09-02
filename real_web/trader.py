@@ -2004,6 +2004,15 @@ NEARCERT_MIN_SECS = 8
 # mesure et positif, sur un cash actuel de ~8$.
 NEARCERT_BUDGET_USD = 4.0
 
+# TEMPORAIRE (Steven 02/09, "laisse uniquement oracle travailler, coupe le
+# reste") : coupe l'OUVERTURE de toute nouvelle position hors TWAP-ORACLE
+# (arb/bothside/fav/near-certain/copy-trade/pre-ouverture/maker-ouvert/
+# renfort), pendant qu'il active tous les symboles. Ne touche PAS la gestion
+# des positions DEJA ouvertes (SL/TP, orphans, resolution, stagger deja
+# engage) -- rien n'est abandonne sans suivi. Repasser a False pour tout
+# reactiver.
+ORACLE_ONLY_MODE = True
+
 FAV_ENABLED = True
 FAV_MIN_PRICE = 0.60
 FAV_MAX_PRICE = 0.99  # Steven 01/09 -- "on parie sur le gagnant", exemple donne = 90c
@@ -4163,16 +4172,17 @@ class MultiTrader:
                     # filtre ci-dessous -- il pose des ordres sur une fenetre
                     # pas encore ouverte, donc precisement quand mk["open"]
                     # est VIDE. Le placer apres revenait a ne jamais l'appeler.
-                    try:
-                        self._manage_preopen(sym)
-                    except Exception as e:
-                        self._tlog(f"fastexit_preopen_err_{sym}", f"💥 [FAST-EXIT] {sym} pre-ouverture erreur: {e}")
-                    # MAKER EN FENETRE OUVERTE : meme raison que la
-                    # pre-ouverture, il agit quand mk["open"] est vide.
-                    try:
-                        self._manage_maker_open(sym)
-                    except Exception as e:
-                        self._tlog(f"fastexit_makeropen_err_{sym}", f"💥 [FAST-EXIT] {sym} maker-ouvert erreur: {e}")
+                    if not ORACLE_ONLY_MODE:
+                        try:
+                            self._manage_preopen(sym)
+                        except Exception as e:
+                            self._tlog(f"fastexit_preopen_err_{sym}", f"💥 [FAST-EXIT] {sym} pre-ouverture erreur: {e}")
+                        # MAKER EN FENETRE OUVERTE : meme raison que la
+                        # pre-ouverture, il agit quand mk["open"] est vide.
+                        try:
+                            self._manage_maker_open(sym)
+                        except Exception as e:
+                            self._tlog(f"fastexit_makeropen_err_{sym}", f"💥 [FAST-EXIT] {sym} maker-ouvert erreur: {e}")
                     if not self.state["markets"][sym]["open"]:
                         continue
                     try:
@@ -4195,10 +4205,11 @@ class MultiTrader:
                     # RENFORT (Steven 05/08) : APRES les sorties, pour que le
                     # marqueur sl_fired du cycle courant soit deja pose et que
                     # le renfort travaille sur la taille reelle post-coupe.
-                    try:
-                        self._manage_reinforce(sym)
-                    except Exception as e:
-                        self._tlog(f"fastexit_reinf_err_{sym}", f"💥 [FAST-EXIT] {sym} renfort erreur: {e}")
+                    if not ORACLE_ONLY_MODE:
+                        try:
+                            self._manage_reinforce(sym)
+                        except Exception as e:
+                            self._tlog(f"fastexit_reinf_err_{sym}", f"💥 [FAST-EXIT] {sym} renfort erreur: {e}")
                     # ARB DECALE : completion / abandon de la jambe 1
                     try:
                         self._manage_stagger(sym)
@@ -4538,7 +4549,7 @@ class MultiTrader:
 
         while self._running.is_set():
             try:
-                if COPY_TRADE_ENABLED:
+                if COPY_TRADE_ENABLED and not ORACLE_ONLY_MODE:
                     ct = self._copy_trade_state()
                     if ct.get("enabled"):
                         # SELECTION AUTOMATIQUE (Steven 05/08) : plus besoin de
@@ -4887,14 +4898,14 @@ class MultiTrader:
                     mm_markets = [
                         mp for mp in by_sym.get(sym, []) if mp[1]["end_ts"] > _now
                     ]
-                    if self.state.get("mm", {}).get("enabled") and mm_markets:
+                    if self.state.get("mm", {}).get("enabled") and mm_markets and not ORACLE_ONLY_MODE:
                         m, p = mm_markets[0]
                         try:
                             self._mm_tick(sym, mode, m, p)
                         except Exception as e:
                             self._tlog(f"mm_err_{sym}", f"💥 [MM] {sym} erreur: {e}")
                     # DELTA-NEUTRE both-side au bid (Steven 23/07)
-                    if self.state.get("dn_enabled") and mm_markets:
+                    if self.state.get("dn_enabled") and mm_markets and not ORACLE_ONLY_MODE:
                         m, p = mm_markets[0]
                         try:
                             self._dn_tick(sym, mode, m, p)
@@ -12471,6 +12482,8 @@ class MultiTrader:
                 self._try_twap_oracle(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug)
             except Exception as e:
                 self._tlog(f"twap_oracle_err_{sym}", f"💥 [TWAP-ORACLE] {sym} {slug} erreur: {e}")
+        if ORACLE_ONLY_MODE:
+            return False  # coupe l'ouverture arb/bothside/fav -- oracle deja tente ci-dessus
         # FILTRE PAR STRAT (Steven 05/08, "je vois des near-certain qui
         # attendent pas resolution") : cette fonction gere l'arb bothside/
         # swing exclusivement. legs_held pilote TOUT son comportement en
