@@ -2007,6 +2007,17 @@ NEARCERT_BUDGET_USD = 4.0
 FAV_ENABLED = True
 FAV_MIN_PRICE = 0.60
 FAV_MAX_PRICE = 0.99  # Steven 01/09 -- "on parie sur le gagnant", exemple donne = 90c
+# BANDE DEDIEE A _try_favorite UNIQUEMENT (Steven 02/09, "achete parfois trop
+# cher et reduit ses chances de tp, devrait rester proche de 50c") : achats a
+# 0.95-0.98 confirmes en prod -- au-dela de ~0.90 le TP devient
+# MATHEMATIQUEMENT impossible (palier 5% depuis 0.97 demanderait 1.02$, hors
+# plage [0,1]). Constantes SEPAREES de FAV_MIN_PRICE/FAV_MAX_PRICE (qui
+# restent le plancher UNIVERSEL utilise ailleurs -- _open_leg, COPY,
+# BOTHSIDE-FAV, _open_hedge_pair_impl -- volontairement inchangees) pour ne
+# pas rouvrir "jamais sous 0.50$" partout, seulement ici. 0.45 accepte
+# explicitement par Steven pour CE mecanisme specifique seulement.
+FAV_STRATEGY_MIN_PRICE = 0.45
+FAV_STRATEGY_MAX_PRICE = 0.62
 FAV_BINANCE_MARGIN = 0.0025   # 0.25% = signal "clair", pas juste "devant"
 FAV_MIN_SECS = 10             # Steven 01/09 -- devenu le mecanisme PRINCIPAL, plus
 # une strategie de repli rare -- doit pouvoir tirer sur presque toute la fenetre
@@ -9189,11 +9200,12 @@ class MultiTrader:
         _, ask, _ = quotes.get(fav_side, (None, None, None))
         if ask is None:
             return False
-        if not (FAV_MIN_PRICE <= ask <= FAV_MAX_PRICE):
+        if not (FAV_STRATEGY_MIN_PRICE <= ask <= FAV_STRATEGY_MAX_PRICE):
             self._tlog(
                 f"favpx_{sym}",
                 f"🌫️ [FAV] {sym} {slug} {fav_side} @ {ask:.3f} hors bande "
-                f"[{FAV_MIN_PRICE}, {FAV_MAX_PRICE}] -> pas de pari directionnel",
+                f"[{FAV_STRATEGY_MIN_PRICE}, {FAV_STRATEGY_MAX_PRICE}] -> pas de pari directionnel "
+                f"(reste proche de 50c pour garder de la marge de TP)",
             )
             return False
         cash, _ = self._read_cash(max_age=0)
