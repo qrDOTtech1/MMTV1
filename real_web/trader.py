@@ -11316,7 +11316,20 @@ class MultiTrader:
         _secs_left_early = p.get("end_ts", 0) - synced_now()
         _p_calc = None
         if p.get("pair") and _strike_early:
-            _live_px = self._ws.spot_price(p["pair"]) if hasattr(self, "_ws") else None
+            # TWAP CHAINLINK DE PREFERENCE (Steven 02/09, "polymarket resout sur
+            # la TWAP officielle desormais, pas le spot instantane") : source
+            # RTDS reelle de resolution, prioritaire sur le tick Binance brut.
+            # Fenetre 30s d'abord (plus proche du spot tout en filtrant les
+            # meches), 60s en repli si la 30s n'est pas encore fraiche, spot
+            # Binance en dernier recours si RTDS est indisponible/pas encore
+            # connecte -- jamais de blocage total sur ce calcul.
+            _live_px = None
+            if hasattr(self, "_ws"):
+                _live_px = self._ws.twap(p["pair"], window_s=30)
+                if _live_px is None:
+                    _live_px = self._ws.twap(p["pair"], window_s=60)
+                if _live_px is None:
+                    _live_px = self._ws.spot_price(p["pair"])
             if _live_px is not None:
                 _p_calc = probability_above_strike(
                     p["pair"], _live_px, _strike_early, _secs_left_early

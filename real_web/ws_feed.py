@@ -29,6 +29,16 @@ from websocket import (
 
 BINANCE_WS = "wss://stream.binance.com:9443/stream"
 POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# RTDS CHAINLINK TWAP (Steven 02/09, "polymarket resout desormais sur une TWAP
+# chainlink 30/60s, pas le spot instantane -- il faut suivre CA, pas Binance
+# tick par tick") : Polymarket relaie en direct la TWAP officielle Chainlink
+# (celle qui determine reellement l'issue du marche) via ce flux, sans
+# credentials. Doc : docs.polymarket.com/market-data/chainlink-twap.
+TWAP_WS = "wss://ws-live-data.polymarket.com"
+TWAP_SYM_TO_SUB = {
+    "BTC": "btc/usd", "ETH": "eth/usd", "SOL": "sol/usd",
+    "XRP": "xrp/usd", "DOGE": "doge/usd", "BNB": "bnb/usd",
+}
 PAIRS = {
     "BTC": "btcusdt",
     "ETH": "ethusdt",
@@ -38,6 +48,9 @@ PAIRS = {
     "BNB": "bnbusdt",
 }
 STALE_S = 3.0  # au-dela, une valeur est jugee perimee -> l'appelant fallback REST
+TWAP_STALE_S = 10.0  # cadence de publication Chainlink non documentee precisement
+# -> tolerance plus large que le spot Binance pour ne pas rejeter une TWAP
+# valide juste parce qu'elle publie un peu moins souvent qu'un bookTicker.
 
 _log = logging.getLogger("ws_feed")
 
@@ -47,6 +60,9 @@ class WSFeed:
         self._lock = threading.Lock()
         # Binance : sym -> (bid, ask, ts)
         self._spot = {}
+        # RTDS Chainlink TWAP : sym -> (value, ts), un dict par fenetre
+        self._twap30 = {}
+        self._twap60 = {}
         # Polymarket : token_id -> {"bids": {px:sz}, "asks": {px:sz}, "ts": ts}
         self._books = {}
         self._poly_wanted = set()  # tokens a suivre (mis a jour par le trader)
@@ -172,6 +188,7 @@ class WSFeed:
         self._started = True
         threading.Thread(target=self._binance_loop, daemon=True).start()
         threading.Thread(target=self._poly_loop, daemon=True).start()
+        threading.Thread(target=self._twap_loop, daemon=True).start()
 
     # ── lecture (ce que le trader appelle) ──
     def spot(self, pair_or_sym):
@@ -188,6 +205,20 @@ class WSFeed:
         """Prix mid seul (compat _binance_price), None si stale."""
         s = self.spot(pair)
         return s[2] if s else None
+
+    def twap(self, pair_or_sym, window_s=30):
+        """TWAP Chainlink officielle (30 ou 60s), source REELLE de resolution
+        Polymarket -- a preferer au spot Binance instantane des que fraiche.
+        None si le flux RTDS n'a pas encore de valeur recente pour cette
+        paire (l'appelant doit alors retomber sur spot_price/_binance_price)."""
+        sym = pair_or_sym.replace("USDT", "") if "USDT" in pair_or_sym else pair_or_sym
+        sym = sym.upper()
+        store = self._twap30 if window_s == 30 else self._twap60
+        with self._lock:
+            v = store.get(sym)
+        if not v or time.time() - v[1] > TWAP_STALE_S:
+            return None
+        return v[0]
 
     def book(self, token_id):
         """(best_bid, best_ask, ts) temps reel d'un token Polymarket, ou None."""
@@ -251,11 +282,19 @@ class WSFeed:
             fresh_books = sum(
                 1 for b in self._books.values() if time.time() - b["ts"] <= STALE_S
             )
+            fresh_twap30 = sum(
+                1 for v in self._twap30.values() if time.time() - v[1] <= TWAP_STALE_S
+            )
+            fresh_twap60 = sum(
+                1 for v in self._twap60.values() if time.time() - v[1] <= TWAP_STALE_S
+            )
             return {
                 "spot_fresh": fresh_spot,
                 "spot_total": len(self._spot),
                 "books_fresh": fresh_books,
                 "books_total": len(self._books),
+                "twap30_fresh": fresh_twap30,
+                "twap60_fresh": fresh_twap60,
                 "poly_wanted": len(self._poly_wanted),
                 "arb_markets": len(self._arb_markets),
                 "arb_signals": self._arb_stats["signals"],
@@ -376,6 +415,69 @@ class WSFeed:
                             )
             except Exception:
                 time.sleep(1.0)  # reconnexion
+
+    # ── RTDS Chainlink TWAP (Steven 02/09) ──────────────────────────────
+    def _twap_loop(self):
+        """Flux RTDS Polymarket : relaie la TWAP Chainlink officielle 30s et
+        60s -- c'est CETTE valeur, pas le spot Binance instantane, qui
+        determine la resolution reelle du marche depuis leur mise a jour du
+        moteur d'execution. Pas de credentials, pas d'historique/replay
+        (docs.polymarket.com/market-data/chainlink-twap) -> reconnexion
+        simple en cas de coupure, on repart en flux avant seulement."""
+        sub_msg = {
+            "action": "subscribe",
+            "subscriptions": [
+                {"topic": "crypto_prices_twap_thirty", "type": "update"},
+                {"topic": "crypto_prices_twap_sixty", "type": "update"},
+            ],
+        }
+        while True:
+            try:
+                ws = create_connection(TWAP_WS, timeout=10)
+                ws.send(json.dumps(sub_msg))
+                ws.settimeout(5.0)
+                last_ping = time.time()
+                last_msg = time.time()
+                while True:
+                    # maintien de connexion : PING texte toutes les 5s (exige par RTDS)
+                    if time.time() - last_ping >= 5.0:
+                        ws.send("PING")
+                        last_ping = time.time()
+                    if time.time() - last_msg > 20.0:
+                        raise ConnectionError("flux TWAP silencieux 20s")
+                    try:
+                        raw = ws.recv()
+                        last_msg = time.time()
+                    except WebSocketTimeoutException:
+                        continue
+                    except (WebSocketConnectionClosedException, OSError) as e:
+                        raise ConnectionError(f"connexion TWAP fermee: {e}")
+                    if not raw or raw in ("PONG", "PING"):
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    self._apply_twap(msg)
+            except Exception:
+                time.sleep(1.0)
+
+    def _apply_twap(self, msg):
+        topic = msg.get("topic")
+        if topic not in ("crypto_prices_twap_thirty", "crypto_prices_twap_sixty"):
+            return
+        payload = msg.get("payload") or {}
+        symbol = (payload.get("symbol") or "").upper()  # "BTC/USD"
+        value = payload.get("value")
+        if not symbol or value is None:
+            return
+        sym = symbol.split("/")[0]
+        now = time.time()
+        with self._lock:
+            if topic == "crypto_prices_twap_thirty":
+                self._twap30[sym] = (float(value), now)
+            else:
+                self._twap60[sym] = (float(value), now)
 
     # ── Polymarket : carnet temps reel, re-subscribe dynamique ──
     def _poly_loop(self):
