@@ -2080,6 +2080,9 @@ TP_INSTANT_PCT = 0.75  # plafond dur : vend TOUT de suite si atteint, meme
 # SL du tout. Voir le commentaire de PNL_SL_PCT pour le detail du sweep.
 TP_INSTANT_SL_DISABLED = True  # Steven 02/09 -- coupe le SL (execution trop lente/erratique
 # ce soir, cf. incidents -33%/-28.7%), on laisse vivre les positions. Le TP reste actif.
+SPREAD_EXIT_DISABLED = True  # Steven 02/09 -- "SPREAD-EXIT aussi sur off" -- meme logique
+# que TP_INSTANT_SL_DISABLED : coupait une jambe des qu'elle sous-performait l'autre de 10%,
+# independamment du SL desactive ci-dessus. On laisse vivre les positions partout pareil.
 # MARKET MAKING ASYMETRIQUE (Steven 19/08, "poser un ordre d'achat + un ordre
 # de revente, encaisser le spread en boucle") : des qu'une position remplit,
 # on pose IMMEDIATEMENT un ordre de vente GTC passif a entree+SPREAD, en plus
@@ -14495,7 +14498,7 @@ class MultiTrader:
                         f"-> billet de loterie, marquee A FERMER",
                     )
                     continue
-            if both_legs_held >= 2:
+            if both_legs_held >= 2 and not SPREAD_EXIT_DISABLED:
                 # ── SPREAD-BASED EXIT V8.0 : coupe la jambe perdante tôt ──
                 # Quand l'autre jambe performe mieux de >10%, cette jambe est probablement
                 # le loser -> on la sort pour récupérer du capital au lieu de tout perdre.
