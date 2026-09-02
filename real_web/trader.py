@@ -14906,11 +14906,21 @@ class MultiTrader:
             _tp_next_target = (
                 PNL_TP_TARGETS[_tp_stage_now] if _tp_stage_now < len(PNL_TP_TARGETS) else TP_INSTANT_PCT
             )
+            # FIX (Steven 02/09, "je veux QUE du tp, j'avais ete clair") :
+            # le trailing pouvait vendre EN DESSOUS du prix d'achat --
+            # arme des +3% (TP_TRAIL_ARM_PCT), un repli brutal pouvait
+            # redonner tout le gain ET plus avant que la verification
+            # suivante ne rattrape, produisant une vente a PERTE etiquetee
+            # "tp_instant" (confirme en prod : entry=0.750 exit=0.620,
+            # pnl=-0.143$). Ajoute `_tp_pct > 0` : le trailing protege
+            # toujours un gain existant, mais ne peut plus jamais vendre
+            # sous le prix d'entree -- ce n'est plus un SL deguise.
             _tp_trigger = _tp_pct is not None and (
                 _tp_pct >= TP_INSTANT_PCT
                 or _tp_pct >= _tp_next_target
                 or (_tp_peak >= TP_TRAIL_ARM_PCT
-                    and _tp_pct <= _tp_peak * (1 - TP_TRAIL_GIVEBACK_PCT))
+                    and _tp_pct <= _tp_peak * (1 - TP_TRAIL_GIVEBACK_PCT)
+                    and _tp_pct > 0)
             )
             if _tp_trigger:
                 exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
