@@ -9066,6 +9066,33 @@ class MultiTrader:
             self._log(f"⚠️ [TWAP-ORACLE] {sym} {slug} {side} non rempli (err={res.get('error', '')})")
             return False
         avg = res.get("avg_cost") or ask
+        # CORRECTION POST-REMPLISSAGE (Steven 02/09, "le sizing de l'oracle
+        # part en steak") : confirme sur incident reel -- decision prise a
+        # ask=0.84 (palier plein 5$, coherent, le contrat n'etait PAS
+        # extreme a cet instant), mais le marche s'est effondre PENDANT
+        # l'execution de l'ordre -> rempli a 0.05 (100 parts, 5$), un niveau
+        # de prix qui aurait du declencher le palier 1$, pas 5$. Le palier
+        # etait calcule sur le prix AVANT l'ordre, jamais revu sur le prix
+        # REELLEMENT paye. Si le prix moyen reel tombe dans un palier
+        # nettement plus bas, revend l'excedent tout de suite pour ramener
+        # l'exposition a ce que ce palier autorise vraiment.
+        _correct_budget = _twap_oracle_bet_usd(avg)
+        _real_cost = round(filled * avg, 2)
+        if _real_cost > _correct_budget * 1.15:
+            _target_shares = round(_correct_budget / avg, 2) if avg > 0 else 0.0
+            _excess = round(filled - _target_shares, 2)
+            if _excess >= MIN_SELL_SHARES:
+                _sold_ex = self._sell_orphan(
+                    tid, _excess, f" {sym} {slug} {side} TWAP-ORACLE-RESIZE",
+                    entry_price=avg, symbol=sym, slug=slug, side=side,
+                )
+                if _sold_ex > 0:
+                    self._log(
+                        f"🔮 [TWAP-ORACLE] {sym} {slug} {side} rempli a {avg:.3f} "
+                        f"(palier reel {_correct_budget:.2f}$ != decide {budget:.2f}$) "
+                        f"-> excedent {_sold_ex} parts revendu pour recaler l'exposition"
+                    )
+                    filled = round(filled - _sold_ex, 2)
         self._add_slug_spent(mk, slug, round(filled * avg, 2))
         mk["open"][key] = {
             "symbol": sym, "slug": slug, "side": side, "mode": "real",
