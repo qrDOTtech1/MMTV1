@@ -9733,7 +9733,9 @@ class MultiTrader:
                     _tp_pct_o >= TP_INSTANT_PCT
                     or _tp_pct_o >= PNL_TP_TARGETS[0]
                     or (_tp_peak_o >= TP_TRAIL_ARM_PCT
-                        and _tp_pct_o <= _tp_peak_o * (1 - TP_TRAIL_GIVEBACK_PCT))
+                        and _tp_pct_o <= _tp_peak_o * (1 - TP_TRAIL_GIVEBACK_PCT)
+                        and _tp_pct_o > 0)   # meme fix que _manage_pnl_tier_exits (8b0389f) :
+                                              # le trailing ne doit jamais vendre sous l'entree
                 )
                 if _tp_trigger_o:
                     _tp_shares = pos.get("filled_shares", 0)
@@ -15144,7 +15146,11 @@ class MultiTrader:
                 # Stop trailing : giveback depuis le pic (override RL si actif)
                 effective_giveback = pos.get("rl_trail_giveback", PNL_TRAIL_GIVEBACK)
                 trail_floor_pct = peak_pct - effective_giveback
-                if pnl_pct <= trail_floor_pct or pnl_pct <= 0:
+                # Steven 02/09 ("je veux QUE du tp") : le "or pnl_pct <= 0" vendait
+                # ce runner meme repasse sous l'entree -- un SL de fait, deguise en
+                # trailing. Meme fix que le TP normal (8b0389f) et TP-INSTANT-ORPHAN :
+                # ce tranche ne se vend plus jamais si elle n'est plus en gain.
+                if pnl_pct > 0 and pnl_pct <= trail_floor_pct:
                     exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
                     if exit_price is None:
                         continue
