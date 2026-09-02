@@ -4061,6 +4061,35 @@ class MultiTrader:
                     self._collect_market_data()
                 except Exception as e:
                     self._tlog("collect_market_err", f"💥 [COLLECTE] erreur: {e}")
+                # PASSE 1 -- SL/TP EN PRIORITE ABSOLUE, TOUS SYMBOLES D'ABORD
+                # (Steven 02/09, enquete sur un SL declenche a -33% au lieu de
+                # -0.1%). Trouve : cette boucle traitait chaque symbole en
+                # SERIE, chacun enchainant preopen/maker/orphans/excedent PUIS
+                # SEULEMENT ENSUITE le SL/TP -- une etape lente (souvent un
+                # appel reseau qui retente sur 400, vu plusieurs fois ce soir)
+                # sur UN symbole retardait d'autant la verification SL de
+                # l'AUTRE. Preuve directe : prix deja a -16.4% a 15:51:00,
+                # verification suivante seulement a 15:51:19 (deja -27.9%) --
+                # 19s d'ecart pour un poll cense tourner toutes les 1.5s. Le
+                # SL/TP passe desormais en 1ere chose faite chaque cycle, pour
+                # TOUS les symboles, avant tout le reste (qui peut attendre
+                # 1.5s de plus sans consequence sur le capital engage).
+                for sym in SYMBOLS:
+                    mode = self.state["modes"].get(sym)
+                    if mode not in ("real", "paper"):
+                        continue
+                    if not self.state["markets"][sym]["open"]:
+                        continue
+                    try:
+                        self._log_position_prices(sym)
+                    except Exception as e:
+                        self._tlog(f"fastexit_price_err_{sym}", f"💥 [FAST-EXIT] {sym} prix erreur: {e}")
+                    try:
+                        self._manage_pnl_tier_exits(sym)
+                    except Exception as e:
+                        self._tlog(f"fastexit_pnl_err_{sym}", f"💥 [FAST-EXIT] {sym} pnl-exits erreur: {e}")
+
+                # PASSE 2 -- tout le reste, moins sensible au delai
                 for sym in SYMBOLS:
                     mode = self.state["modes"].get(sym)
                     # FIX (regression) : limiter au reel privait le PAPER de tout
@@ -4085,10 +4114,6 @@ class MultiTrader:
                     if not self.state["markets"][sym]["open"]:
                         continue
                     try:
-                        self._log_position_prices(sym)
-                    except Exception as e:
-                        self._tlog(f"fastexit_price_err_{sym}", f"💥 [FAST-EXIT] {sym} prix erreur: {e}")
-                    try:
                         self._manage_orphans(sym)
                     except Exception as e:
                         self._tlog(f"fastexit_orphan_err_{sym}", f"💥 [FAST-EXIT] {sym} orphans erreur: {e}")
@@ -4105,10 +4130,6 @@ class MultiTrader:
                         self._solder_excedent(sym)
                     except Exception as e:
                         self._tlog(f"fastexit_exc_err_{sym}", f"💥 [FAST-EXIT] {sym} excedent erreur: {e}")
-                    try:
-                        self._manage_pnl_tier_exits(sym)
-                    except Exception as e:
-                        self._tlog(f"fastexit_pnl_err_{sym}", f"💥 [FAST-EXIT] {sym} pnl-exits erreur: {e}")
                     # RENFORT (Steven 05/08) : APRES les sorties, pour que le
                     # marqueur sl_fired du cycle courant soit deja pose et que
                     # le renfort travaille sur la taille reelle post-coupe.
