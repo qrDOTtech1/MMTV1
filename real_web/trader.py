@@ -5544,14 +5544,32 @@ class MultiTrader:
                                         f"-- verifier manuellement",
                                     )
                             # position trackee par le bot mais qui n'existe plus reellement
-                            for tid in tracked_tids:
-                                if tid not in real_by_asset:
+                            # (Steven 02/09, trouve en audit : 3 positions detectees "fantomes"
+                            # a CHAQUE cycle pendant des heures sans jamais etre nettoyees --
+                            # cette boucle ne faisait QUE logger, jamais retirer de mk["open"].
+                            # Une position absente on-chain a un solde REEL de 0 (vendue ou
+                            # perdue a la resolution) -- rien a reclamer, juste a nettoyer.
+                            # Delai de grace de 45s pour ne pas effacer un ordre tout juste
+                            # rempli avant que data-api.polymarket.com ne l'ait indexe.)
+                            now_r = time.time()
+                            for sym in SYMBOLS:
+                                mk_r = self.state["markets"].get(sym, {})
+                                open_r = mk_r.get("open", {})
+                                for key in list(open_r.keys()):
+                                    pos = open_r[key]
+                                    tid = str(pos.get("token_id") or "")
+                                    if not tid or tid in real_by_asset:
+                                        continue
+                                    if now_r - pos.get("opened_ts", now_r) < 45:
+                                        continue
                                     self._tlog(
                                         f"reconcil_ghost_{tid[:8]}",
-                                        f"👻 [RECONCILIATION] position trackee par le bot mais absente "
+                                        f"👻 [RECONCILIATION] {sym} {key} position trackee mais absente "
                                         f"on-chain (token {tid[:12]}...) -- probablement deja resolue/vendue, "
-                                        f"l'etat interne n'a pas ete nettoye",
+                                        f"nettoyage de l'etat interne",
                                     )
+                                    open_r.pop(key, None)
+                            self._save()
             except Exception as e:
                 self._tlog("reconcil_err", f"⚠️ [RECONCILIATION] cycle echoue : {str(e)[:200]}")
             time.sleep(self.RECONCILIATION_INTERVAL_S)
