@@ -2004,6 +2004,25 @@ FAV_MIN_SECS = 10             # Steven 01/09 -- devenu le mecanisme PRINCIPAL, p
 # une strategie de repli rare -- doit pouvoir tirer sur presque toute la fenetre
 FAV_MAX_SECS = 280
 FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par investable
+
+# ── TWAP-ORACLE (Steven 02/09) ────────────────────────────────────────────
+# Deploye apres backtest 12h reelles (Binance 1s + prix Polymarket RECHERCHE
+# reels) : 61/62 gagnants une fois les 2 faux-positifs corriges (fenetres a
+# egalite exacte, cf. regle officielle Polymarket "TWAP >= prix de depart ->
+# Up"), soit ~+129$/h en simulation avec mise 5$. Mecanisme INDEPENDANT de
+# l'arb/favori Polymarket -- se fie exclusivement a la convergence TWAP
+# Binance vers le strike (voir WSFeed.twap_oracle_signal). EXCEPTION
+# EXPLICITE ET ISOLEE a la regle "jamais sous 0.50$" (decidee avec Steven,
+# 02/09) : ce mecanisme ne se fie pas au prix marche donc n'est pas concerne
+# par le risque (achat du cote que le marche croit perdant) qui a motive
+# cette regle ailleurs -- c'est au contraire son cas le plus rentable en
+# backtest (cotes 1-2c ou le marche n'a pas encore rattrape l'evidence).
+# HOLD TO RESOLUTION STRICT : strat="twap_oracle" volontairement absent de
+# la liste geree par _manage_pnl_tier_exits -> jamais de TP/SL dessus.
+TWAP_ORACLE_ENABLED = True
+TWAP_ORACLE_BET_USD = 5.0      # Steven 02/09 -- plancher demande, "augmenter si ca tourne bien"
+TWAP_ORACLE_MIN_SECS_LEFT = 5
+TWAP_ORACLE_MAX_SECS_LEFT = 50  # la formule n'est valide que dans la fenetre TWAP 60s
 # TP INSTANTANE UNIVERSEL (Steven 19/08, "meme prix 0.10, 0.35, 0.52, 0.65,
 # toujours meme chose") : s'applique a TOUTE position geree par
 # _manage_pnl_tier_exits (bothside/swing/fav/nearcert/copy), quel que soit le
@@ -8786,6 +8805,74 @@ class MultiTrader:
         )
         return True
 
+    def _try_twap_oracle(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
+        """TWAP-ORACLE (Steven 02/09) : voir le bloc de constantes TWAP_ORACLE_*
+        pour la justification complete (backtest 12h reelles, 61/62). Un seul
+        pari par fenetre, HOLD TO RESOLUTION -- strat="twap_oracle" n'est PAS
+        dans la liste geree par _manage_pnl_tier_exits, donc jamais de TP/SL
+        applique dessus une fois ouvert (voulu). PEUT acheter sous 0.50$,
+        exception assumee a la regle generale (decidee avec Steven)."""
+        if not TWAP_ORACLE_ENABLED or mode != "real":
+            return False
+        if mk.setdefault("twap_oracle_tried", {}).get(slug):
+            return False
+        now = synced_now()
+        secs_left = p.get("end_ts", now) - now
+        if not (TWAP_ORACLE_MIN_SECS_LEFT <= secs_left <= TWAP_ORACLE_MAX_SECS_LEFT):
+            return False
+        pair = p.get("pair")
+        if not pair:
+            return False
+        from core.btc_updown import _strike_at
+        strike = _strike_at(pair, p["start_ts"], slug=slug)
+        if not strike:
+            return False
+        if not hasattr(self, "_ws"):
+            return False
+        sig = self._ws.twap_oracle_signal(sym, strike, now, secs_left)
+        if not sig or not sig.get("certain"):
+            return False
+        side = sig["pred"]
+        if side not in outcomes:
+            return False
+        key = f"{slug}|{side}"
+        if key in mk["open"]:
+            return False
+        tid = token_ids[outcomes.index(side)]
+        _, ask, _ = quotes.get(side, (None, None, None))
+        if ask is None or ask <= 0 or ask >= 1:
+            return False
+        mk["twap_oracle_tried"][slug] = time.time()
+        investable = self._investable()
+        budget = round(min(TWAP_ORACLE_BET_USD, investable), 2)
+        if budget < MIN_BUDGET_USD:
+            return False
+        self._log(
+            f"🔮 [TWAP-ORACLE] {sym} {slug} {side} @ {ask:.3f} budget={budget:.2f}$ "
+            f"x_req={sig['x_req']:.4f} spot={sig['spot']:.4f} strike={strike:.4f} "
+            f"band={sig['band']:.4f} {secs_left:.0f}s restantes -> pari CERTAIN, hold to resolution"
+        )
+        with self._order_lock:
+            res = self._live.snipe_buy_market(tid, round(min(ask + 0.05, 0.99), 2), budget)
+        filled = res.get("filled_shares", 0.0)
+        if filled <= 0:
+            self._log(f"⚠️ [TWAP-ORACLE] {sym} {slug} {side} non rempli (err={res.get('error', '')})")
+            return False
+        avg = res.get("avg_cost") or ask
+        self._add_slug_spent(mk, slug, round(filled * avg, 2))
+        mk["open"][key] = {
+            "symbol": sym, "slug": slug, "side": side, "mode": "real",
+            "strat": "twap_oracle", "token_id": tid, "entry_price": avg,
+            "filled_shares": filled, "cost": round(filled * avg, 2),
+            "start_ts": p["start_ts"], "pair": pair, "end_ts": p["end_ts"],
+            "opened_ts": time.time(), "buffer": 0.0, "hold_to_resolution": True,
+        }
+        self._log(
+            f"✅ [TWAP-ORACLE] {sym} {slug} {side} {filled} parts @ {avg:.3f} "
+            f"({round(filled * avg, 2)}$) -> ouverte, HOLD TO RESOLUTION (pas de TP/SL)"
+        )
+        return True
+
     def _try_favorite(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
         """PARI DIRECTIONNEL SUR LE FAVORI (Steven 05/08, demande explicite).
 
@@ -12015,6 +12102,16 @@ class MultiTrader:
         self._log_market_prices(sym, slug, outcomes, quotes)
         now = synced_now()
         secs_left = p["end_ts"] - now
+
+        # TWAP-ORACLE (Steven 02/09) : INDEPENDANT de l'arb/favori Polymarket
+        # ci-dessous -- tente a CHAQUE cycle, ne bloque rien d'autre. Doit
+        # etre gate uniquement mode=="real" (fait a l'interieur de la
+        # fonction) pour ne jamais tourner en paper.
+        if mode == "real":
+            try:
+                self._try_twap_oracle(sym, m, p, quotes, outcomes, token_ids, mode, mk, slug)
+            except Exception as e:
+                self._tlog(f"twap_oracle_err_{sym}", f"💥 [TWAP-ORACLE] {sym} {slug} erreur: {e}")
         # FILTRE PAR STRAT (Steven 05/08, "je vois des near-certain qui
         # attendent pas resolution") : cette fonction gere l'arb bothside/
         # swing exclusivement. legs_held pilote TOUT son comportement en

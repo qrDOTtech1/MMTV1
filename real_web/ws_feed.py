@@ -17,9 +17,12 @@ recalcule le combined ask en temps reel. Si combined <= threshold -> callback pu
 instantane (< 100ms de latency vs ~15s en moyenne avant)."""
 
 import json
+import math
+import statistics
 import threading
 import time
 import logging
+from collections import deque
 
 from websocket import (
     WebSocketConnectionClosedException,
@@ -63,6 +66,11 @@ class WSFeed:
         # RTDS Chainlink TWAP : sym -> (value, ts), un dict par fenetre
         self._twap30 = {}
         self._twap60 = {}
+        # TWAP-ORACLE (Steven 02/09) : historique court (90s) de ticks
+        # Binance par symbole, pour reconstruire nous-memes une moyenne
+        # glissante causale et un ecart-type court terme -- voir
+        # twap_oracle_signal(). sym -> deque[(ts, mid_price)]
+        self._oracle_ticks = {s: deque() for s in PAIRS}
         # Polymarket : token_id -> {"bids": {px:sz}, "asks": {px:sz}, "ts": ts}
         self._books = {}
         self._poly_wanted = set()  # tokens a suivre (mis a jour par le trader)
@@ -407,14 +415,75 @@ class WSFeed:
                     d = msg.get("data", msg)
                     sym = pair_to_sym.get(d.get("s", "").upper())
                     if sym and "b" in d and "a" in d:
+                        now = time.time()
+                        mid = (float(d["b"]) + float(d["a"])) / 2
                         with self._lock:
                             self._spot[sym] = (
                                 float(d["b"]),
                                 float(d["a"]),
-                                time.time(),
+                                now,
                             )
+                            dq = self._oracle_ticks[sym]
+                            dq.append((now, mid))
+                            while dq and now - dq[0][0] > 90:
+                                dq.popleft()
             except Exception:
                 time.sleep(1.0)  # reconnexion
+
+    # ── TWAP-ORACLE (Steven 02/09) ──────────────────────────────────────
+    def twap_oracle_signal(self, sym, strike, now, secs_left,
+                            k_conf=2.5, twap_win=60, min_abs_margin_frac=0.0003):
+        """Calcule le signal "convergence" valide en backtest (12h reelles,
+        61/62 gagnants une fois les faux-positifs de tie corriges -- voir
+        session du 02/09). A r secondes de la fin de la fenetre TWAP 60s,
+        connaissant deja la portion ECOULEE (known_avg), calcule le prix
+        moyen requis sur les r secondes restantes pour inverser le resultat
+        (x_required) et le compare au spot actuel +/- une bande de
+        confiance. Retourne None si pas assez de donnees, sinon
+        {"pred": "Up"/"Down", "certain": bool, ...}.
+
+        BANDE = max(K*sigma_1s*sqrt(r), strike*min_abs_margin_frac) : le
+        plancher absolu est le FIX (Steven 02/09, cas SOL/XRP ou un marche
+        anormalement calme retrecissait la bande relative a presque rien,
+        classant "certain" une simple egalite de prix -- deux faux-positifs
+        confirmes sur les cotes extremes du backtest 12h)."""
+        sym = sym.replace("USDT", "") if "USDT" in sym else sym
+        with self._lock:
+            ticks = list(self._oracle_ticks.get(sym, ()))
+        if not ticks or strike is None or strike <= 0:
+            return None
+        r = min(secs_left, twap_win)
+        if r <= 0 or r >= twap_win:
+            return None
+
+        def avg_between(lo, hi):
+            vals = [p for t, p in ticks if lo <= t <= hi]
+            return sum(vals) / len(vals) if vals else None
+
+        known_avg = avg_between(now - twap_win, now - r)
+        if known_avg is None:
+            return None
+        spot = ticks[-1][1]
+
+        recent = [p for t, p in ticks if now - 120 <= t <= now]
+        sigma1 = None
+        if len(recent) >= 10:
+            diffs = [recent[i + 1] - recent[i] for i in range(len(recent) - 1)]
+            if len(diffs) >= 5:
+                sigma1 = statistics.pstdev(diffs)
+        if sigma1 is None:
+            return None  # pas assez d'historique pour juger la volatilite -> pas de certitude forcee
+
+        x_req = (strike * twap_win - known_avg * (twap_win - r)) / r
+        pred = "Up" if spot >= x_req else "Down"
+        certain = False
+        band = max(k_conf * sigma1 * math.sqrt(max(r, 1)), strike * min_abs_margin_frac)
+        if x_req > spot + band:
+            pred, certain = "Down", True
+        elif x_req < spot - band:
+            pred, certain = "Up", True
+        return {"pred": pred, "certain": certain, "spot": spot, "x_req": x_req,
+                "known_avg": known_avg, "sigma1": sigma1, "band": band}
 
     # ── RTDS Chainlink TWAP (Steven 02/09) ──────────────────────────────
     def _twap_loop(self):
