@@ -5975,6 +5975,19 @@ class MultiTrader:
             return 0.0
         before = self._live.position_size(token_id)
         before = before if before >= 0 else shares
+        # FIX (Steven 02/09, vraie cause trouvee via l'erreur enfin lisible :
+        # "not enough balance / allowance: balance: 1767542, order amount:
+        # 1770000") : round(shares, 2) arrondissait parfois VERS LE HAUT
+        # au-dela du solde on-chain reel (1.767542 arrondi a 1.77, qui
+        # n'existe pas) -> l'API rejette, la vente echoue a 400, retente,
+        # rejete pareil, jusqu'a resolution. Plafonne desormais sur le solde
+        # REEL deja lu ci-dessus (`before`) et arrondit vers le BAS (jamais
+        # au-dela de ce qu'on possede vraiment).
+        if before > 0:
+            shares = min(shares, before)
+        shares = math.floor(shares * 100) / 100
+        if shares < 0.01:
+            return 0.0
         with self._order_lock:
             # AGRESSIF (Steven 30/07, "orphelin evitable ?") : GTC pile au bid
             # etait un ordre MAKER, aucune garantie de croiser -> observe
@@ -8830,6 +8843,26 @@ class MultiTrader:
         if not hasattr(self, "_ws"):
             return False
         sig = self._ws.twap_oracle_signal(sym, strike, now, secs_left)
+        # DIAGNOSTIC CONTINU (Steven 02/09, "plus de ligne de log a propos
+        # de oracle") : jusqu'ici l'oracle ne loggait QUE quand il tirait --
+        # aucune trace de son raisonnement les 95% du temps ou il observe
+        # sans agir. Throttled a 1 ligne/2s par marche (comme FAV-DIAG) pour
+        # ne pas noyer le journal.
+        if sig:
+            self._tlog(
+                f"twapdiag_{sym}",
+                f"🔮 [TWAP-ORACLE-DIAG] {sym} {slug} pred={sig['pred']} certain={sig['certain']} "
+                f"x_req={sig['x_req']:.4f} spot={sig['spot']:.4f} strike={strike:.4f} "
+                f"band={sig['band']:.4f} sigma1s={sig['sigma1']:.5f} {secs_left:.0f}s restantes",
+                every=2.0,
+            )
+        else:
+            self._tlog(
+                f"twapdiag_{sym}",
+                f"🔮 [TWAP-ORACLE-DIAG] {sym} {slug} pas assez de donnees (historique WS "
+                f"insuffisant ou hors fenetre {secs_left:.0f}s restantes)",
+                every=5.0,
+            )
         if not sig or not sig.get("certain"):
             return False
         side = sig["pred"]
@@ -13761,7 +13794,11 @@ class MultiTrader:
             hist.append({"ts": round(now, 1), "price": round(cur, 4)})
             if len(hist) > PRICE_LOG_MAX_POINTS:
                 del hist[: len(hist) - PRICE_LOG_MAX_POINTS]
-            tag = f"[{pos['strat'].upper()}]" if pos.get("strat") else ""
+            # tiret plutot que underscore (Steven 02/09) : le classificateur
+            # du journal DetailDesk (JournalTab.tsx) n'extrait que
+            # [A-Z0-9-]+ entre crochets -- un underscore casse le match et
+            # la ligne retombe dans "Autre" sans jamais etre categorisee.
+            tag = f"[{pos['strat'].upper().replace('_', '-')}]" if pos.get("strat") else ""
             self._log(
                 f"💹 [PRIX]{tag} {sym} {pos['slug']} {pos['side']} {cur:.3f} "
                 f"(entree {entry:.3f}, {pnl_pct:+.1f}%)"
