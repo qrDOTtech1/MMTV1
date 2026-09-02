@@ -2078,7 +2078,8 @@ TP_INSTANT_PCT = 0.75  # plafond dur : vend TOUT de suite si atteint, meme
 # representatif). Sur le dataset RECHERCHE complet (142 135 lignes, 5656
 # series), le SL serre (voir PNL_SL_PCT) est nettement meilleur que pas de
 # SL du tout. Voir le commentaire de PNL_SL_PCT pour le detail du sweep.
-TP_INSTANT_SL_DISABLED = False
+TP_INSTANT_SL_DISABLED = True  # Steven 02/09 -- coupe le SL (execution trop lente/erratique
+# ce soir, cf. incidents -33%/-28.7%), on laisse vivre les positions. Le TP reste actif.
 # MARKET MAKING ASYMETRIQUE (Steven 19/08, "poser un ordre d'achat + un ordre
 # de revente, encaisser le spread en boucle") : des qu'une position remplit,
 # on pose IMMEDIATEMENT un ordre de vente GTC passif a entree+SPREAD, en plus
