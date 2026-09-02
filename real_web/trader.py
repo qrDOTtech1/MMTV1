@@ -9182,15 +9182,30 @@ class MultiTrader:
             shares = pos.get("filled_shares", 0)
             if entry <= 0 or shares <= 0:
                 continue
-            cur_bid = self._get_bid(pos)
-            if cur_bid is None:
-                continue
-            pct = (cur_bid - entry) / entry
+            # Steven 02/09 ("elle aurait pu capturer du benefice mais il ne
+            # s'est rien passe") : sur ces contrats a 1c, le bid disparait
+            # souvent quelques secondes (carnet fin) MEME quand le prix a
+            # reellement pique -- l'ancien code utilisait _get_bid() (bid
+            # strict) pour TOUT, et un simple `continue` sur bid absent
+            # geleait le pic memorise, ratant des pics reels (confirme : un
+            # bid a 0.29 vu sur l'appli Polymarket n'a jamais ete lu ici,
+            # price_log reste bloque a 0.010 tout du long). On separe
+            # desormais : le PIC est mesure au mieux dispo (mid/ask via
+            # _live_price, jamais bloquant), la VENTE reste conditionnee a
+            # un vrai bid executable (_get_bid).
+            live_px = self._live_price(pos.get("token_id"), None, pos.get("side"))
+            if live_px is not None:
+                live_pct = (live_px - entry) / entry
+                peak = pos.get("_oracle_trail_peak", 0.0)
+                if live_pct > peak:
+                    pos["_oracle_trail_peak"] = peak = live_pct
             peak = pos.get("_oracle_trail_peak", 0.0)
-            if pct > peak:
-                pos["_oracle_trail_peak"] = peak = pct
             if peak < TWAP_ORACLE_TRAIL_ARM_PCT:
                 continue  # pas encore assez de gain pour armer le verrou
+            cur_bid = self._get_bid(pos)
+            if cur_bid is None:
+                continue  # arme mais pas de bid executable ce cycle -> reessaie au prochain
+            pct = (cur_bid - entry) / entry
             if pct > peak * (1 - TWAP_ORACLE_TRAIL_GIVEBACK_PCT):
                 continue  # pas encore assez retrace depuis le pic
             sold = self._sell_orphan(
