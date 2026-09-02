@@ -12993,7 +12993,21 @@ class MultiTrader:
                         f"non couvrable a profit -> marquee A FERMER"
                     )
             return legs_held > 0
-        for i, (side, token_id) in enumerate(zip(outcomes, token_ids)):
+        # ORDRE FAVORI D'ABORD (Steven 02/09, "poly renvoi dans l'ordre up/down
+        # et notre bot prend le premier donc seulement up") : cette boucle ne
+        # tente QUE l'element i=0 (voir le "if i > 0: break" plus bas, choix
+        # volontaire du 19/08 pour ne jamais ouvrir de 2e jambe). Mais elle
+        # itérait sur `outcomes` tel que renvoye par Polymarket, quasi
+        # toujours ["Up", "Down"] dans cet ordre fixe -> i=0 etait TOUJOURS Up,
+        # jamais Down, peu importe lequel etait reellement favori. Preuve en
+        # prod : 50 entrees reelles sur ce chemin en ~22h, 50 Up, 0 Down.
+        # fav_side_ordering existe deja et sert cet exact usage un peu plus
+        # haut (tri de leg_data_immediate pour le chemin arb parallele) --
+        # applique ici au chemin sequentiel qui en avait besoin aussi.
+        _seq_order = list(zip(outcomes, token_ids))
+        if fav_side:
+            _seq_order.sort(key=lambda leg: 0 if leg[0] == fav_side else 1)
+        for i, (side, token_id) in enumerate(_seq_order):
             # PLUS DE PAIRE (Steven 19/08, "on s'en fou de la jambe down ...
             # vu qu'on va tp directement la premiere leg ouvrir la deuxieme
             # n'a plus d'interet") : TP instantane universel rend le
