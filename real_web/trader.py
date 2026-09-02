@@ -15369,8 +15369,33 @@ class MultiTrader:
                         and not api_empty
                         and now > pos["end_ts"] + 180
                     ):
-                        # Liste NON-VIDE + position absente = redeemee = gagnee
-                        won = True
+                        # BUG CRITIQUE TROUVE (Steven 02/09, "il enquete sur
+                        # les pertes") : "position absente de la liste" n'est
+                        # PAS synonyme de "gagnee et redeemee" -- confirme sur
+                        # 2 positions reelles (BTC+ETH 1788361500, achat
+                        # TWAP-ORACLE @0.01) dont le prix observe s'est
+                        # effondre a 0.001 (perdantes, quasi certaines) mais
+                        # que ce code marquait quand meme won=True -> +495$
+                        # de "gain" credite dans mk['trades'] qui n'a JAMAIS
+                        # ete un vrai encaissement (le compteur PNL-REEL-
+                        # ONCHAIN, source Polymarket independante, ne montre
+                        # que quelques $ de redeems reels sur toute la
+                        # session). L'API data-api semble aussi retirer les
+                        # positions PERDANTES a valeur nulle de la liste, pas
+                        # seulement les gagnantes reclamees -- l'hypothese du
+                        # 25/07 ("les perdantes restent a curVal 0") est
+                        # fausse dans ce cas. On utilise desormais le DERNIER
+                        # PRIX REELLEMENT OBSERVE (price_log, deja collecte en
+                        # continu pendant la detention) comme depatageur :
+                        # >=0.5 -> probablement gagnee, <0.5 -> probablement
+                        # perdue. Fallback sur l'ancien comportement (won=True)
+                        # UNIQUEMENT si aucun historique de prix n'existe.
+                        _hist = pos.get("price_log") or []
+                        _last_px = _hist[-1]["price"] if _hist else None
+                        if _last_px is not None:
+                            won = _last_px >= 0.5
+                        else:
+                            won = True
                     elif (
                         out.get("found") is False
                         and api_empty
