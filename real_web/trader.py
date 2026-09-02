@@ -2056,6 +2056,17 @@ TWAP_ORACLE_MAX_SECS_LEFT = 120  # Steven 02/09 -- releve 58->120, voir REGIME P
 # la formule "convergence" existante (plus precise une fois la fenetre TWAP
 # reellement commencee).
 TWAP_ORACLE_PROB_THRESHOLD = 0.95
+# VERROU DE PROFIT SUR LA VALEUR (Steven 02/09, "la pos valait 27$ ... il n'a
+# pas TP et ca s'est resolu dans l'autre sens ... un TP qui traque la VALEUR
+# de la pos, plus focus sur la valeur") : le hold-to-resolution strict expose
+# un gain papier enorme (+450% observe) a un retournement total avant la
+# cloture. Contrairement au TP normal (paliers fixes 5/15/20%, non applique
+# aux positions oracle), celui-ci ne s'arme qu'une fois le gain VRAIMENT
+# large (ARM_PCT) -- laisse les petits mouvements tranquilles, protege
+# seulement contre l'aller-retour +450% -> perte totale. Vend TOUT (pas de
+# palier) au retracement, capital recycle immediatement.
+TWAP_ORACLE_TRAIL_ARM_PCT = 1.0     # s'arme a partir de +100% (position doublee)
+TWAP_ORACLE_TRAIL_GIVEBACK_PCT = 0.30  # vend si le prix redonne 30% de son pic
 # PALIER DE MISE DEGRESSIF PAR PRIX (Steven 02/09, "si ca passe on gagne quand
 # meme bcp mais sinon ca perd que 1$") : une mise FIXE de 5$ traite pareil un
 # pari a 90c (variance faible) et un pari a 1c (variance maximale : soit -100%
@@ -4123,6 +4134,10 @@ class MultiTrader:
                         self._manage_pnl_tier_exits(sym)
                     except Exception as e:
                         self._tlog(f"fastexit_pnl_err_{sym}", f"💥 [FAST-EXIT] {sym} pnl-exits erreur: {e}")
+                    try:
+                        self._manage_oracle_trailing(sym)
+                    except Exception as e:
+                        self._tlog(f"fastexit_oracletrail_err_{sym}", f"💥 [FAST-EXIT] {sym} oracle-trailing erreur: {e}")
 
                 _pass1_syms = [
                     sym for sym in SYMBOLS
@@ -9152,6 +9167,52 @@ class MultiTrader:
             f"({round(filled * avg, 2)}$) -> ouverte, HOLD TO RESOLUTION (pas de TP/SL)"
         )
         return True
+
+    def _manage_oracle_trailing(self, sym):
+        """VERROU DE PROFIT sur la VALEUR pour les positions TWAP-ORACLE
+        (Steven 02/09) : voir TWAP_ORACLE_TRAIL_* pour la justification.
+        Ne touche QUE strat="twap_oracle" -- les autres restent gerees par
+        _manage_pnl_tier_exits, aucun chevauchement possible (cette derniere
+        ignore deja explicitement "twap_oracle" dans sa liste de strats)."""
+        mk = self.state["markets"][sym]
+        for key, pos in list(mk["open"].items()):
+            if pos.get("strat") != "twap_oracle" or pos.get("mode") != "real":
+                continue
+            entry = pos.get("entry_price", 0)
+            shares = pos.get("filled_shares", 0)
+            if entry <= 0 or shares <= 0:
+                continue
+            cur_bid = self._get_bid(pos)
+            if cur_bid is None:
+                continue
+            pct = (cur_bid - entry) / entry
+            peak = pos.get("_oracle_trail_peak", 0.0)
+            if pct > peak:
+                pos["_oracle_trail_peak"] = peak = pct
+            if peak < TWAP_ORACLE_TRAIL_ARM_PCT:
+                continue  # pas encore assez de gain pour armer le verrou
+            if pct > peak * (1 - TWAP_ORACLE_TRAIL_GIVEBACK_PCT):
+                continue  # pas encore assez retrace depuis le pic
+            sold = self._sell_orphan(
+                pos["token_id"], shares,
+                f" {sym} {pos['slug']} {pos['side']} TWAP-ORACLE-TRAIL",
+                entry_price=entry, symbol=sym, slug=pos.get("slug"), side=pos.get("side"),
+            )
+            if sold <= 0:
+                continue
+            realized = round(sold * (cur_bid - entry), 3)
+            pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + realized, 3)
+            pos["filled_shares"] = round(shares - sold, 2)
+            if pos["filled_shares"] < MIN_SELL_SHARES:
+                pnl = pos["realized_pnl"]
+                pos.update(win=pnl > 0, pnl=pnl, resolved_by="oracle_trail", exit_price=round(cur_bid, 3))
+                mk["trades"].append(pos)
+                del mk["open"][key]
+                self._record_trade_pnl(sym, pnl)
+                self._log(
+                    f"🔒 [TWAP-ORACLE-TRAIL] {sym} {pos['slug']} {pos['side']} pic={peak:+.0%} "
+                    f"-> verrouille @ {cur_bid:.3f} (entree {entry:.3f}) pnl={pnl:+.3f}$"
+                )
 
     def _try_favorite(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
         """PARI DIRECTIONNEL SUR LE FAVORI (Steven 05/08, demande explicite).
