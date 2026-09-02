@@ -169,6 +169,14 @@ FAV_TARGET_NET_USD = 0.30  # gain net vise quand le favori gagne (dog deja dedui
 # (max_payable), jamais surpaye pour forcer la paire.
 FORCE_PAIR_MAX_RETRIES = 3
 FORCE_PAIR_RETRY_SLEEP_S = 0.4
+# FIX (Steven 02/09, enquete sur FORCE_SELL 100% perdant) : le plafond de
+# prix de la 2e jambe utilisait PAIR_COMPLETION_MAX_COMBINED, desactive a
+# 99.0 depuis le 19/08 (meme bug deja trouve et corrige ce soir sur
+# HEDGE-NEAR -- pas re-applique ici). "jamais surpaye pour forcer la
+# paire" etait donc un plafond FICTIF (99.0 - prix jambe1 ~= 98$, aucune
+# limite reelle). Vrai plafond restaure : combine final <= 1.03 (perte
+# max ~3% si la paire se complete, au lieu d'un plafond inoperant).
+FORCE_PAIR_MAX_COMBINED = 1.03
 FAVORITE_BET_MAX_USD = 12.0  # plafond dur de mise favori (post-validation)
 FAV_MAX_PRICE = 0.97  # au-dela, la mise requise explose pour 0.30$ -> skip hedge
 # ── VALIDATION HEDGE (Steven 23/07, "uniquement des mises en $, max 1$/pos en
@@ -13366,7 +13374,7 @@ class MultiTrader:
                         break
                 if fill_price is not None:
                     max_payable = round(
-                        max(0.05, PAIR_COMPLETION_MAX_COMBINED - fill_price), 3
+                        max(0.05, FORCE_PAIR_MAX_COMBINED - fill_price), 3
                     )
                 else:
                     max_payable = 0.50
@@ -13570,7 +13578,7 @@ class MultiTrader:
                         )
                         if fill_price is not None:
                             max_payable = round(
-                        max(0.05, PAIR_COMPLETION_MAX_COMBINED - fill_price), 3
+                        max(0.05, FORCE_PAIR_MAX_COMBINED - fill_price), 3
                     )
                         else:
                             max_payable = 0.50
