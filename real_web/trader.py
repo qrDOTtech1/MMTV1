@@ -5468,10 +5468,90 @@ class MultiTrader:
 
         threading.Thread(target=_boucle_collecte, daemon=True, name="collecte-marche").start()
         threading.Thread(target=self._gatekeeper_loop, daemon=True, name="gatekeeper").start()
+        threading.Thread(target=self._boucle_reconciliation, daemon=True, name="reconciliation").start()
         self._log(
-            "🧠 [RECHERCHE] collecte de marche + gatekeeper demarres "
-            "(independants du trading, mode ombre)"
+            "🧠 [RECHERCHE] collecte de marche + gatekeeper + reconciliation "
+            "demarres (independants du trading, mode ombre)"
         )
+
+    RECONCILIATION_INTERVAL_S = 60
+
+    def _boucle_reconciliation(self):
+        """RECONCILIATION AUTONOME (Steven 02/09, "active reconciliation
+        auto l'adresse est dans .env") : independante de _running, comme
+        demarrer_recherche() -- tourne MEME quand le bot est arrete/stoppe.
+
+        Trouve en audit : 3 positions resolues depuis 18-21h restaient
+        "ouvertes" dans l'etat interne (gains eventuels non reclames)
+        parce que redeem_resolved() n'etait appele QUE depuis la boucle
+        principale de trading, elle-meme gatee par _running -- un arret
+        manuel de plusieurs heures geleait donc aussi les redeem.
+
+        Deux taches independantes de _running :
+        1. redeem_resolved() -- reclame tout gain deja tranche par
+           Polymarket, peu importe si le bot trade ou non.
+        2. Comparaison positions reelles (data-api) vs mk['open'] trackees
+           -- log tout ecart (position reelle non trackee ou inversement)
+           au lieu de decouvrir le trou des heures plus tard en audit."""
+        while True:
+            try:
+                if self._live is not None:
+                    try:
+                        n = self._live.redeem_resolved()
+                        if n:
+                            self._log(f"💰 [RECONCILIATION] {n} gain(s) reclame(s) (independant de _running)")
+                    except Exception as e:
+                        self._tlog("reconcil_redeem_err", f"⚠️ [RECONCILIATION] redeem echoue : {str(e)[:160]}")
+
+                    funder = os.environ.get("POLY_FUNDER_ADDRESS", "")
+                    if funder:
+                        try:
+                            import requests as _rq
+
+                            r = _rq.get(
+                                "https://data-api.polymarket.com/positions",
+                                params={"user": funder}, timeout=10,
+                                headers={"User-Agent": "Mozilla/5.0"},
+                            )
+                            real_positions = r.json() if r.status_code == 200 else []
+                            if not isinstance(real_positions, list):
+                                real_positions = []
+                        except Exception:
+                            real_positions = None
+
+                        if real_positions is not None:
+                            real_by_asset = {
+                                str(p.get("asset")): p for p in real_positions
+                                if (p.get("size") or 0) > 0.01
+                            }
+                            tracked_tids = set()
+                            for sym in SYMBOLS:
+                                for pos in self.state["markets"].get(sym, {}).get("open", {}).values():
+                                    tid = pos.get("token_id")
+                                    if tid:
+                                        tracked_tids.add(str(tid))
+                            # position reelle avec de la valeur, jamais trackee par le bot
+                            for asset, p in real_by_asset.items():
+                                if asset not in tracked_tids and (p.get("currentValue") or 0) > 0.05:
+                                    self._tlog(
+                                        f"reconcil_untracked_{asset[:8]}",
+                                        f"🚨 [RECONCILIATION] position reelle NON TRACKEE : "
+                                        f"{p.get('title', '?')} {p.get('outcome', '?')} "
+                                        f"{p.get('size', 0):.2f} parts valeur={p.get('currentValue', 0):.2f}$ "
+                                        f"-- verifier manuellement",
+                                    )
+                            # position trackee par le bot mais qui n'existe plus reellement
+                            for tid in tracked_tids:
+                                if tid not in real_by_asset:
+                                    self._tlog(
+                                        f"reconcil_ghost_{tid[:8]}",
+                                        f"👻 [RECONCILIATION] position trackee par le bot mais absente "
+                                        f"on-chain (token {tid[:12]}...) -- probablement deja resolue/vendue, "
+                                        f"l'etat interne n'a pas ete nettoye",
+                                    )
+            except Exception as e:
+                self._tlog("reconcil_err", f"⚠️ [RECONCILIATION] cycle echoue : {str(e)[:200]}")
+            time.sleep(self.RECONCILIATION_INTERVAL_S)
 
     def _gatekeeper_loop(self):
         """ENTRAINEMENT AUTONOME, MODE OMBRE (Steven 11/08, "il s'entraine
