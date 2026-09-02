@@ -2076,6 +2076,17 @@ TWAP_ORACLE_PROB_THRESHOLD = 0.95
 # palier) au retracement, capital recycle immediatement.
 TWAP_ORACLE_TRAIL_ARM_PCT = 1.0     # s'arme a partir de +100% (position doublee)
 TWAP_ORACLE_TRAIL_GIVEBACK_PCT = 0.30  # vend si le prix redonne 30% de son pic
+# PALIERS POUR LES TICKETS "1c" (Steven 02/09, "les pos a 1c ne devraient
+# jamais hold to resolution, souvent il y a quand meme de l'argent a recup --
+# sinon quand il achete au-dessus (genre 80c) ca se passe bien") : un ticket
+# a 1c est le pari a la variance la PLUS extreme (soit -100% soit +milliers%)
+# -- le hold pur + le verrou unique ci-dessus (arme a +100% seulement une
+# fois, vend TOUT) laisse tout le gain papier expose jusqu'a ce seuil. En
+# dessous de TWAP_ORACLE_CHEAP_ENTRY_MAX, on prend la moitie des parts
+# restantes a CHAQUE palier de gain -- au-dessus (achat deja convaincu comme
+# 80c), rien ne change, le hold pur continue de bien fonctionner.
+TWAP_ORACLE_CHEAP_ENTRY_MAX = 0.05
+TWAP_ORACLE_CHEAP_TP_TARGETS = (1.0, 3.0, 8.0)  # +100% / +300% / +800%
 # PALIER DE MISE DEGRESSIF PAR PRIX (Steven 02/09, "si ca passe on gagne quand
 # meme bcp mais sinon ca perd que 1$") : une mise FIXE de 5$ traite pareil un
 # pari a 90c (variance faible) et un pari a 1c (variance maximale : soit -100%
@@ -5844,6 +5855,19 @@ class MultiTrader:
         bid_depth = round(sum(sz for _, sz in bids[:3]), 2) if bids else 0.0
         ask_depth = round(sum(sz for _, sz in asks[:3]), 2) if asks else 0.0
         _tot_depth = bid_depth + ask_depth
+        # TWAP CHAINLINK OFFICIELLE (Steven 02/09, "recupere aussi ce flux dans
+        # notre db comme le reste de recherche") : Polymarket resout sur CE
+        # flux (voir description de marche -- "resolution source: Chainlink
+        # BTC/USD TWAP-60s"), pas sur Binance. On l'accumule ici, cote a cote
+        # avec le spot Binance deja capture, pour pouvoir un jour mesurer/
+        # backtester l'ecart Binance-vs-Chainlink au lieu de le deviner.
+        twap30 = twap60 = None
+        try:
+            if hasattr(self, "_ws"):
+                twap30 = self._ws.twap(symbol, window_s=30)
+                twap60 = self._ws.twap(symbol, window_s=60)
+        except Exception:
+            pass
         ligne = {
             "ts": round(time.time(), 1), "symbol": symbol, "slug": slug, "side": side,
             "hour_utc": hour_utc, "dow": dow, "danger": danger,
@@ -5862,6 +5886,7 @@ class MultiTrader:
             "bid_depth_top3": bid_depth, "ask_depth_top3": ask_depth,
             "imbalance_bid_pct": round(100 * bid_depth / _tot_depth, 1) if _tot_depth > 0 else None,
             "triggered": triggered,
+            "twap30_chainlink": twap30, "twap60_chainlink": twap60,
         }
         # AJOUT SEUL dans un fichier dedie (cf. MARKET_DATA_FILE) : ne passe
         # plus par self.state, donc _save() reste leger meme avec des jours
@@ -9060,6 +9085,29 @@ class MultiTrader:
         if not sig or not sig.get("certain"):
             return False
         side = sig["pred"]
+        # VETO CHAINLINK (Steven 02/09, "en reel on constate quasiment QUE
+        # des pertes") : trouve sur un vrai cas -- notre calcul (Binance)
+        # disait Down avec 82% du band de confiance, mais l'ecart REEL final
+        # (strike vs moyenne) n'etait que de 6$ sur 77460$ (0.008%), et
+        # Polymarket resout sur le TWAP OFFICIEL Chainlink (voir description
+        # de marche : "resolution source... Chainlink BTC/USD TWAP-60s"), pas
+        # sur Binance -- un ecart aussi mince peut basculer selon la source.
+        # self._ws.twap() lit ce MEME flux Chainlink officiel (RTDS, deja
+        # cable ailleurs dans ce fichier) : si dispo et frais, on verifie que
+        # la VRAIE source de resolution est d'accord avec nous avant de
+        # parier, plutot que de ne se fier qu'a notre proxy Binance.
+        _cl_twap60 = self._ws.twap(pair, window_s=60)
+        if _cl_twap60 is not None:
+            _cl_side = "Up" if _cl_twap60 >= strike else "Down"
+            if _cl_side != side:
+                self._tlog(
+                    f"twaporacle_cl_veto_{sym}",
+                    f"🚫 [TWAP-ORACLE] {sym} {slug} {side} rejete -> Chainlink TWAP60 "
+                    f"({_cl_twap60:.4f} vs strike {strike:.4f}) donne {_cl_side}, en desaccord "
+                    f"avec la source reelle de resolution",
+                    every=5.0,
+                )
+                return False
         if side not in outcomes:
             return False
         key = f"{slug}|{side}"
@@ -9211,6 +9259,42 @@ class MultiTrader:
                 if live_pct > peak:
                     pos["_oracle_trail_peak"] = peak = live_pct
             peak = pos.get("_oracle_trail_peak", 0.0)
+
+            # PALIERS "TICKET 1c" (voir TWAP_ORACLE_CHEAP_* ci-dessus) : prend
+            # la moitie des parts RESTANTES a chaque palier de gain franchi,
+            # tant que l'entree est un ticket bon marche. Verifie sur le VRAI
+            # bid (pas le pic estime) -- on ne vend jamais dans une cotation
+            # fantome.
+            if entry <= TWAP_ORACLE_CHEAP_ENTRY_MAX:
+                stage = pos.get("_oracle_cheap_tp_stage", 0)
+                if stage < len(TWAP_ORACLE_CHEAP_TP_TARGETS) and peak >= TWAP_ORACLE_CHEAP_TP_TARGETS[stage]:
+                    _cb = self._get_bid(pos)
+                    if _cb is not None and (_cb - entry) / entry >= TWAP_ORACLE_CHEAP_TP_TARGETS[stage]:
+                        _sell_n = round(shares / 2, 2)
+                        if _sell_n >= MIN_SELL_SHARES:
+                            _sold = self._sell_orphan(
+                                pos["token_id"], _sell_n,
+                                f" {sym} {pos['slug']} {pos['side']} TWAP-ORACLE-CHEAP-TP{stage + 1}",
+                                entry_price=entry, symbol=sym, slug=pos.get("slug"), side=pos.get("side"),
+                            )
+                            if _sold > 0:
+                                _realized = round(_sold * (_cb - entry), 3)
+                                pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + _realized, 3)
+                                pos["filled_shares"] = shares = round(shares - _sold, 2)
+                                pos["_oracle_cheap_tp_stage"] = stage + 1
+                                self._log(
+                                    f"💰 [TWAP-ORACLE-CHEAP-TP{stage + 1}] {sym} {pos['slug']} {pos['side']} "
+                                    f"+{TWAP_ORACLE_CHEAP_TP_TARGETS[stage] * 100:.0f}% vend {_sold} @ {_cb:.3f} "
+                                    f"(entree {entry:.3f}) realise={_realized:+.3f}$ reste={shares}"
+                                )
+                                if shares < MIN_SELL_SHARES:
+                                    pnl = pos["realized_pnl"]
+                                    pos.update(win=pnl > 0, pnl=pnl, resolved_by="oracle_cheap_tp", exit_price=round(_cb, 3))
+                                    mk["trades"].append(pos)
+                                    del mk["open"][key]
+                                    self._record_trade_pnl(sym, pnl)
+                                continue  # reevalue le verrou de trail au prochain cycle
+
             if peak < TWAP_ORACLE_TRAIL_ARM_PCT:
                 continue  # pas encore assez de gain pour armer le verrou
             cur_bid = self._get_bid(pos)
