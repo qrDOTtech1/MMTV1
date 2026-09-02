@@ -2065,6 +2065,11 @@ TWAP_ORACLE_MAX_SECS_LEFT = 120  # Steven 02/09 -- releve 58->120, voir REGIME P
 # la formule "convergence" existante (plus precise une fois la fenetre TWAP
 # reellement commencee).
 TWAP_ORACLE_PROB_THRESHOLD = 0.95
+# ESSAI "PARI PRECOCE" (Steven 03/09, "essayons") : 1$ des le tout premier
+# pred brut (meme non 'certain'), strat separee de l'oracle normal pour
+# comparer les stats sans rien casser du mecanisme existant.
+TWAP_ORACLE_EARLY_ENABLED = True
+TWAP_ORACLE_EARLY_BET_USD = 1.0
 # VERROU DE PROFIT SUR LA VALEUR (Steven 02/09, "la pos valait 27$ ... il n'a
 # pas TP et ca s'est resolu dans l'autre sens ... un TP qui traque la VALEUR
 # de la pos, plus focus sur la valeur") : le hold-to-resolution strict expose
@@ -9082,6 +9087,50 @@ class MultiTrader:
                 f"insuffisant ou hors fenetre {secs_left:.0f}s restantes)",
                 every=5.0,
             )
+        # ESSAI "PARI PRECOCE" (Steven 03/09, "au moment ou il attend si
+        # certain=true il peut deja placer 1$ ... essayons") : plutot que
+        # d'attendre la confirmation statistique (certain=True), place un
+        # tout petit 1$ des le tout PREMIER pred brut de la fenetre, meme
+        # non confirme. strat DEDIEE ("twap_oracle_early") pour comparer ses
+        # stats separement du pari 'certain' normal ci-dessous, qui continue
+        # de tourner INCHANGE (les 2 peuvent coexister sur la meme fenetre).
+        # Backtest 24h/6 marches AVANT deploiement : win rate du tout premier
+        # pred brut vs celui du pred certain -- voir log de session pour le
+        # resultat chiffre.
+        if TWAP_ORACLE_EARLY_ENABLED and sig and mode == "real":
+            _early_tried = mk.setdefault("twap_oracle_early_tried", {})
+            _early_key = f"{slug}|{sig['pred']}"
+            if _early_key not in _early_tried and sig["pred"] in outcomes:
+                _early_side = sig["pred"]
+                _early_open_key = f"{slug}|{_early_side}"
+                if _early_open_key not in mk["open"]:
+                    _early_tried[_early_key] = time.time()
+                    _etid = token_ids[outcomes.index(_early_side)]
+                    _e_ask = quotes.get(_early_side, (None, None, None))[1]
+                    if _e_ask is not None and 0 < _e_ask < 1:
+                        _e_budget = round(min(TWAP_ORACLE_EARLY_BET_USD, self._investable()), 2)
+                        if _e_budget >= MIN_BUDGET_USD:
+                            with self._order_lock:
+                                _e_res = self._live.snipe_buy_market(
+                                    _etid, round(min(_e_ask + 0.05, 0.99), 2), _e_budget,
+                                )
+                            _e_filled = _e_res.get("filled_shares", 0.0)
+                            if _e_filled > 0:
+                                _e_avg = _e_res.get("avg_cost") or _e_ask
+                                self._add_slug_spent(mk, slug, round(_e_filled * _e_avg, 2))
+                                mk["open"][_early_open_key] = {
+                                    "symbol": sym, "slug": slug, "side": _early_side, "mode": "real",
+                                    "strat": "twap_oracle_early", "token_id": _etid, "entry_price": _e_avg,
+                                    "filled_shares": _e_filled, "cost": round(_e_filled * _e_avg, 2),
+                                    "start_ts": p["start_ts"], "pair": pair, "end_ts": p["end_ts"],
+                                    "opened_ts": time.time(), "buffer": 0.0, "hold_to_resolution": True,
+                                }
+                                self._log(
+                                    f"🧪 [TWAP-ORACLE-EARLY] {sym} {slug} {_early_side} "
+                                    f"{_e_filled} parts @ {_e_avg:.3f} ({round(_e_filled * _e_avg, 2)}$) "
+                                    f"certain={sig['certain']} {secs_left:.0f}s restantes -> ESSAI, hold to resolution"
+                                )
+
         if not sig or not sig.get("certain"):
             return False
         side = sig["pred"]
@@ -9235,7 +9284,7 @@ class MultiTrader:
         ignore deja explicitement "twap_oracle" dans sa liste de strats)."""
         mk = self.state["markets"][sym]
         for key, pos in list(mk["open"].items()):
-            if pos.get("strat") != "twap_oracle" or pos.get("mode") != "real":
+            if pos.get("strat") not in ("twap_oracle", "twap_oracle_early") or pos.get("mode") != "real":
                 continue
             entry = pos.get("entry_price", 0)
             shares = pos.get("filled_shares", 0)

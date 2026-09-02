@@ -463,7 +463,17 @@ class WSFeed:
         known_avg = avg_between(now - twap_win, now - r)
         if known_avg is None:
             return None
-        spot = ticks[-1][1]
+        # GARDE DE FRAICHEUR (Steven 03/09, spot BTC fige a la meme valeur
+        # exacte pendant 16s+ dans les logs pendant qu'ETH bougeait) : ce
+        # spot() ordinaire a deja STALE_S, mais twap_oracle_signal() lisait
+        # le dernier tick SANS jamais verifier son age -- un flux qui cale
+        # sur un symbole se traduit en un x_req/spot figes, potentiellement
+        # classes "certain" sur des donnees mortes plutot que sur du marche
+        # reel. Meme seuil que spot().
+        last_ts, last_px = ticks[-1]
+        if now - last_ts > STALE_S:
+            return None
+        spot = last_px
 
         recent = [p for t, p in ticks if now - 120 <= t <= now]
         sigma1 = None
