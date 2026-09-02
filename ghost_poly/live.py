@@ -693,13 +693,51 @@ class PolyLive:
             std_err = str(e)
         try:
             resp2, timing2 = self._signed_post_timed(token_id, args, order_type, neg_risk=True)
-            resp2["timing"] = timing2
-            return resp2
+            if resp2 and resp2.get("success", True) is not False:
+                resp2["timing"] = timing2
+                return resp2
+            negrisk_err = str(resp2)
         except Exception as e:
-            return {
-                "success": False,
-                "error": f"std:{std_err[:60]} | negrisk:{str(e)[:60]}",
-            }
+            negrisk_err = str(e)
+
+        # FILET DE SECOURS (Steven 02/09, "1+2" -- comprendre la vraie erreur
+        # ET avoir un filet qui n'en depend pas) : les ordres LIMITE (GTC/FAK,
+        # std ET neg_risk) ont echoue. Tente un ORDRE MARKET (meme mecanisme
+        # que snipe_buy_market pour l'achat -- deja prouve fiable la-dessus --
+        # mais cote SELL, jamais utilise avant ce soir). Chemin de
+        # construction/validation DIFFERENT cote API que les ordres limite :
+        # si le rejet 400 est specifique au type d'ordre (tick/precision/
+        # signature d'un OrderArgsV2 limite), le market order peut passer la
+        # ou les deux autres ont echoue -- independant de la cause exacte.
+        market_err = ""
+        try:
+            from py_clob_client_v2 import MarketOrderArgsV2
+
+            c = self.client()
+            floor_px = round(max(0.01, sell_price - 0.03), 2)
+            mkt_args = MarketOrderArgsV2(
+                token_id=token_id, amount=round(size, 2), side="SELL", price=floor_px,
+            )
+            resp3 = c.post_order(c.create_market_order(mkt_args), OrderType.FAK)
+            if resp3 and resp3.get("success", True) is not False:
+                resp3["timing"] = {"fallback": "market_sell"}
+                return resp3
+            market_err = str(resp3)
+        except Exception as e3:
+            market_err = str(e3)
+
+        # FIX (Steven 02/09, "on n'a jamais su la vraie erreur") : le vrai
+        # point de troncature etait ICI, a 60 caracteres -- couper a 60 rase
+        # systematiquement le message Polymarket juste apres "{'error': '"
+        # (ex: "PolyApiException[status_code=400, error_message={'error':
+        # 'n" fait deja 60+ caracteres a lui seul). Le rallongement fait plus
+        # tot ce soir cote trader.py (log a [:1200]) etait donc inutile : la
+        # chaine arrivait deja amputee. Elargi a 500 pour voir enfin le vrai
+        # message la prochaine fois qu'une vente echoue.
+        return {
+            "success": False,
+            "error": f"std:{std_err[:500]} | negrisk:{negrisk_err[:500]} | market:{market_err[:500]}",
+        }
 
     def execute_directional(self, token_id: str, price: float, size: float) -> dict:
         """Un seul ordre BUY, GTC proche du marché. Utilisé pour les paris
@@ -733,7 +771,7 @@ class PolyLive:
         except Exception as e:
             return {
                 "success": False,
-                "error": f"std:{std_err[:80]} | negrisk:{str(e)[:80]}",
+                "error": f"std:{std_err[:500]} | negrisk:{str(e)[:500]}",
             }
 
     # ── snipe marketable (V3 BTC/ETH up-down) ──
