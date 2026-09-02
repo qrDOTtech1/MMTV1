@@ -298,6 +298,9 @@ PAPER_START_BAL = 20.0  # solde papier de depart (par marche paper)
 # sur les entrees pas cheres a forte conviction" (b grandit quand ask baisse).
 KELLY_FRACTION = 0.25
 KELLY_ASSUMED_EDGE = 0.06  # edge de proba suppose au max de conviction, a recalibrer
+MIN_STAKE_FRACTION = 0.10  # Steven 02/09 -- plancher de mise = 10% du capital investissable
+# (voir _budget_usd) ; borne quand meme par HARD_CAP_USD/MAX_FRACTION/investable, jamais
+# depasse le budget reellement disponible, juste evite les mises Kelly ridiculement petites.
 # avec plus de donnees reelles sur le WR par marche.
 
 # ── MULTIPLICATEUR EMPIRIQUE PAR PALIER DE PRIX (Steven 04/08) ──
@@ -4639,6 +4642,15 @@ class MultiTrader:
         else:
             tier_mult = PRICE_TIER_BUDGET_MULT["above_070"]
         budget *= tier_mult
+        # PLANCHER PROPORTIONNEL AU CAPITAL (Steven 02/09, "il faut ajouter un
+        # plancher proportionnel au capital ex mise mini = X% du solde") :
+        # sur un favori >0.70 (edge en $ mecaniquement faible pres de 1.00),
+        # le Kelly pur produisait des mises ridicules (4-5$ sur 53$ de solde)
+        # meme avec le multiplicateur de palier. Le plancher releve la mise
+        # sans jamais depasser le hard cap / MAX_FRACTION ci-dessous -- donc
+        # sans risque d'engager plus que prevu, juste moins TIMIDE sur les
+        # favoris confirmes.
+        budget = max(budget, investable * MIN_STAKE_FRACTION)
         # le plancher de securite reste PRIORITAIRE : on ne depasse jamais
         # l'investissable (= solde - FLOOR_USD), ni le hard cap, ni MAX_FRACTION.
         return max(
