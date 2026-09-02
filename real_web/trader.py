@@ -298,7 +298,7 @@ PAPER_START_BAL = 20.0  # solde papier de depart (par marche paper)
 # sur les entrees pas cheres a forte conviction" (b grandit quand ask baisse).
 KELLY_FRACTION = 0.25
 KELLY_ASSUMED_EDGE = 0.06  # edge de proba suppose au max de conviction, a recalibrer
-MIN_STAKE_FRACTION = 0.10  # Steven 02/09 -- plancher de mise = 10% du capital investissable
+MIN_STAKE_FRACTION = 0.17  # Steven 02/09 -- releve 10->17%, plancher de mise = 17% du capital investissable
 # (voir _budget_usd) ; borne quand meme par HARD_CAP_USD/MAX_FRACTION/investable, jamais
 # depasse le budget reellement disponible, juste evite les mises Kelly ridiculement petites.
 # avec plus de donnees reelles sur le WR par marche.
