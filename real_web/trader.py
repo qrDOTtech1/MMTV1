@@ -2023,6 +2023,25 @@ TWAP_ORACLE_ENABLED = True
 TWAP_ORACLE_BET_USD = 5.0      # Steven 02/09 -- plancher demande, "augmenter si ca tourne bien"
 TWAP_ORACLE_MIN_SECS_LEFT = 5
 TWAP_ORACLE_MAX_SECS_LEFT = 50  # la formule n'est valide que dans la fenetre TWAP 60s
+# PALIER DE MISE DEGRESSIF PAR PRIX (Steven 02/09, "si ca passe on gagne quand
+# meme bcp mais sinon ca perd que 1$") : une mise FIXE de 5$ traite pareil un
+# pari a 90c (variance faible) et un pari a 1c (variance maximale : soit -100%
+# soit ~+9900%). Le ratio de payout reste enorme meme avec une mise reduite
+# sur les cotes extremes -- ca amortit juste le "ouch" d'un raté (confirme en
+# prod le 02/09 : le seul raté du lot etait justement un pari a 1c). Cherche
+# le premier palier dont le prix-plafond est >= l'ask, sinon TWAP_ORACLE_BET_USD.
+TWAP_ORACLE_BET_TIERS = (
+    (0.05, 1.0),   # ask <= 5c  -> mise 1$
+    (0.10, 2.0),   # ask <= 10c -> mise 2$
+    (0.30, 3.0),   # ask <= 30c -> mise 3$
+)  # au-dela de 30c : TWAP_ORACLE_BET_USD (5$) plein
+
+
+def _twap_oracle_bet_usd(ask):
+    for max_px, bet in TWAP_ORACLE_BET_TIERS:
+        if ask <= max_px:
+            return bet
+    return TWAP_ORACLE_BET_USD
 # TP INSTANTANE UNIVERSEL (Steven 19/08, "meme prix 0.10, 0.35, 0.52, 0.65,
 # toujours meme chose") : s'applique a TOUTE position geree par
 # _manage_pnl_tier_exits (bothside/swing/fav/nearcert/copy), quel que soit le
@@ -2121,6 +2140,7 @@ PNL_TP_FRACTIONS = (0.25, 0.25, 0.25, 0.25)  # fraction de la taille INITIALE pa
 PNL_TP_TARGETS = (0.05, 0.15, 0.20)  # Steven 02/09 -- 3e palier resserre 35%->20%
 PNL_TRAIL_ACTIVATION = 0.25  # trailing s'armee des TP1 (+25%)
 PNL_TRAIL_GIVEBACK = 0.10  # 10% du pic depuis le palier atteint -> vente runner
+SL_CONFIRM_S = 2.0  # Steven 02/09 -- la perte doit persister ce nb de secondes avant de vendre (filtre le bruit court)
 PNL_SL_PCT = 0.001  # Steven 01/09 -- resserre 0.2%->0.1%, coherent avec le
 # sweep qui s'ameliorait de facon monotone jusqu'a l'extreme testee. Steven 19/08 -- 2e correction le meme soir : le modele
 # de frais initial (4% sur CHAQUE sortie) etait faux -- les frais ne
@@ -8909,7 +8929,7 @@ class MultiTrader:
             return False
         mk["twap_oracle_tried"][slug] = time.time()
         investable = self._investable()
-        budget = round(min(TWAP_ORACLE_BET_USD, investable), 2)
+        budget = round(min(_twap_oracle_bet_usd(ask), investable), 2)
         if budget < MIN_BUDGET_USD:
             self._tlog(
                 f"twaporacle_skip_budget_{sym}",
@@ -14707,7 +14727,23 @@ class MultiTrader:
             # le vieux SL pense pour les paliers 25/50/75% ne s'applique
             # plus. PNL_SL_PCT desactive via TP_INSTANT_SL_DISABLED.
             effective_sl_pct = pos.get("rl_stop_pct", PNL_SL_PCT)
-            if (not TP_INSTANT_SL_DISABLED) and pnl_pct <= -effective_sl_pct and stage < len(PNL_TP_TARGETS):
+            _sl_breach = pnl_pct <= -effective_sl_pct and stage < len(PNL_TP_TARGETS)
+            # CONFIRMATION ANTI-BRUIT (Steven 02/09, "il y a eu du bruit et il
+            # a vendu" -- creux passager du carnet, remonte juste apres, mais
+            # deja coupe a perte). Le seuil PNL_SL_PCT reste inchange (toujours
+            # aussi serre), mais on exige desormais que la perte PERSISTE
+            # SL_CONFIRM_S secondes sur des lectures successives avant de
+            # vendre -- un simple wick d'une seconde ne declenche plus rien,
+            # une vraie chute continue toujours aussi vite qu'avant.
+            if not _sl_breach:
+                pos.pop("_sl_breach_since", None)
+                _sl_confirmed = False
+            elif pos.get("_sl_breach_since") is None:
+                pos["_sl_breach_since"] = now
+                _sl_confirmed = False
+            else:
+                _sl_confirmed = (now - pos["_sl_breach_since"]) >= SL_CONFIRM_S
+            if (not TP_INSTANT_SL_DISABLED) and _sl_confirmed:
                 exit_price = self._get_bid(pos) if pos["mode"] == "real" else cur
                 if exit_price is None:
                     continue
