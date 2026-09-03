@@ -9722,15 +9722,27 @@ class MultiTrader:
                             )
 
         # ── 3) cherche une NOUVELLE entree (consensus de MOUVEMENT + traineur) ──
+        # DIAGNOSTIC CONTINU (Steven 03/09, "j'aimerais bien avoir des logs
+        # meme quand il trade pas, pour comprendre pourquoi") : meme principe
+        # que TWAP-ORACLE-DIAG -- une ligne throttled a CHAQUE raison de ne
+        # pas trader, pas seulement quand un trade part.
+        def _diag(msg):
+            self._tlog("steven_diag", f"🌟 [STEVEN-ENGINE-DIAG] {msg}", every=10.0)
+
         # HEURES COUPEES (UTC) : ne bloque QUE les nouvelles entrees, jamais
         # la gestion (DCA/SL) des positions deja ouvertes ci-dessus.
         import datetime as _dt
         _cur_hour_utc = _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc).hour
         if _cur_hour_utc in (cfg.get("skip_hours") or []):
+            _diag(f"heure {_cur_hour_utc}h UTC coupee dans les reglages -> pas de nouvelle entree")
             return
         if n_open >= cfg["max_concurrent"] or total_cost >= cfg["bankroll_usd"]:
+            _diag(f"limite atteinte : {n_open}/{cfg['max_concurrent']} positions, "
+                  f"{total_cost:.2f}$/{cfg['bankroll_usd']}$ engages")
             return
         if len(moves) < cfg["min_assets_agreeing"]:
+            _diag(f"seulement {len(moves)}/6 marches lisibles ce cycle "
+                  f"(min requis {cfg['min_assets_agreeing']}) -- symboles vus: {sorted(moves.keys())}")
             return
 
         up_count = sum(1 for v in moves.values() if v["movement"] >= STEVEN_MOVE_EPSILON)
@@ -9740,6 +9752,9 @@ class MultiTrader:
         elif down_count >= cfg["min_assets_agreeing"] and cfg["allow_down"]:
             majority_side = "Down"
         else:
+            _mv_str = " ".join(f"{s}={v['movement']:+.3%}" for s, v in sorted(moves.items()))
+            _diag(f"pas de consensus (besoin {cfg['min_assets_agreeing']}/6) : "
+                  f"up={up_count} down={down_count} | {_mv_str}")
             return
 
         # INVERSION SUR SERIE (optionnel) : si les N derniers paris places par
@@ -9758,6 +9773,7 @@ class MultiTrader:
                     )
                     majority_side = _flipped
                 else:
+                    _diag(f"inversion sur serie voudrait parier {_flipped} mais ce sens est desactive -> skip")
                     return
 
         # mouvement de CET actif dans le sens majoritaire (positif = confirme
@@ -9767,9 +9783,12 @@ class MultiTrader:
 
         agreeing = {s: v for s, v in moves.items() if signed_move(v) >= STEVEN_MOVE_EPSILON}
         if len(agreeing) < cfg["min_assets_agreeing"]:
+            _diag(f"consensus {majority_side} initial mais retombe a {len(agreeing)} "
+                  f"actifs en le recalculant -> skip")
             return
         avg_move = sum(signed_move(v) for v in agreeing.values()) / len(agreeing)
         if avg_move <= 0:
+            _diag(f"consensus {majority_side} mais mouvement moyen non positif ({avg_move:+.3%}) -> skip")
             return
 
         # le traineur : parmi TOUS les actifs (y compris ceux pas encore
@@ -9777,9 +9796,11 @@ class MultiTrader:
         # mouvement moyen du groupe (gap_ratio=1 -> n'a pas bouge du tout,
         # gap_ratio=0 -> a deja suivi autant que la moyenne).
         best_sym, best_gap = None, 0.0
+        _all_gaps = {}
         for s, v in moves.items():
             m_ = signed_move(v)
             gap_ratio = (avg_move - m_) / avg_move
+            _all_gaps[s] = gap_ratio
             if gap_ratio >= cfg["laggard_gap"] and gap_ratio > best_gap:
                 key_check = f"{v['slug']}|{majority_side}"
                 mk_s = self.state["markets"].get(s)
@@ -9787,6 +9808,9 @@ class MultiTrader:
                     continue
                 best_sym, best_gap = s, gap_ratio
         if best_sym is None:
+            _gap_str = " ".join(f"{s}={g:.2f}" for s, g in sorted(_all_gaps.items(), key=lambda kv: -kv[1]))
+            _diag(f"consensus {majority_side} ({len(agreeing)} actifs, avg_move={avg_move:+.3%}) "
+                  f"mais aucun traineur >= gap {cfg['laggard_gap']:.2f} : {_gap_str}")
             return
 
         v = moves[best_sym]
@@ -9794,6 +9818,7 @@ class MultiTrader:
         tid = v["token_ids"][v["outcomes"].index(majority_side)]
         _, ask, _ = self._book_quote(tid)
         if ask is None or ask <= 0 or ask >= 1:
+            _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) trouve mais ask indisponible -> skip")
             return
         # BANDE D'ACHAT (filtre d'EXECUTION du traineur DEJA identifie par le
         # mouvement de prix ci-dessus, PAS le signal lui-meme) : n'achete que
@@ -9801,14 +9826,20 @@ class MultiTrader:
         # 90c laisse trop peu de marge de gain, un prix a 5c signifie que le
         # marche lui-meme ne croit pas du tout au rattrapage.
         if not (cfg["buy_min_price"] <= ask <= cfg["buy_max_price"]):
+            _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) trouve mais prix {ask:.3f} "
+                  f"hors bande [{cfg['buy_min_price']:.2f}, {cfg['buy_max_price']:.2f}] -> skip")
             return
         # BANDE A EVITER (optionnelle) : meme si dans la bande d'achat
         # normale, un sous-intervalle peut etre exclu explicitement.
         _avoid_max = cfg.get("avoid_max_price", 0.0)
         if _avoid_max > 0 and cfg.get("avoid_min_price", 0.0) <= ask <= _avoid_max:
+            _diag(f"traineur {best_sym} {majority_side} @ {ask:.3f} tombe dans la bande a eviter "
+                  f"[{cfg.get('avoid_min_price', 0.0):.2f}, {_avoid_max:.2f}] -> skip")
             return
         budget = round(min(cfg["initial_buy_usd"], self._investable(), cfg["bankroll_usd"] - total_cost), 2)
         if budget < MIN_BUDGET_USD:
+            _diag(f"traineur {best_sym} {majority_side} @ {ask:.3f} valide mais budget insuffisant "
+                  f"({budget:.2f}$ < {MIN_BUDGET_USD}$)")
             return
         with self._order_lock:
             res = self._live.snipe_buy_market(tid, round(min(ask + 0.05, 0.99), 2), budget)
