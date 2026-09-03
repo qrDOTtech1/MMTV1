@@ -2081,6 +2081,13 @@ TWAP_ORACLE_EARLY_BET_USD = 5.0  # Steven 03/09 -- releve de 1$ a la demande, ma
 # par backtest (voir session).
 TWAP_ORACLE_EARLY_TP_ARM_PCT = 0.10
 TWAP_ORACLE_EARLY_TP_SELL_FRACTION = 0.75
+# Steven 03/09 ("regarde la pos early qui a perdu alors qu'on aurait pu TP !
+# le reglage passe de under 5c a under 42c") : le flip immediat (vend TOUT
+# des le premier tick de gain reel, pas d'attente de 10%) couvrait trop peu
+# d'entrees -- releve pour couvrir la plupart des paris precoces, PAS
+# TWAP_ORACLE_CHEAP_ENTRY_MAX (qui reste a 5c pour l'oracle 'certain', ne
+# pas m'elange les deux mecanismes).
+TWAP_ORACLE_EARLY_FLIP_MAX_ENTRY = 0.42
 
 # STEVEN ENGINE (Steven 03/09, "un ami a un bot payant performant, on veut
 # EN PLUS de l'oracle faire tourner un moteur base sur son comportement") :
@@ -9565,12 +9572,14 @@ class MultiTrader:
                     pos["_oracle_trail_peak"] = peak = live_pct
             peak = pos.get("_oracle_trail_peak", 0.0)
 
-            # FLIP IMMEDIAT sur ticket precoce <5c (Steven 03/09, "si under
-            # 5c on achete et on vend immediatement tout de suite apres") :
-            # plus agressif que le TP precoce general -- des le premier
-            # tick de gain reel, vend TOUT (pas 75%), pas d'attente de 10%.
+            # FLIP IMMEDIAT sur pari precoce <=42c (Steven 03/09, "si under
+            # 5c [releve a 42c] on achete et on vend immediatement tout de
+            # suite apres") : plus agressif que le TP precoce general -- des
+            # le premier tick de gain reel, vend TOUT (pas 75%), pas
+            # d'attente de 10% (qui ratait des positions parties trop vite,
+            # cf entree 0.230 pic 0.255 jamais vendu, retombee a 0.010).
             if (pos.get("strat") == "twap_oracle_early" and not pos.get("_early_tp_done")
-                    and entry <= TWAP_ORACLE_CHEAP_ENTRY_MAX):
+                    and entry <= TWAP_ORACLE_EARLY_FLIP_MAX_ENTRY):
                 _cb = self._get_bid(pos)
                 if _cb is not None and _cb > entry:
                     _sold = self._sell_orphan(
