@@ -4010,6 +4010,7 @@ class MultiTrader:
         "avoid_min_price": (0.0, 1.0),
         "avoid_max_price": (0.0, 1.0),
         "streak_reversal_n": (2, 30),
+        "confirmation_secs": (0, 120),
     }
     STEVEN_DCA_MODES = ("standard", "off", "capped", "on_confirm")
     STEVEN_PRESETS = ("selective", "balanced", "aggressive")
@@ -4047,6 +4048,12 @@ class MultiTrader:
             # pnl total (+196.80$/137 signaux) contre 0.05% (+183.54$/87) --
             # meilleur compromis volume/qualite que la valeur initiale.
             "move_epsilon": STEVEN_MOVE_EPSILON,
+            # Steven 03/09 ("ca ne devrait pas arriver, enquete sur la
+            # solution" -- retournement juste apres l'entree) : exige que le
+            # signal (cote+traineur) tienne 30s avant d'executer. Backteste :
+            # win_rate 62.2%->67.3%, pnl/trade +1.56$->+2.42$, au prix du
+            # volume (127->52 signaux/24h). 0 = desactive (immediat).
+            "confirmation_secs": 30,
         }
         saved = self.state.get("steven_engine") or {}
         defaults.update({k: v for k, v in saved.items() if k in defaults})
@@ -9865,13 +9872,16 @@ class MultiTrader:
         _cur_hour_utc = _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc).hour
         if _cur_hour_utc in (cfg.get("skip_hours") or []):
             _diag(f"heure {_cur_hour_utc}h UTC coupee dans les reglages -> pas de nouvelle entree")
+            self.state.pop("steven_pending_signal", None)
             return
         if n_open >= cfg["max_concurrent"] or total_cost >= cfg["bankroll_usd"]:
             _diag("limite de positions/bankroll atteinte -> pas de nouvelle entree")
+            self.state.pop("steven_pending_signal", None)
             return
         if len(moves) < cfg["min_assets_agreeing"]:
             _diag(f"seulement {len(moves)}/6 marches lisibles ce cycle "
                   f"(min requis {cfg['min_assets_agreeing']}) -- symboles vus: {sorted(moves.keys())}")
+            self.state.pop("steven_pending_signal", None)
             return
 
         up_count = sum(1 for v in moves.values() if v["movement"] >= cfg["move_epsilon"])
@@ -9884,6 +9894,7 @@ class MultiTrader:
             _mv_str = " ".join(f"{s}={v['movement']:+.3%}" for s, v in sorted(moves.items()))
             _diag(f"pas de consensus (besoin {cfg['min_assets_agreeing']}/6) : "
                   f"up={up_count} down={down_count} | {_mv_str}")
+            self.state.pop("steven_pending_signal", None)
             return
 
         # INVERSION SUR SERIE (optionnel) : si les N derniers paris places par
@@ -9940,7 +9951,34 @@ class MultiTrader:
             _gap_str = " ".join(f"{s}={g:.2f}" for s, g in sorted(_all_gaps.items(), key=lambda kv: -kv[1]))
             _diag(f"consensus {majority_side} ({len(agreeing)} actifs, avg_move={avg_move:+.3%}) "
                   f"mais aucun traineur >= gap {cfg['laggard_gap']:.2f} : {_gap_str}")
+            self.state.pop("steven_pending_signal", None)
             return
+
+        # CONFIRMATION (Steven 03/09, "ca ne devrait pas arriver, enquete
+        # sur la solution" -- un retournement juste apres l'entree) :
+        # backteste sur 24h reelles -- exiger que le MEME signal (cote +
+        # traineur) tienne pendant confirmation_secs avant d'executer
+        # ameliore le win rate (62%->67%) et le pnl/trade (+1.56$->+2.42$),
+        # au prix d'un peu moins de volume. Un signal qui change de cote ou
+        # de traineur entre-temps repart a zero (pas de confirmation
+        # "partielle").
+        _confirm_s = cfg.get("confirmation_secs", 0)
+        if _confirm_s > 0:
+            _pending = self.state.get("steven_pending_signal")
+            if not _pending or _pending.get("side") != majority_side or _pending.get("sym") != best_sym:
+                self.state["steven_pending_signal"] = {
+                    "side": majority_side, "sym": best_sym, "first_seen": now,
+                }
+                _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) detecte, "
+                      f"en attente de confirmation ({_confirm_s:.0f}s)")
+                return
+            elapsed = now - _pending["first_seen"]
+            if elapsed < _confirm_s:
+                _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) toujours en attente "
+                      f"de confirmation ({elapsed:.0f}/{_confirm_s:.0f}s)")
+                return
+            # confirme -- efface l'etat en attente, on execute ci-dessous
+            self.state.pop("steven_pending_signal", None)
 
         v = moves[best_sym]
         mk = self.state["markets"][best_sym]
@@ -9989,11 +10027,16 @@ class MultiTrader:
         _hist = self.state.setdefault("steven_side_history", [])
         _hist.append(majority_side)
         del _hist[:-50]  # ne garde que les 50 derniers, largement assez pour streak_reversal_n<=30
+        # DETAIL DU CONSENSUS (Steven 03/09, "on voit pas de ligne qui dit
+        # clairement qu'il y a eu un consensus") : meme richesse que la
+        # ligne "pas de consensus" (mouvement de CHAQUE actif), pas juste le
+        # compte agrege -- pour voir d'un coup d'oeil qui a vote quoi.
+        _mv_detail = " ".join(f"{s}={v2['movement']:+.3%}" for s, v2 in sorted(moves.items()))
         self._log(
             f"🌟 [STEVEN-ENGINE] {best_sym} {v['slug']} {majority_side} "
             f"{filled} parts @ {avg:.3f} ({round(filled * avg, 2)}$) "
             f"gap_ratio={best_gap:.2f} consensus={len(agreeing)}/{len(moves)} avg_move={avg_move:+.4%} "
-            f"-> ouverte, hold to resolution"
+            f"| {_mv_detail} -> ouverte, hold to resolution"
         )
 
     def _try_favorite(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
