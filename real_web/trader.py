@@ -2109,7 +2109,7 @@ STEVEN_ALLOW_DOWN = True           # "DOWN setups"
 # pas le prix du contrat") : seuil minimal de mouvement de PRIX (fraction,
 # pas %) pour qu'un actif compte comme "parti" dans un sens -- sous ce seuil,
 # c'est juste du bruit de marche, ni Up ni Down.
-STEVEN_MOVE_EPSILON = 0.0005
+STEVEN_MOVE_EPSILON = 0.0003  # Steven 03/09 -- backteste 24h : meilleur pnl total (+196.80$/137 signaux)
 # VERROU DE PROFIT SUR LA VALEUR (Steven 02/09, "la pos valait 27$ ... il n'a
 # pas TP et ca s'est resolu dans l'autre sens ... un TP qui traque la VALEUR
 # de la pos, plus focus sur la valeur") : le hold-to-resolution strict expose
@@ -3998,7 +3998,8 @@ class MultiTrader:
         "dca1_add_usd": (0.0, 50.0),
         "dca2_add_usd": (0.0, 50.0),
         "dca_trigger_drop": (0.01, 0.50),
-        "stoploss_price": (0.01, 0.90),
+        "stoploss_price": (0.0, 0.90),  # 0.0 = desactive (Steven 03/09, "faut couper le stop loss")
+        "move_epsilon": (0.0001, 0.01),
         "avoid_min_price": (0.0, 1.0),
         "avoid_max_price": (0.0, 1.0),
         "streak_reversal_n": (2, 30),
@@ -4035,6 +4036,10 @@ class MultiTrader:
             "skip_hours": [],
             "streak_reversal_enabled": False,
             "streak_reversal_n": 7,
+            # Steven 03/09 : backteste sur 24h reelles, 0.03% donne le meilleur
+            # pnl total (+196.80$/137 signaux) contre 0.05% (+183.54$/87) --
+            # meilleur compromis volume/qualite que la valeur initiale.
+            "move_epsilon": STEVEN_MOVE_EPSILON,
         }
         saved = self.state.get("steven_engine") or {}
         defaults.update({k: v for k, v in saved.items() if k in defaults})
@@ -9677,9 +9682,10 @@ class MultiTrader:
                 if entry <= 0 or shares <= 0:
                     continue
                 # STOP-LOSS ABSOLU (Steven engine a un vrai SL, contrairement a
-                # l'oracle -- c'est le point central de ce moteur : gestion de
-                # risque plutot que certitude statistique).
-                if cur <= cfg["stoploss_price"]:
+                # l'oracle). Desactivable (Steven 03/09, "faut couper le stop
+                # loss") : 0.0 = jamais de coupe, hold to resolution comme
+                # l'oracle sur cette position -- risque de -100% assume.
+                if cfg["stoploss_price"] > 0 and cur <= cfg["stoploss_price"]:
                     sold = self._sell_orphan(
                         tid, shares, f" {sym} {pos['slug']} {pos['side']} STEVEN-SL",
                         entry_price=entry, symbol=sym, slug=pos.get("slug"), side=pos.get("side"),
@@ -9722,8 +9728,8 @@ class MultiTrader:
                     if add_usd > 0 and dca_mode == "on_confirm":
                         _mv = moves.get(sym)
                         _still_agrees = _mv is not None and (
-                            (pos["side"] == "Up" and _mv["movement"] >= STEVEN_MOVE_EPSILON)
-                            or (pos["side"] == "Down" and _mv["movement"] <= -STEVEN_MOVE_EPSILON)
+                            (pos["side"] == "Up" and _mv["movement"] >= cfg["move_epsilon"])
+                            or (pos["side"] == "Down" and _mv["movement"] <= -cfg["move_epsilon"])
                         )
                         if not _still_agrees:
                             self._tlog(
@@ -9780,8 +9786,8 @@ class MultiTrader:
                   f"(min requis {cfg['min_assets_agreeing']}) -- symboles vus: {sorted(moves.keys())}")
             return
 
-        up_count = sum(1 for v in moves.values() if v["movement"] >= STEVEN_MOVE_EPSILON)
-        down_count = sum(1 for v in moves.values() if v["movement"] <= -STEVEN_MOVE_EPSILON)
+        up_count = sum(1 for v in moves.values() if v["movement"] >= cfg["move_epsilon"])
+        down_count = sum(1 for v in moves.values() if v["movement"] <= -cfg["move_epsilon"])
         if up_count >= cfg["min_assets_agreeing"] and cfg["allow_up"]:
             majority_side = "Up"
         elif down_count >= cfg["min_assets_agreeing"] and cfg["allow_down"]:
@@ -9816,7 +9822,7 @@ class MultiTrader:
         def signed_move(v):
             return v["movement"] if majority_side == "Up" else -v["movement"]
 
-        agreeing = {s: v for s, v in moves.items() if signed_move(v) >= STEVEN_MOVE_EPSILON}
+        agreeing = {s: v for s, v in moves.items() if signed_move(v) >= cfg["move_epsilon"]}
         if len(agreeing) < cfg["min_assets_agreeing"]:
             _diag(f"consensus {majority_side} initial mais retombe a {len(agreeing)} "
                   f"actifs en le recalculant -> skip")
