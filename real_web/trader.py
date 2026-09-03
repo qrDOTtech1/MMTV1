@@ -2101,7 +2101,11 @@ STEVEN_DCA_TRIGGER_DROP = 0.09     # "DCA trigger drop ($)" -- par palier depuis
 STEVEN_STOPLOSS_PRICE = 0.20       # "Stop-loss price ($)" -- prix ABSOLU, pas un %
 STEVEN_ALLOW_UP = True             # "UP setups"
 STEVEN_ALLOW_DOWN = True           # "DOWN setups"
-STEVEN_LEAN_EPSILON = 0.02         # marge morte autour de 0.50 avant de compter un actif comme "penche"
+# Steven 03/09 ("le signal c'est que les prix des cryptos bougent ensemble,
+# pas le prix du contrat") : seuil minimal de mouvement de PRIX (fraction,
+# pas %) pour qu'un actif compte comme "parti" dans un sens -- sous ce seuil,
+# c'est juste du bruit de marche, ni Up ni Down.
+STEVEN_MOVE_EPSILON = 0.0005
 # VERROU DE PROFIT SUR LA VALEUR (Steven 02/09, "la pos valait 27$ ... il n'a
 # pas TP et ca s'est resolu dans l'autre sens ... un TP qui traque la VALEUR
 # de la pos, plus focus sur la valeur") : le hold-to-resolution strict expose
@@ -3991,7 +3995,12 @@ class MultiTrader:
         "dca2_add_usd": (0.0, 50.0),
         "dca_trigger_drop": (0.01, 0.50),
         "stoploss_price": (0.01, 0.90),
+        "avoid_min_price": (0.0, 1.0),
+        "avoid_max_price": (0.0, 1.0),
+        "streak_reversal_n": (2, 30),
     }
+    STEVEN_DCA_MODES = ("standard", "off", "capped", "on_confirm")
+    STEVEN_PRESETS = ("selective", "balanced", "aggressive")
 
     def steven_config(self):
         defaults = {
@@ -4010,6 +4019,18 @@ class MultiTrader:
             "stoploss_price": STEVEN_STOPLOSS_PRICE,
             "allow_up": STEVEN_ALLOW_UP,
             "allow_down": STEVEN_ALLOW_DOWN,
+            # AJOUTS (Steven 03/09, "je dois retrouver chaque parametre
+            # present sur screen") : preset affiche cote UI seulement (les
+            # champs numeriques ci-dessus restent la source de verite reelle
+            # une fois modifies), mode DCA (comportement, pas juste des
+            # montants), bande a eviter, heures coupees, inversion sur serie.
+            "consensus_preset": "aggressive",
+            "dca_mode": "standard",
+            "avoid_min_price": 0.0,
+            "avoid_max_price": 0.0,
+            "skip_hours": [],
+            "streak_reversal_enabled": False,
+            "streak_reversal_n": 7,
         }
         saved = self.state.get("steven_engine") or {}
         defaults.update({k: v for k, v in saved.items() if k in defaults})
@@ -4020,8 +4041,27 @@ class MultiTrader:
             return {"ok": False, "message": "payload invalide"}
         cfg = self.steven_config()
         for k, v in patch.items():
-            if k in ("enabled", "allow_up", "allow_down"):
+            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled"):
                 cfg[k] = bool(v)
+                continue
+            if k == "dca_mode":
+                if v not in self.STEVEN_DCA_MODES:
+                    return {"ok": False, "message": f"dca_mode invalide (parmi {self.STEVEN_DCA_MODES})"}
+                cfg[k] = v
+                continue
+            if k == "consensus_preset":
+                if v not in self.STEVEN_PRESETS:
+                    return {"ok": False, "message": f"consensus_preset invalide (parmi {self.STEVEN_PRESETS})"}
+                cfg[k] = v
+                continue
+            if k == "skip_hours":
+                if not isinstance(v, list):
+                    return {"ok": False, "message": "skip_hours doit etre une liste d'heures 0-23"}
+                try:
+                    hours = sorted({int(h) for h in v if 0 <= int(h) <= 23})
+                except Exception:
+                    return {"ok": False, "message": "skip_hours : valeurs invalides"}
+                cfg[k] = hours
                 continue
             if k in self.STEVEN_CONFIG_BOUNDS:
                 try:
@@ -4034,6 +4074,8 @@ class MultiTrader:
                 cfg[k] = fv
         if cfg["buy_min_price"] >= cfg["buy_max_price"]:
             return {"ok": False, "message": "buy_min_price doit etre < buy_max_price"}
+        if cfg["avoid_max_price"] > 0 and cfg["avoid_min_price"] >= cfg["avoid_max_price"]:
+            return {"ok": False, "message": "avoid_min_price doit etre < avoid_max_price (ou les deux a 0 pour desactiver)"}
         self.state["steven_engine"] = cfg
         self._save()
         self._log(f"⚙️ [STEVEN-ENGINE] config mise a jour : {cfg}")
@@ -9524,9 +9566,15 @@ class MultiTrader:
         if not cfg["enabled"]:
             return
         now = synced_now()
+        from core.btc_updown import _binance_price, _strike_at
 
-        # ── 1) lit le lean actuel (prix du cote "Up") des 6 marches ──
-        leans = {}   # sym -> {"m","p","outcomes","token_ids","up_price"}
+        # ── 1) lit le MOUVEMENT DE PRIX REEL (Binance, spot vs strike du
+        # debut de fenetre) des 6 marches -- Steven 03/09, "tu as mal compris,
+        # le signal c'est que les prix des cryptos bougent ensemble (correles
+        # 73-85%), pas le prix du contrat de prediction". Le prix du contrat
+        # (bande 0.47-0.62) n'intervient qu'a l'EXECUTION plus bas, jamais
+        # dans la detection du traineur.
+        moves = {}   # sym -> {"m","p","outcomes","token_ids","slug","movement"}
         for sym in STEVEN_SYMBOLS:
             if self.state["modes"].get(sym, "off") not in ("real", "paper"):
                 continue
@@ -9541,13 +9589,16 @@ class MultiTrader:
                 continue
             if len(outcomes) != 2 or len(token_ids) != 2 or "Up" not in outcomes:
                 continue
-            up_tid = token_ids[outcomes.index("Up")]
-            _, _, up_mid = self._book_quote(up_tid)
-            if up_mid is None:
+            pair = p.get("pair")
+            if not pair:
                 continue
-            leans[sym] = {
+            strike = _strike_at(pair, p["start_ts"], slug=m.get("slug"))
+            spot = _binance_price(pair)
+            if not strike or not spot:
+                continue
+            moves[sym] = {
                 "m": m, "p": p, "outcomes": outcomes, "token_ids": token_ids,
-                "up_price": up_mid, "slug": m.get("slug"),
+                "slug": m.get("slug"), "movement": (spot - strike) / strike,
             }
 
         # ── 2) gere les positions DEJA ouvertes (DCA + stop-loss) AVANT toute
@@ -9597,16 +9648,38 @@ class MultiTrader:
                                 f"@ {cur:.3f} (entree {entry:.3f}) pnl={pnl:+.3f}$"
                             )
                     continue
-                # DCA (moyenne a la baisse) : 2 paliers max, chacun declenche a
-                # DCA_TRIGGER_DROP de plus sous l'entree initiale.
+                # DCA (moyenne a la baisse) : comportement pilote par
+                # dca_mode -- "off" = jamais, "capped" = 1 seul palier,
+                # "on_confirm" = ne renforce que si le consensus tient
+                # TOUJOURS ce cycle-ci, "standard" = 2 paliers inconditionnels.
                 stage = pos.get("dca_stage", 0)
                 drop = entry - cur
-                if stage == 0 and drop >= cfg["dca_trigger_drop"]:
-                    add_usd = cfg["dca1_add_usd"]
-                elif stage == 1 and drop >= cfg["dca_trigger_drop"] * 2:
-                    add_usd = cfg["dca2_add_usd"]
-                else:
+                dca_mode = cfg.get("dca_mode", "standard")
+                if dca_mode == "off":
                     add_usd = 0.0
+                elif dca_mode == "capped":
+                    add_usd = cfg["dca1_add_usd"] if (stage == 0 and drop >= cfg["dca_trigger_drop"]) else 0.0
+                else:
+                    if stage == 0 and drop >= cfg["dca_trigger_drop"]:
+                        add_usd = cfg["dca1_add_usd"]
+                    elif stage == 1 and drop >= cfg["dca_trigger_drop"] * 2:
+                        add_usd = cfg["dca2_add_usd"]
+                    else:
+                        add_usd = 0.0
+                    if add_usd > 0 and dca_mode == "on_confirm":
+                        _mv = moves.get(sym)
+                        _still_agrees = _mv is not None and (
+                            (pos["side"] == "Up" and _mv["movement"] >= STEVEN_MOVE_EPSILON)
+                            or (pos["side"] == "Down" and _mv["movement"] <= -STEVEN_MOVE_EPSILON)
+                        )
+                        if not _still_agrees:
+                            self._tlog(
+                                f"steven_dca_skip_{sym}",
+                                f"🌟 [STEVEN-ENGINE] {sym} {pos['slug']} {pos['side']} DCA saute "
+                                f"(on_confirm : le consensus ne tient plus sur cet actif)",
+                                every=30.0,
+                            )
+                            add_usd = 0.0
                 if add_usd > 0 and pos.get("cost", 0.0) + add_usd <= cfg["max_per_trade_usd"]:
                     _ask_now = ask if ask is not None else cur
                     if _ask_now and 0 < _ask_now < 1 and self._investable() >= add_usd:
@@ -9630,14 +9703,20 @@ class MultiTrader:
                                 f"-> nouvelle entree moy. {pos['entry_price']:.3f}"
                             )
 
-        # ── 3) cherche une NOUVELLE entree (consensus + traineur) ──
+        # ── 3) cherche une NOUVELLE entree (consensus de MOUVEMENT + traineur) ──
+        # HEURES COUPEES (UTC) : ne bloque QUE les nouvelles entrees, jamais
+        # la gestion (DCA/SL) des positions deja ouvertes ci-dessus.
+        import datetime as _dt
+        _cur_hour_utc = _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc).hour
+        if _cur_hour_utc in (cfg.get("skip_hours") or []):
+            return
         if n_open >= cfg["max_concurrent"] or total_cost >= cfg["bankroll_usd"]:
             return
-        if len(leans) < cfg["min_assets_agreeing"]:
+        if len(moves) < cfg["min_assets_agreeing"]:
             return
 
-        up_count = sum(1 for v in leans.values() if v["up_price"] >= 0.5 + STEVEN_LEAN_EPSILON)
-        down_count = sum(1 for v in leans.values() if v["up_price"] <= 0.5 - STEVEN_LEAN_EPSILON)
+        up_count = sum(1 for v in moves.values() if v["movement"] >= STEVEN_MOVE_EPSILON)
+        down_count = sum(1 for v in moves.values() if v["movement"] <= -STEVEN_MOVE_EPSILON)
         if up_count >= cfg["min_assets_agreeing"] and cfg["allow_up"]:
             majority_side = "Up"
         elif down_count >= cfg["min_assets_agreeing"] and cfg["allow_down"]:
@@ -9645,42 +9724,70 @@ class MultiTrader:
         else:
             return
 
-        # prix de CE cote pour chaque actif du groupe majoritaire (pour la moyenne)
-        def side_price(v):
-            return v["up_price"] if majority_side == "Up" else round(1 - v["up_price"], 4)
+        # INVERSION SUR SERIE (optionnel) : si les N derniers paris places par
+        # CE moteur ont tous ete du meme cote, on prend le cote OPPOSE pour
+        # celui-ci -- parie sur un retour a l'equilibre plutot que de suivre
+        # une serie deja longue.
+        if cfg.get("streak_reversal_enabled"):
+            _hist = self.state.setdefault("steven_side_history", [])
+            _n = int(cfg.get("streak_reversal_n", 7))
+            if len(_hist) >= _n and all(h == majority_side for h in _hist[-_n:]):
+                _flipped = "Down" if majority_side == "Up" else "Up"
+                if (_flipped == "Up" and cfg["allow_up"]) or (_flipped == "Down" and cfg["allow_down"]):
+                    self._log(
+                        f"🔁 [STEVEN-ENGINE] serie de {_n} paris {majority_side} -> inversion, "
+                        f"prochain pari en {_flipped}"
+                    )
+                    majority_side = _flipped
+                else:
+                    return
 
-        agreeing = {
-            s: v for s, v in leans.items()
-            if (side_price(v) >= 0.5 + STEVEN_LEAN_EPSILON)
-        }
+        # mouvement de CET actif dans le sens majoritaire (positif = confirme
+        # le mouvement, negatif = est parti a contre-sens)
+        def signed_move(v):
+            return v["movement"] if majority_side == "Up" else -v["movement"]
+
+        agreeing = {s: v for s, v in moves.items() if signed_move(v) >= STEVEN_MOVE_EPSILON}
         if len(agreeing) < cfg["min_assets_agreeing"]:
             return
-        avg_price = sum(side_price(v) for v in agreeing.values()) / len(agreeing)
+        avg_move = sum(signed_move(v) for v in agreeing.values()) / len(agreeing)
+        if avg_move <= 0:
+            return
 
         # le traineur : parmi TOUS les actifs (y compris ceux pas encore
-        # "agreeing"), celui dont le prix sur majority_side est le plus en
-        # retard sur la moyenne du groupe, tant qu'il reste dans la bande
-        # d'achat -- pas deja extreme, pas deja retourne contre le mouvement.
+        # "agreeing"), celui qui a le plus de retard EN PROPORTION du
+        # mouvement moyen du groupe (gap_ratio=1 -> n'a pas bouge du tout,
+        # gap_ratio=0 -> a deja suivi autant que la moyenne).
         best_sym, best_gap = None, 0.0
-        for s, v in leans.items():
-            px = side_price(v)
-            if not (cfg["buy_min_price"] <= px <= cfg["buy_max_price"]):
-                continue
-            gap = avg_price - px
-            if gap >= cfg["laggard_gap"] and gap > best_gap:
+        for s, v in moves.items():
+            m_ = signed_move(v)
+            gap_ratio = (avg_move - m_) / avg_move
+            if gap_ratio >= cfg["laggard_gap"] and gap_ratio > best_gap:
                 key_check = f"{v['slug']}|{majority_side}"
                 mk_s = self.state["markets"].get(s)
                 if mk_s and key_check in mk_s["open"]:
                     continue
-                best_sym, best_gap = s, gap
+                best_sym, best_gap = s, gap_ratio
         if best_sym is None:
             return
 
-        v = leans[best_sym]
+        v = moves[best_sym]
         mk = self.state["markets"][best_sym]
         tid = v["token_ids"][v["outcomes"].index(majority_side)]
         _, ask, _ = self._book_quote(tid)
         if ask is None or ask <= 0 or ask >= 1:
+            return
+        # BANDE D'ACHAT (filtre d'EXECUTION du traineur DEJA identifie par le
+        # mouvement de prix ci-dessus, PAS le signal lui-meme) : n'achete que
+        # si son propre marche de prediction n'est pas deja extreme -- payer
+        # 90c laisse trop peu de marge de gain, un prix a 5c signifie que le
+        # marche lui-meme ne croit pas du tout au rattrapage.
+        if not (cfg["buy_min_price"] <= ask <= cfg["buy_max_price"]):
+            return
+        # BANDE A EVITER (optionnelle) : meme si dans la bande d'achat
+        # normale, un sous-intervalle peut etre exclu explicitement.
+        _avoid_max = cfg.get("avoid_max_price", 0.0)
+        if _avoid_max > 0 and cfg.get("avoid_min_price", 0.0) <= ask <= _avoid_max:
             return
         budget = round(min(cfg["initial_buy_usd"], self._investable(), cfg["bankroll_usd"] - total_cost), 2)
         if budget < MIN_BUDGET_USD:
@@ -9701,10 +9808,14 @@ class MultiTrader:
             "start_ts": v["p"]["start_ts"], "pair": v["p"].get("pair"), "end_ts": v["p"]["end_ts"],
             "opened_ts": time.time(), "buffer": 0.0, "dca_stage": 0,
         }
+        _hist = self.state.setdefault("steven_side_history", [])
+        _hist.append(majority_side)
+        del _hist[:-50]  # ne garde que les 50 derniers, largement assez pour streak_reversal_n<=30
         self._log(
             f"🌟 [STEVEN-ENGINE] {best_sym} {v['slug']} {majority_side} "
             f"{filled} parts @ {avg:.3f} ({round(filled * avg, 2)}$) "
-            f"gap={best_gap:.3f} consensus={len(agreeing)}/{len(leans)} -> ouverte, hold to resolution"
+            f"gap_ratio={best_gap:.2f} consensus={len(agreeing)}/{len(moves)} avg_move={avg_move:+.4%} "
+            f"-> ouverte, hold to resolution"
         )
 
     def _try_favorite(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
