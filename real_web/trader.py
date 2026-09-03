@@ -4085,6 +4085,13 @@ class MultiTrader:
             return {"ok": False, "message": "buy_min_price doit etre < buy_max_price"}
         if cfg["avoid_max_price"] > 0 and cfg["avoid_min_price"] >= cfg["avoid_max_price"]:
             return {"ok": False, "message": "avoid_min_price doit etre < avoid_max_price (ou les deux a 0 pour desactiver)"}
+        # GARDE ANTI-SPAM (Steven 03/09, "j'ai set un reglage et depuis ca
+        # spam les logs") : si le dashboard (ou un navigateur qui rejoue une
+        # soumission de formulaire) renvoie EXACTEMENT la meme config, on
+        # n'ecrit rien et on ne logue rien -- silence au lieu de spammer le
+        # journal avec des ecritures identiques toutes les 2-3s.
+        if cfg == self.steven_config():
+            return {"ok": True, "steven_engine": cfg, "unchanged": True}
         self.state["steven_engine"] = cfg
         self._save()
         self._log(f"⚙️ [STEVEN-ENGINE] config mise a jour : {cfg}")
