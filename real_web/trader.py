@@ -9344,7 +9344,24 @@ class MultiTrader:
             if _early_key not in _early_tried and sig["pred"] in outcomes:
                 _early_side = sig["pred"]
                 _early_open_key = f"{slug}|{_early_side}"
-                if _early_open_key not in mk["open"]:
+                # PAS DE PARI OPPOSE (Steven 03/09, "early pose 2 fois dans
+                # les deux sens sur ETH") : si le pred flip en cours de
+                # fenetre (~28% des cas, mesure) et qu'un early est DEJA
+                # ouvert sur l'AUTRE cote de ce meme marche, ne pas en
+                # ouvrir un 2e a contre-sens -- on tiendrait mecaniquement
+                # une jambe perdante garantie (marche binaire, un seul cote
+                # peut gagner).
+                _opp_side = "Down" if _early_side == "Up" else "Up"
+                _opp_open_key = f"{slug}|{_opp_side}"
+                _opp_pos = mk["open"].get(_opp_open_key)
+                if _opp_pos and _opp_pos.get("strat") == "twap_oracle_early":
+                    self._tlog(
+                        f"twap_early_opposite_{sym}",
+                        f"🧪 [TWAP-ORACLE-EARLY-DIAG] {sym} {slug} {_early_side} pred flip mais un "
+                        f"early {_opp_side} est deja ouvert sur ce marche -> pas de 2e pari a contre-sens",
+                        every=10.0,
+                    )
+                elif _early_open_key not in mk["open"]:
                     _etid = token_ids[outcomes.index(_early_side)]
                     _e_ask = quotes.get(_early_side, (None, None, None))[1]
                     if _e_ask is not None and 0 < _e_ask < TWAP_ORACLE_EARLY_MIN_PRICE:
