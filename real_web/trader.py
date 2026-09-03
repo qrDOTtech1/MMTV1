@@ -4027,6 +4027,7 @@ class MultiTrader:
         "avoid_max_price": (0.0, 1.0),
         "streak_reversal_n": (2, 30),
         "confirmation_secs": (0, 120),
+        "size_scale_max": (1.0, 5.0),
     }
     STEVEN_DCA_MODES = ("standard", "off", "capped", "on_confirm")
     STEVEN_PRESETS = ("selective", "balanced", "aggressive")
@@ -4078,6 +4079,17 @@ class MultiTrader:
             # vs +16.95$ si inverse, meme mise/prix. ESSAI, togglable
             # instantanement depuis le dashboard.
             "reverse_mode": False,
+            # Steven 03/09 ("comment optimiser d'avantage ?") : backteste par
+            # symbole choisi comme traineur (reglages prod actuels, 24h reelles) :
+            # DOGE -4.14$/trade (33% WR), BTC -0.30$/trade malgre n=42 (pas du
+            # bruit) -- les deux moins bons. ETH +1.90$/trade et BNB +1.04$/trade
+            # nettement meilleurs. Vide par defaut, wird via dashboard/API.
+            "excluded_symbols": [],
+            # Mise proportionnelle au gap_ratio (plus le traineur est en retard,
+            # plus fort est historiquement le signal) : budget = initial_buy_usd
+            # * min(size_scale_max, 1 + gap_ratio). False = mise fixe (avant).
+            "size_scale_by_gap": True,
+            "size_scale_max": 2.0,
         }
         saved = self.state.get("steven_engine") or {}
         defaults.update({k: v for k, v in saved.items() if k in defaults})
@@ -4088,8 +4100,14 @@ class MultiTrader:
             return {"ok": False, "message": "payload invalide"}
         cfg = self.steven_config()
         for k, v in patch.items():
-            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled", "reverse_mode"):
+            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled", "reverse_mode", "size_scale_by_gap"):
                 cfg[k] = bool(v)
+                continue
+            if k == "excluded_symbols":
+                if not isinstance(v, list):
+                    return {"ok": False, "message": "excluded_symbols doit etre une liste de symboles"}
+                syms = sorted({str(s).upper() for s in v if str(s).upper() in SYMBOLS})
+                cfg[k] = syms
                 continue
             if k == "dca_mode":
                 if v not in self.STEVEN_DCA_MODES:
@@ -9993,7 +10011,10 @@ class MultiTrader:
         # gap_ratio=0 -> a deja suivi autant que la moyenne).
         best_sym, best_gap = None, 0.0
         _all_gaps = {}
+        _excluded = set(cfg.get("excluded_symbols") or [])
         for s, v in moves.items():
+            if s in _excluded:
+                continue
             m_ = signed_move(v)
             gap_ratio = (avg_move - m_) / avg_move
             _all_gaps[s] = gap_ratio
@@ -10084,7 +10105,15 @@ class MultiTrader:
             _diag(f"traineur {best_sym} {majority_side} @ {ask:.3f} tombe dans la bande a eviter "
                   f"[{cfg.get('avoid_min_price', 0.0):.2f}, {_avoid_max:.2f}] -> skip")
             return
-        budget = round(min(cfg["initial_buy_usd"], self._investable(), cfg["bankroll_usd"] - total_cost), 2)
+        # MISE PROPORTIONNELLE AU GAP (Steven 03/09, "optimiser d'avantage")
+        # : plus le traineur a de retard sur la moyenne du groupe, plus le
+        # signal historique est fort -- on scale la mise de base en
+        # consequence (borne a size_scale_max pour limiter le risque).
+        _stake_usd = cfg["initial_buy_usd"]
+        if cfg.get("size_scale_by_gap", True):
+            _scale = min(cfg.get("size_scale_max", 2.0), 1 + best_gap)
+            _stake_usd = round(cfg["initial_buy_usd"] * _scale, 2)
+        budget = round(min(_stake_usd, self._investable(), cfg["bankroll_usd"] - total_cost), 2)
         if budget < MIN_BUDGET_USD:
             _diag(f"traineur {best_sym} {majority_side} @ {ask:.3f} valide mais budget insuffisant "
                   f"({budget:.2f}$ < {MIN_BUDGET_USD}$)")
