@@ -2069,7 +2069,7 @@ TWAP_ORACLE_PROB_THRESHOLD = 0.95
 # pred brut (meme non 'certain'), strat separee de l'oracle normal pour
 # comparer les stats sans rien casser du mecanisme existant.
 TWAP_ORACLE_EARLY_ENABLED = True
-TWAP_ORACLE_EARLY_BET_USD = 1.0
+TWAP_ORACLE_EARLY_BET_USD = 5.0  # Steven 03/09 -- releve de 1$ a la demande, malgre l'echantillon encore petit (8 essais, pnl resolu legerement negatif a ce stade)
 
 # STEVEN ENGINE (Steven 03/09, "un ami a un bot payant performant, on veut
 # EN PLUS de l'oracle faire tourner un moteur base sur son comportement") :
