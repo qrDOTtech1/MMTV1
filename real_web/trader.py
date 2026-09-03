@@ -9318,7 +9318,7 @@ class MultiTrader:
                                 f"twap_early_budget_{sym}",
                                 f"🧪 [TWAP-ORACLE-EARLY-DIAG] {sym} {slug} {_early_side} budget "
                                 f"insuffisant ({_e_budget:.2f}$ < {MIN_BUDGET_USD}$) -> pas encore essaye",
-                                every=15.0,
+                                every=5.0,
                             )
                         if _e_budget >= MIN_BUDGET_USD:
                             # marque "essaye" seulement ICI (Steven 03/09, bug trouve :
@@ -9363,14 +9363,14 @@ class MultiTrader:
                             f"twap_early_noask_{sym}",
                             f"🧪 [TWAP-ORACLE-EARLY-DIAG] {sym} {slug} {_early_side} pas d'ask "
                             f"disponible ce cycle (carnet={_e_ask}) -> reessaie au prochain cycle",
-                            every=15.0,
+                            every=5.0,
                         )
                 else:
                     self._tlog(
                         f"twap_early_open_{sym}",
                         f"🧪 [TWAP-ORACLE-EARLY-DIAG] {sym} {slug} {_early_side} position essai "
                         f"deja ouverte sur ce cote",
-                        every=30.0,
+                        every=15.0,
                     )
 
         if not sig or not sig.get("certain"):
@@ -9775,7 +9775,12 @@ class MultiTrader:
         # que TWAP-ORACLE-DIAG -- une ligne throttled a CHAQUE raison de ne
         # pas trader, pas seulement quand un trade part.
         def _diag(msg):
-            self._tlog("steven_diag", f"🌟 [STEVEN-ENGINE-DIAG] {msg}", every=10.0)
+            self._tlog(
+                "steven_diag",
+                f"🌟 [STEVEN-ENGINE-DIAG] [{n_open}/{cfg['max_concurrent']} pos, "
+                f"{total_cost:.2f}$/{cfg['bankroll_usd']}$] {msg}",
+                every=5.0,
+            )
 
         # HEURES COUPEES (UTC) : ne bloque QUE les nouvelles entrees, jamais
         # la gestion (DCA/SL) des positions deja ouvertes ci-dessus.
@@ -9785,8 +9790,7 @@ class MultiTrader:
             _diag(f"heure {_cur_hour_utc}h UTC coupee dans les reglages -> pas de nouvelle entree")
             return
         if n_open >= cfg["max_concurrent"] or total_cost >= cfg["bankroll_usd"]:
-            _diag(f"limite atteinte : {n_open}/{cfg['max_concurrent']} positions, "
-                  f"{total_cost:.2f}$/{cfg['bankroll_usd']}$ engages")
+            _diag("limite de positions/bankroll atteinte -> pas de nouvelle entree")
             return
         if len(moves) < cfg["min_assets_agreeing"]:
             _diag(f"seulement {len(moves)}/6 marches lisibles ce cycle "
