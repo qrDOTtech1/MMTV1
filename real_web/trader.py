@@ -2070,6 +2070,10 @@ TWAP_ORACLE_PROB_THRESHOLD = 0.95
 # comparer les stats sans rien casser du mecanisme existant.
 TWAP_ORACLE_EARLY_ENABLED = True
 TWAP_ORACLE_EARLY_BET_USD = 5.0  # Steven 03/09 -- releve de 1$ a la demande, malgre l'echantillon encore petit (8 essais, pnl resolu legerement negatif a ce stade)
+# Steven 03/09 ("n'ajoute SURTOUT PAS de barriere ici") : demande explicite
+# et confirmee -- des qu'un pred brut apparait, achat IMMEDIAT au premier
+# prix disponible, sans aucun plafond/plancher de prix. Ne pas re-ajouter de
+# filtre de prix sur ce chemin sans consigne explicite contraire.
 
 # STEVEN ENGINE (Steven 03/09, "un ami a un bot payant performant, on veut
 # EN PLUS de l'oracle faire tourner un moteur base sur son comportement") :
@@ -9297,6 +9301,13 @@ class MultiTrader:
                     _e_ask = quotes.get(_early_side, (None, None, None))[1]
                     if _e_ask is not None and 0 < _e_ask < 1:
                         _e_budget = round(min(TWAP_ORACLE_EARLY_BET_USD, self._investable()), 2)
+                        if _e_budget < MIN_BUDGET_USD:
+                            self._tlog(
+                                f"twap_early_budget_{sym}",
+                                f"🧪 [TWAP-ORACLE-EARLY-DIAG] {sym} {slug} {_early_side} budget "
+                                f"insuffisant ({_e_budget:.2f}$ < {MIN_BUDGET_USD}$) -> pas encore essaye",
+                                every=15.0,
+                            )
                         if _e_budget >= MIN_BUDGET_USD:
                             # marque "essaye" seulement ICI (Steven 03/09, bug trouve :
                             # marquer avant de savoir si l'ask/budget est valide
@@ -9310,6 +9321,16 @@ class MultiTrader:
                                     _etid, round(min(_e_ask + 0.05, 0.99), 2), _e_budget,
                                 )
                             _e_filled = _e_res.get("filled_shares", 0.0)
+                            if _e_filled <= 0:
+                                # Steven 03/09, "j'ai pas vu ligne essai ni le
+                                # trade associe" : avant, un fill rate ici ne
+                                # laissait AUCUNE trace (log absent) et ne
+                                # reessayait jamais (deja marque "essaye")
+                                # -- silence total, impossible a diagnostiquer.
+                                self._log(
+                                    f"⚠️ [TWAP-ORACLE-EARLY] {sym} {slug} {_early_side} "
+                                    f"essai non rempli @ {_e_ask:.3f} (err={_e_res.get('error', '')})"
+                                )
                             if _e_filled > 0:
                                 _e_avg = _e_res.get("avg_cost") or _e_ask
                                 self._add_slug_spent(mk, slug, round(_e_filled * _e_avg, 2))
@@ -9325,6 +9346,20 @@ class MultiTrader:
                                     f"{_e_filled} parts @ {_e_avg:.3f} ({round(_e_filled * _e_avg, 2)}$) "
                                     f"certain={sig['certain']} {secs_left:.0f}s restantes -> ESSAI, hold to resolution"
                                 )
+                    else:
+                        self._tlog(
+                            f"twap_early_noask_{sym}",
+                            f"🧪 [TWAP-ORACLE-EARLY-DIAG] {sym} {slug} {_early_side} pas d'ask "
+                            f"disponible ce cycle (carnet={_e_ask}) -> reessaie au prochain cycle",
+                            every=15.0,
+                        )
+                else:
+                    self._tlog(
+                        f"twap_early_open_{sym}",
+                        f"🧪 [TWAP-ORACLE-EARLY-DIAG] {sym} {slug} {_early_side} position essai "
+                        f"deja ouverte sur ce cote",
+                        every=30.0,
+                    )
 
         if not sig or not sig.get("certain"):
             return False
