@@ -2070,6 +2070,38 @@ TWAP_ORACLE_PROB_THRESHOLD = 0.95
 # comparer les stats sans rien casser du mecanisme existant.
 TWAP_ORACLE_EARLY_ENABLED = True
 TWAP_ORACLE_EARLY_BET_USD = 1.0
+
+# STEVEN ENGINE (Steven 03/09, "un ami a un bot payant performant, on veut
+# EN PLUS de l'oracle faire tourner un moteur base sur son comportement") :
+# reproduit du mieux possible la logique "Constellation" vue sur son
+# dashboard (config CONSTELLATION/AGGRESSIVE) -- Polymarket fait tourner 6
+# marches Up/Down 5min correles (73-85%) sur BTC/ETH/SOL/XRP/DOGE/BNB. Si
+# au moins STEVEN_MIN_ASSETS_AGREEING des 6 penchent nettement du meme cote,
+# et qu'UN traine derriere (son prix sur ce cote est encore bas, pas encore
+# "rattrape"), on parie qu'il rattrape le mouvement avant la cloture --
+# AVEC filet de securite explicite (DCA + stop-loss), contrairement a
+# l'oracle qui n'a ni l'un ni l'autre par construction (certitude
+# statistique plutot que gestion de risque). Ceci est ma RECONSTRUCTION des
+# reglages vus sur son ecran (pas son code source) -- backtest impossible
+# sans historique multi-actifs aligne a la seconde, donc deploye avec
+# logs detailles pour juger sur des resultats reels, comme demande.
+STEVEN_ENGINE_ENABLED = True
+STEVEN_SYMBOLS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB")
+STEVEN_MIN_ASSETS_AGREEING = 4     # "Min assets agreeing" (preset AGGRESSIVE)
+STEVEN_LAGGARD_GAP = 0.08          # "Laggard gap"
+STEVEN_INITIAL_BUY_USD = 10.0      # "Initial buy ($)"
+STEVEN_MAX_CONCURRENT = 4          # "Max concurrent"
+STEVEN_BUY_MIN_PRICE = 0.47        # "Buy price range" (traineur, cote laggard)
+STEVEN_BUY_MAX_PRICE = 0.62
+STEVEN_BANKROLL_USD = 20.0         # "Bankroll ($)" -- expo totale max de ce moteur
+STEVEN_MAX_PER_TRADE_USD = 10.5    # "Max per trade ($)" -- plafond initial+DCA
+STEVEN_DCA1_ADD_USD = 3.0          # "DCA #1 add ($)"
+STEVEN_DCA2_ADD_USD = 2.5          # "DCA #2 add ($)"
+STEVEN_DCA_TRIGGER_DROP = 0.09     # "DCA trigger drop ($)" -- par palier depuis l'entree
+STEVEN_STOPLOSS_PRICE = 0.20       # "Stop-loss price ($)" -- prix ABSOLU, pas un %
+STEVEN_ALLOW_UP = True             # "UP setups"
+STEVEN_ALLOW_DOWN = True           # "DOWN setups"
+STEVEN_LEAN_EPSILON = 0.02         # marge morte autour de 0.50 avant de compter un actif comme "penche"
 # VERROU DE PROFIT SUR LA VALEUR (Steven 02/09, "la pos valait 27$ ... il n'a
 # pas TP et ca s'est resolu dans l'autre sens ... un TP qui traque la VALEUR
 # de la pos, plus focus sur la valeur") : le hold-to-resolution strict expose
@@ -3941,6 +3973,99 @@ class MultiTrader:
         self._log(f"⚙️ budget ARB {old}$ -> {v}$/jambe")
         return {"ok": True, "arb_budget": v}
 
+    # ── STEVEN ENGINE : config reglable depuis le dashboard (Steven 03/09,
+    # "je veux aussi la meme page de parametres pour le Steven engine") --
+    # meme pattern que arb_budget() : les STEVEN_* du haut de fichier ne
+    # servent plus que de valeurs PAR DEFAUT, self.state["steven_engine"]
+    # est la source de verite une fois modifiee depuis le dashboard.
+    STEVEN_CONFIG_BOUNDS = {
+        "min_assets_agreeing": (2, 6),
+        "laggard_gap": (0.01, 0.30),
+        "initial_buy_usd": (1.0, 50.0),
+        "max_concurrent": (1, 6),
+        "buy_min_price": (0.05, 0.90),
+        "buy_max_price": (0.10, 0.95),
+        "bankroll_usd": (5.0, 500.0),
+        "max_per_trade_usd": (1.0, 100.0),
+        "dca1_add_usd": (0.0, 50.0),
+        "dca2_add_usd": (0.0, 50.0),
+        "dca_trigger_drop": (0.01, 0.50),
+        "stoploss_price": (0.01, 0.90),
+    }
+
+    def steven_config(self):
+        defaults = {
+            "enabled": STEVEN_ENGINE_ENABLED,
+            "min_assets_agreeing": STEVEN_MIN_ASSETS_AGREEING,
+            "laggard_gap": STEVEN_LAGGARD_GAP,
+            "initial_buy_usd": STEVEN_INITIAL_BUY_USD,
+            "max_concurrent": STEVEN_MAX_CONCURRENT,
+            "buy_min_price": STEVEN_BUY_MIN_PRICE,
+            "buy_max_price": STEVEN_BUY_MAX_PRICE,
+            "bankroll_usd": STEVEN_BANKROLL_USD,
+            "max_per_trade_usd": STEVEN_MAX_PER_TRADE_USD,
+            "dca1_add_usd": STEVEN_DCA1_ADD_USD,
+            "dca2_add_usd": STEVEN_DCA2_ADD_USD,
+            "dca_trigger_drop": STEVEN_DCA_TRIGGER_DROP,
+            "stoploss_price": STEVEN_STOPLOSS_PRICE,
+            "allow_up": STEVEN_ALLOW_UP,
+            "allow_down": STEVEN_ALLOW_DOWN,
+        }
+        saved = self.state.get("steven_engine") or {}
+        defaults.update({k: v for k, v in saved.items() if k in defaults})
+        return defaults
+
+    def set_steven_config(self, patch):
+        if not isinstance(patch, dict):
+            return {"ok": False, "message": "payload invalide"}
+        cfg = self.steven_config()
+        for k, v in patch.items():
+            if k in ("enabled", "allow_up", "allow_down"):
+                cfg[k] = bool(v)
+                continue
+            if k in self.STEVEN_CONFIG_BOUNDS:
+                try:
+                    fv = round(float(v), 4)
+                except Exception:
+                    return {"ok": False, "message": f"valeur invalide pour {k}"}
+                lo, hi = self.STEVEN_CONFIG_BOUNDS[k]
+                if not (lo <= fv <= hi):
+                    return {"ok": False, "message": f"{k} hors bornes ({lo}-{hi})"}
+                cfg[k] = fv
+        if cfg["buy_min_price"] >= cfg["buy_max_price"]:
+            return {"ok": False, "message": "buy_min_price doit etre < buy_max_price"}
+        self.state["steven_engine"] = cfg
+        self._save()
+        self._log(f"⚙️ [STEVEN-ENGINE] config mise a jour : {cfg}")
+        return {"ok": True, "steven_engine": cfg}
+
+    def steven_stats(self):
+        """Stats live du moteur, pour affichage dashboard -- separees des
+        stats oracle/arb (filtre sur strat=='steven_engine')."""
+        open_n, open_cost = 0, 0.0
+        trades, wins, pnl_sum = 0, 0, 0.0
+        for sym in STEVEN_SYMBOLS:
+            mk = self.state["markets"].get(sym)
+            if not mk:
+                continue
+            for pos in mk["open"].values():
+                if pos.get("strat") == "steven_engine":
+                    open_n += 1
+                    open_cost += pos.get("cost", 0.0)
+            for t in mk["trades"]:
+                if t.get("strat") == "steven_engine":
+                    trades += 1
+                    pnl_sum += t.get("pnl", 0.0)
+                    if t.get("win"):
+                        wins += 1
+        return {
+            "open_positions": open_n,
+            "open_cost": round(open_cost, 2),
+            "trades": trades,
+            "win_rate": round(100 * wins / trades, 1) if trades else None,
+            "pnl": round(pnl_sum, 3),
+        }
+
     def start(self):
         if self.is_running():
             return {"ok": False, "message": "deja en cours"}
@@ -4865,6 +4990,16 @@ class MultiTrader:
                 _now = synced_now()
                 for _s in by_sym:
                     by_sym[_s].sort(key=lambda mp: mp[1]["end_ts"] - _now)
+
+                # STEVEN ENGINE (Steven 03/09, "en plus de oracle faire tourner
+                # un Steven engine base sur le comportement du bot d'un ami") :
+                # cross-symbole, tourne UNE fois par cycle complet (pas par
+                # symbole comme le reste) puisqu'il a besoin de voir les 6
+                # marches ensemble pour detecter un "traineur".
+                try:
+                    self._manage_steven_engine(by_sym)
+                except Exception as e:
+                    self._log(f"💥 [STEVEN-ENGINE] erreur: {e}")
 
                 # workflow d'UN marche (detection + gestion + resolution). Chaque
                 # marche ne touche QUE son propre sous-etat mk -> pas de conflit
@@ -9104,12 +9239,18 @@ class MultiTrader:
                 _early_side = sig["pred"]
                 _early_open_key = f"{slug}|{_early_side}"
                 if _early_open_key not in mk["open"]:
-                    _early_tried[_early_key] = time.time()
                     _etid = token_ids[outcomes.index(_early_side)]
                     _e_ask = quotes.get(_early_side, (None, None, None))[1]
                     if _e_ask is not None and 0 < _e_ask < 1:
                         _e_budget = round(min(TWAP_ORACLE_EARLY_BET_USD, self._investable()), 2)
                         if _e_budget >= MIN_BUDGET_USD:
+                            # marque "essaye" seulement ICI (Steven 03/09, bug trouve :
+                            # marquer avant de savoir si l'ask/budget est valide
+                            # desactivait l'essai pour le reste de la fenetre si le
+                            # tout premier passage tombait sur un carnet pas encore
+                            # pret -- observe en prod, une fenetre entiere sans
+                            # aucun essai malgre un pred stable 30s+).
+                            _early_tried[_early_key] = time.time()
                             with self._order_lock:
                                 _e_res = self._live.snipe_buy_market(
                                     _etid, round(min(_e_ask + 0.05, 0.99), 2), _e_budget,
@@ -9372,6 +9513,199 @@ class MultiTrader:
                     f"🔒 [TWAP-ORACLE-TRAIL] {sym} {pos['slug']} {pos['side']} pic={peak:+.0%} "
                     f"-> verrouille @ {cur_bid:.3f} (entree {entry:.3f}) pnl={pnl:+.3f}$"
                 )
+
+    def _manage_steven_engine(self, by_sym):
+        """Detection + gestion du 'Steven Engine' (voir STEVEN_* ci-dessus).
+        Cross-symbole par construction : lit les 6 marches ensemble a CHAQUE
+        cycle plutot que d'etre appelee par symbole comme le reste du bot.
+        Reglages LUS DEPUIS LE DASHBOARD (steven_config()), les constantes
+        STEVEN_* du haut de fichier ne servent que de valeurs par defaut."""
+        cfg = self.steven_config()
+        if not cfg["enabled"]:
+            return
+        now = synced_now()
+
+        # ── 1) lit le lean actuel (prix du cote "Up") des 6 marches ──
+        leans = {}   # sym -> {"m","p","outcomes","token_ids","up_price"}
+        for sym in STEVEN_SYMBOLS:
+            if self.state["modes"].get(sym, "off") not in ("real", "paper"):
+                continue
+            cands = [mp for mp in by_sym.get(sym, []) if mp[1]["end_ts"] > now]
+            if not cands:
+                continue
+            m, p = cands[0]
+            try:
+                outcomes = json.loads(m.get("outcomes") or "[]")
+                token_ids = json.loads(m.get("clobTokenIds") or "[]")
+            except Exception:
+                continue
+            if len(outcomes) != 2 or len(token_ids) != 2 or "Up" not in outcomes:
+                continue
+            up_tid = token_ids[outcomes.index("Up")]
+            _, _, up_mid = self._book_quote(up_tid)
+            if up_mid is None:
+                continue
+            leans[sym] = {
+                "m": m, "p": p, "outcomes": outcomes, "token_ids": token_ids,
+                "up_price": up_mid, "slug": m.get("slug"),
+            }
+
+        # ── 2) gere les positions DEJA ouvertes (DCA + stop-loss) AVANT toute
+        # nouvelle entree -- le risque sur le capital deja engage prime. ──
+        n_open = 0
+        total_cost = 0.0
+        for sym in STEVEN_SYMBOLS:
+            mk = self.state["markets"].get(sym)
+            if not mk:
+                continue
+            for key, pos in list(mk["open"].items()):
+                if pos.get("strat") != "steven_engine" or pos.get("mode") != "real":
+                    continue
+                n_open += 1
+                total_cost += pos.get("cost", 0.0)
+                tid = pos["token_id"]
+                bid, ask, mid = self._book_quote(tid)
+                cur = bid if bid is not None else mid
+                if cur is None:
+                    continue
+                entry = pos.get("entry_price", 0)
+                shares = pos.get("filled_shares", 0)
+                if entry <= 0 or shares <= 0:
+                    continue
+                # STOP-LOSS ABSOLU (Steven engine a un vrai SL, contrairement a
+                # l'oracle -- c'est le point central de ce moteur : gestion de
+                # risque plutot que certitude statistique).
+                if cur <= cfg["stoploss_price"]:
+                    sold = self._sell_orphan(
+                        tid, shares, f" {sym} {pos['slug']} {pos['side']} STEVEN-SL",
+                        entry_price=entry, symbol=sym, slug=pos.get("slug"), side=pos.get("side"),
+                    )
+                    if sold > 0:
+                        realized = round(sold * (cur - entry), 3)
+                        pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + realized, 3)
+                        pos["filled_shares"] = round(shares - sold, 2)
+                        if pos["filled_shares"] < MIN_SELL_SHARES:
+                            pnl = pos["realized_pnl"]
+                            pos.update(win=pnl > 0, pnl=pnl, resolved_by="steven_sl", exit_price=round(cur, 3))
+                            mk["trades"].append(pos)
+                            del mk["open"][key]
+                            self._record_trade_pnl(sym, pnl)
+                            n_open -= 1
+                            total_cost -= pos.get("cost", 0.0)
+                            self._log(
+                                f"🛑 [STEVEN-SL] {sym} {pos['slug']} {pos['side']} "
+                                f"@ {cur:.3f} (entree {entry:.3f}) pnl={pnl:+.3f}$"
+                            )
+                    continue
+                # DCA (moyenne a la baisse) : 2 paliers max, chacun declenche a
+                # DCA_TRIGGER_DROP de plus sous l'entree initiale.
+                stage = pos.get("dca_stage", 0)
+                drop = entry - cur
+                if stage == 0 and drop >= cfg["dca_trigger_drop"]:
+                    add_usd = cfg["dca1_add_usd"]
+                elif stage == 1 and drop >= cfg["dca_trigger_drop"] * 2:
+                    add_usd = cfg["dca2_add_usd"]
+                else:
+                    add_usd = 0.0
+                if add_usd > 0 and pos.get("cost", 0.0) + add_usd <= cfg["max_per_trade_usd"]:
+                    _ask_now = ask if ask is not None else cur
+                    if _ask_now and 0 < _ask_now < 1 and self._investable() >= add_usd:
+                        with self._order_lock:
+                            _dca_res = self._live.snipe_buy_market(
+                                tid, round(min(_ask_now + 0.05, 0.99), 2), add_usd,
+                            )
+                        _dca_filled = _dca_res.get("filled_shares", 0.0)
+                        if _dca_filled > 0:
+                            _dca_avg = _dca_res.get("avg_cost") or _ask_now
+                            new_cost = round(pos["cost"] + _dca_filled * _dca_avg, 2)
+                            new_shares = round(shares + _dca_filled, 2)
+                            pos["entry_price"] = round(new_cost / new_shares, 4) if new_shares > 0 else entry
+                            pos["filled_shares"] = new_shares
+                            pos["cost"] = new_cost
+                            pos["dca_stage"] = stage + 1
+                            self._add_slug_spent(mk, pos["slug"], round(_dca_filled * _dca_avg, 2))
+                            self._log(
+                                f"➕ [STEVEN-DCA{stage + 1}] {sym} {pos['slug']} {pos['side']} "
+                                f"+{_dca_filled} parts @ {_dca_avg:.3f} (+{add_usd}$) "
+                                f"-> nouvelle entree moy. {pos['entry_price']:.3f}"
+                            )
+
+        # ── 3) cherche une NOUVELLE entree (consensus + traineur) ──
+        if n_open >= cfg["max_concurrent"] or total_cost >= cfg["bankroll_usd"]:
+            return
+        if len(leans) < cfg["min_assets_agreeing"]:
+            return
+
+        up_count = sum(1 for v in leans.values() if v["up_price"] >= 0.5 + STEVEN_LEAN_EPSILON)
+        down_count = sum(1 for v in leans.values() if v["up_price"] <= 0.5 - STEVEN_LEAN_EPSILON)
+        if up_count >= cfg["min_assets_agreeing"] and cfg["allow_up"]:
+            majority_side = "Up"
+        elif down_count >= cfg["min_assets_agreeing"] and cfg["allow_down"]:
+            majority_side = "Down"
+        else:
+            return
+
+        # prix de CE cote pour chaque actif du groupe majoritaire (pour la moyenne)
+        def side_price(v):
+            return v["up_price"] if majority_side == "Up" else round(1 - v["up_price"], 4)
+
+        agreeing = {
+            s: v for s, v in leans.items()
+            if (side_price(v) >= 0.5 + STEVEN_LEAN_EPSILON)
+        }
+        if len(agreeing) < cfg["min_assets_agreeing"]:
+            return
+        avg_price = sum(side_price(v) for v in agreeing.values()) / len(agreeing)
+
+        # le traineur : parmi TOUS les actifs (y compris ceux pas encore
+        # "agreeing"), celui dont le prix sur majority_side est le plus en
+        # retard sur la moyenne du groupe, tant qu'il reste dans la bande
+        # d'achat -- pas deja extreme, pas deja retourne contre le mouvement.
+        best_sym, best_gap = None, 0.0
+        for s, v in leans.items():
+            px = side_price(v)
+            if not (cfg["buy_min_price"] <= px <= cfg["buy_max_price"]):
+                continue
+            gap = avg_price - px
+            if gap >= cfg["laggard_gap"] and gap > best_gap:
+                key_check = f"{v['slug']}|{majority_side}"
+                mk_s = self.state["markets"].get(s)
+                if mk_s and key_check in mk_s["open"]:
+                    continue
+                best_sym, best_gap = s, gap
+        if best_sym is None:
+            return
+
+        v = leans[best_sym]
+        mk = self.state["markets"][best_sym]
+        tid = v["token_ids"][v["outcomes"].index(majority_side)]
+        _, ask, _ = self._book_quote(tid)
+        if ask is None or ask <= 0 or ask >= 1:
+            return
+        budget = round(min(cfg["initial_buy_usd"], self._investable(), cfg["bankroll_usd"] - total_cost), 2)
+        if budget < MIN_BUDGET_USD:
+            return
+        with self._order_lock:
+            res = self._live.snipe_buy_market(tid, round(min(ask + 0.05, 0.99), 2), budget)
+        filled = res.get("filled_shares", 0.0)
+        if filled <= 0:
+            self._log(f"⚠️ [STEVEN-ENGINE] {best_sym} {v['slug']} {majority_side} non rempli (err={res.get('error', '')})")
+            return
+        avg = res.get("avg_cost") or ask
+        self._add_slug_spent(mk, v["slug"], round(filled * avg, 2))
+        key = f"{v['slug']}|{majority_side}"
+        mk["open"][key] = {
+            "symbol": best_sym, "slug": v["slug"], "side": majority_side, "mode": "real",
+            "strat": "steven_engine", "token_id": tid, "entry_price": avg,
+            "filled_shares": filled, "cost": round(filled * avg, 2),
+            "start_ts": v["p"]["start_ts"], "pair": v["p"].get("pair"), "end_ts": v["p"]["end_ts"],
+            "opened_ts": time.time(), "buffer": 0.0, "dca_stage": 0,
+        }
+        self._log(
+            f"🌟 [STEVEN-ENGINE] {best_sym} {v['slug']} {majority_side} "
+            f"{filled} parts @ {avg:.3f} ({round(filled * avg, 2)}$) "
+            f"gap={best_gap:.3f} consensus={len(agreeing)}/{len(leans)} -> ouverte, hold to resolution"
+        )
 
     def _try_favorite(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
         """PARI DIRECTIONNEL SUR LE FAVORI (Steven 05/08, demande explicite).
@@ -16502,6 +16836,8 @@ class MultiTrader:
             "cash_usdc": self._last_good_cash,
             "floor": self.floor(),
             "arb_budget": self.arb_budget(),
+            "steven_engine": self.steven_config(),
+            "steven_stats": self.steven_stats(),
             "stop_consec": STOP_CONSEC_LOSSES,
             "markets": {},
             "diag": self._diag,

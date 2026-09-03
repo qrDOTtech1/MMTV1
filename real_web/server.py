@@ -170,6 +170,14 @@ def marketmaker_reset_kill():
     return jsonify(trader.reset_mm_kill())
 
 
+@app.route("/api/steven-engine", methods=["GET", "POST"])
+def steven_engine():
+    if request.method == "GET":
+        return jsonify({"steven_engine": trader.steven_config(), "stats": trader.steven_stats()})
+    d = request.get_json(force=True)
+    return jsonify(trader.set_steven_config(d))
+
+
 @app.route("/api/real-history")
 def real_history():
     return jsonify(trader.fetch_real_history())
