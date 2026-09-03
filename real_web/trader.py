@@ -2074,6 +2074,13 @@ TWAP_ORACLE_EARLY_BET_USD = 5.0  # Steven 03/09 -- releve de 1$ a la demande, ma
 # et confirmee -- des qu'un pred brut apparait, achat IMMEDIAT au premier
 # prix disponible, sans aucun plafond/plancher de prix. Ne pas re-ajouter de
 # filtre de prix sur ce chemin sans consigne explicite contraire.
+# TP DEDIE au pari precoce (Steven 03/09, "cette ligne aurait declenche TP
+# immediatement, laisser le reste courir") : ~81% de win rate seulement
+# (backteste) contre 99%+ pour le pari certain -- des le premier gain reel,
+# on securise l'essentiel des parts en une fois, valeurs de depart a affiner
+# par backtest (voir session).
+TWAP_ORACLE_EARLY_TP_ARM_PCT = 0.10
+TWAP_ORACLE_EARLY_TP_SELL_FRACTION = 0.75
 
 # STEVEN ENGINE (Steven 03/09, "un ami a un bot payant performant, on veut
 # EN PLUS de l'oracle faire tourner un moteur base sur son comportement") :
@@ -9551,11 +9558,81 @@ class MultiTrader:
                     pos["_oracle_trail_peak"] = peak = live_pct
             peak = pos.get("_oracle_trail_peak", 0.0)
 
+            # FLIP IMMEDIAT sur ticket precoce <5c (Steven 03/09, "si under
+            # 5c on achete et on vend immediatement tout de suite apres") :
+            # plus agressif que le TP precoce general -- des le premier
+            # tick de gain reel, vend TOUT (pas 75%), pas d'attente de 10%.
+            if (pos.get("strat") == "twap_oracle_early" and not pos.get("_early_tp_done")
+                    and entry <= TWAP_ORACLE_CHEAP_ENTRY_MAX):
+                _cb = self._get_bid(pos)
+                if _cb is not None and _cb > entry:
+                    _sold = self._sell_orphan(
+                        pos["token_id"], shares,
+                        f" {sym} {pos['slug']} {pos['side']} TWAP-ORACLE-EARLY-FLIP",
+                        entry_price=entry, symbol=sym, slug=pos.get("slug"), side=pos.get("side"),
+                    )
+                    if _sold > 0:
+                        _realized = round(_sold * (_cb - entry), 3)
+                        pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + _realized, 3)
+                        pos["filled_shares"] = shares = round(shares - _sold, 2)
+                        pos["_early_tp_done"] = True
+                        self._log(
+                            f"⚡ [TWAP-ORACLE-EARLY-FLIP] {sym} {pos['slug']} {pos['side']} "
+                            f"vend {_sold} @ {_cb:.3f} (entree {entry:.3f}) "
+                            f"realise={_realized:+.3f}$ reste={shares}"
+                        )
+                        if shares < MIN_SELL_SHARES:
+                            pnl = pos["realized_pnl"]
+                            pos.update(win=pnl > 0, pnl=pnl, resolved_by="oracle_early_flip", exit_price=round(_cb, 3))
+                            mk["trades"].append(pos)
+                            del mk["open"][key]
+                            self._record_trade_pnl(sym, pnl)
+                        continue
+
             # PALIERS "TICKET 1c" (voir TWAP_ORACLE_CHEAP_* ci-dessus) : prend
             # la moitie des parts RESTANTES a chaque palier de gain franchi,
             # tant que l'entree est un ticket bon marche. Verifie sur le VRAI
             # bid (pas le pic estime) -- on ne vend jamais dans une cotation
             # fantome.
+            # TP DEDIE AUX PARIS "PRECOCES" (Steven 03/09, "surtout les early
+            # est un TP ... cette ligne aurait declenche TP immediatement,
+            # laisser le reste courir") : contrairement au pari 'certain'
+            # (99%+ win rate mesure, vraiment hold-to-resolution), le pari
+            # precoce n'a que ~81% de win rate (backteste) -- moins de raison
+            # d'accepter le risque plein d'un retournement total. Des le
+            # premier gain reel constate, on securise une grosse partie des
+            # parts en UNE fois, le reliquat continue jusqu'a resolution
+            # (ou le verrou/paliers ci-dessous s'il grimpe encore).
+            if pos.get("strat") == "twap_oracle_early" and not pos.get("_early_tp_done"):
+                if peak >= TWAP_ORACLE_EARLY_TP_ARM_PCT:
+                    _cb = self._get_bid(pos)
+                    if _cb is not None and (_cb - entry) / entry >= TWAP_ORACLE_EARLY_TP_ARM_PCT:
+                        _sell_n = round(shares * TWAP_ORACLE_EARLY_TP_SELL_FRACTION, 2)
+                        if _sell_n >= MIN_SELL_SHARES:
+                            _sold = self._sell_orphan(
+                                pos["token_id"], _sell_n,
+                                f" {sym} {pos['slug']} {pos['side']} TWAP-ORACLE-EARLY-TP",
+                                entry_price=entry, symbol=sym, slug=pos.get("slug"), side=pos.get("side"),
+                            )
+                            if _sold > 0:
+                                _realized = round(_sold * (_cb - entry), 3)
+                                pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + _realized, 3)
+                                pos["filled_shares"] = shares = round(shares - _sold, 2)
+                                pos["_early_tp_done"] = True
+                                self._log(
+                                    f"💰 [TWAP-ORACLE-EARLY-TP] {sym} {pos['slug']} {pos['side']} "
+                                    f"+{(_cb - entry) / entry:.0%} vend {_sold} @ {_cb:.3f} "
+                                    f"(entree {entry:.3f}) realise={_realized:+.3f}$ reste={shares} "
+                                    f"(continue jusqu'a resolution)"
+                                )
+                                if shares < MIN_SELL_SHARES:
+                                    pnl = pos["realized_pnl"]
+                                    pos.update(win=pnl > 0, pnl=pnl, resolved_by="oracle_early_tp", exit_price=round(_cb, 3))
+                                    mk["trades"].append(pos)
+                                    del mk["open"][key]
+                                    self._record_trade_pnl(sym, pnl)
+                                continue
+
             if entry <= TWAP_ORACLE_CHEAP_ENTRY_MAX:
                 stage = pos.get("_oracle_cheap_tp_stage", 0)
                 if stage < len(TWAP_ORACLE_CHEAP_TP_TARGETS) and peak >= TWAP_ORACLE_CHEAP_TP_TARGETS[stage]:
