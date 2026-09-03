@@ -4066,6 +4066,12 @@ class MultiTrader:
             # pnl/trade +1.56$->+2.42$. Reduit a 20s (Steven 03/09, "je
             # voudrais qu'on le set a 20sec"). 0 = desactive (immediat).
             "confirmation_secs": 20,
+            # Steven 03/09 ("un manque a gagner de 90e toute la soiree, on
+            # teste un reverse engine, au pire on le coupera") : verifie sur
+            # 10 vrais trades recents (verite Binance) -- pnl reel -14.40$
+            # vs +16.95$ si inverse, meme mise/prix. ESSAI, togglable
+            # instantanement depuis le dashboard.
+            "reverse_mode": False,
         }
         saved = self.state.get("steven_engine") or {}
         defaults.update({k: v for k, v in saved.items() if k in defaults})
@@ -4076,7 +4082,7 @@ class MultiTrader:
             return {"ok": False, "message": "payload invalide"}
         cfg = self.steven_config()
         for k, v in patch.items():
-            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled"):
+            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled", "reverse_mode"):
                 cfg[k] = bool(v)
                 continue
             if k == "dca_mode":
@@ -9964,7 +9970,12 @@ class MultiTrader:
             gap_ratio = (avg_move - m_) / avg_move
             _all_gaps[s] = gap_ratio
             if gap_ratio >= cfg["laggard_gap"] and gap_ratio > best_gap:
-                key_check = f"{v['slug']}|{majority_side}"
+                # verifie le cote REELLEMENT parie (apres reverse eventuel),
+                # sinon le dedoublonnage checke le mauvais cote en mode reverse.
+                _check_side = majority_side
+                if cfg.get("reverse_mode"):
+                    _check_side = "Down" if majority_side == "Up" else "Up"
+                key_check = f"{v['slug']}|{_check_side}"
                 mk_s = self.state["markets"].get(s)
                 if mk_s and key_check in mk_s["open"]:
                     continue
@@ -10011,10 +10022,22 @@ class MultiTrader:
 
         v = moves[best_sym]
         mk = self.state["markets"][best_sym]
-        tid = v["token_ids"][v["outcomes"].index(majority_side)]
+        # REVERSE ENGINE (Steven 03/09, "ca s'est passe toute la soiree, un
+        # manque a gagner de 90e... un filtre post achat qui pose Down au
+        # lieu de Up et inversement") : verifie sur 10 vrais trades recents
+        # (verite Binance independante) -- pnl reel -14.40$ vs +16.95$ si
+        # inverse, meme mise, meme prix. Toute la logique de DETECTION
+        # (consensus, traineur, gap, confirmation) reste INCHANGEE ; seul le
+        # cote EXECUTE a l'achat est flip. Togglable (reverse_mode=False
+        # coupe instantanement, revient au comportement normal).
+        _exec_side = majority_side
+        if cfg.get("reverse_mode"):
+            _exec_side = "Down" if majority_side == "Up" else "Up"
+        tid = v["token_ids"][v["outcomes"].index(_exec_side)]
         _, ask, _ = self._book_quote(tid)
         if ask is None or ask <= 0 or ask >= 1:
-            _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) trouve mais ask indisponible -> skip")
+            _diag(f"traineur {best_sym} {majority_side}{'->reverse '+_exec_side if cfg.get('reverse_mode') else ''} "
+                  f"(gap={best_gap:.2f}) trouve mais ask indisponible -> skip")
             return
         # BANDE D'ACHAT (filtre d'EXECUTION du traineur DEJA identifie par le
         # mouvement de prix ci-dessus, PAS le signal lui-meme) : n'achete que
@@ -10022,7 +10045,8 @@ class MultiTrader:
         # 90c laisse trop peu de marge de gain, un prix a 5c signifie que le
         # marche lui-meme ne croit pas du tout au rattrapage.
         if not (cfg["buy_min_price"] <= ask <= cfg["buy_max_price"]):
-            _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) trouve mais prix {ask:.3f} "
+            _diag(f"traineur {best_sym} {majority_side}{'->reverse '+_exec_side if cfg.get('reverse_mode') else ''} "
+                  f"(gap={best_gap:.2f}) trouve mais prix {ask:.3f} "
                   f"hors bande [{cfg['buy_min_price']:.2f}, {cfg['buy_max_price']:.2f}] -> skip")
             return
         # BANDE A EVITER (optionnelle) : meme si dans la bande d'achat
@@ -10041,31 +10065,32 @@ class MultiTrader:
             res = self._live.snipe_buy_market(tid, round(min(ask + 0.05, 0.99), 2), budget)
         filled = res.get("filled_shares", 0.0)
         if filled <= 0:
-            self._log(f"⚠️ [STEVEN-ENGINE] {best_sym} {v['slug']} {majority_side} non rempli (err={res.get('error', '')})")
+            self._log(f"⚠️ [STEVEN-ENGINE] {best_sym} {v['slug']} {_exec_side} non rempli (err={res.get('error', '')})")
             return
         avg = res.get("avg_cost") or ask
         self._add_slug_spent(mk, v["slug"], round(filled * avg, 2))
-        key = f"{v['slug']}|{majority_side}"
+        key = f"{v['slug']}|{_exec_side}"
         mk["open"][key] = {
-            "symbol": best_sym, "slug": v["slug"], "side": majority_side, "mode": "real",
+            "symbol": best_sym, "slug": v["slug"], "side": _exec_side, "mode": "real",
             "strat": "steven_engine", "token_id": tid, "entry_price": avg,
             "filled_shares": filled, "cost": round(filled * avg, 2),
             "start_ts": v["p"]["start_ts"], "pair": v["p"].get("pair"), "end_ts": v["p"]["end_ts"],
             "opened_ts": time.time(), "buffer": 0.0, "dca_stage": 0,
         }
         _hist = self.state.setdefault("steven_side_history", [])
-        _hist.append(majority_side)
+        _hist.append(_exec_side)  # traque le cote REELLEMENT parie (pour l'inversion sur serie)
         del _hist[:-50]  # ne garde que les 50 derniers, largement assez pour streak_reversal_n<=30
         # DETAIL DU CONSENSUS (Steven 03/09, "on voit pas de ligne qui dit
         # clairement qu'il y a eu un consensus") : meme richesse que la
         # ligne "pas de consensus" (mouvement de CHAQUE actif), pas juste le
         # compte agrege -- pour voir d'un coup d'oeil qui a vote quoi.
         _mv_detail = " ".join(f"{s}={v2['movement']:+.3%}" for s, v2 in sorted(moves.items()))
+        _rev_note = f" [REVERSE : signal={majority_side} -> parie {_exec_side}]" if cfg.get("reverse_mode") else ""
         self._log(
-            f"🌟 [STEVEN-ENGINE] {best_sym} {v['slug']} {majority_side} "
+            f"🌟 [STEVEN-ENGINE] {best_sym} {v['slug']} {_exec_side} "
             f"{filled} parts @ {avg:.3f} ({round(filled * avg, 2)}$) "
             f"gap_ratio={best_gap:.2f} consensus={len(agreeing)}/{len(moves)} avg_move={avg_move:+.4%} "
-            f"| {_mv_detail} -> ouverte, hold to resolution"
+            f"| {_mv_detail}{_rev_note} -> ouverte, hold to resolution"
         )
 
     def _try_favorite(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
