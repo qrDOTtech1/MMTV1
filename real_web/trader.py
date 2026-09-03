@@ -2082,6 +2082,12 @@ TWAP_ORACLE_EARLY_MIN_PRICE = 0.50
 # (backteste) contre 99%+ pour le pari certain -- des le premier gain reel,
 # on securise l'essentiel des parts en une fois, valeurs de depart a affiner
 # par backtest (voir session).
+# DESACTIVE (Steven 03/09, "le tp du early qui vend 75% peut etre mis en
+# pause aussi ... bah les deux ca servirait a rien sinon, go !") : le flip
+# (<=42c) est mort depuis le plancher d'achat a 0.50 ; le TP general n'a pas
+# cette limite de prix (s'applique encore aux entrees 50-99c actuelles) mais
+# coupe quand meme sur demande explicite -- remettre a True pour reactiver.
+TWAP_ORACLE_EARLY_TP_ENABLED = False
 TWAP_ORACLE_EARLY_TP_ARM_PCT = 0.10
 TWAP_ORACLE_EARLY_TP_SELL_FRACTION = 0.75
 # Steven 03/09 ("regarde la pos early qui a perdu alors qu'on aurait pu TP !
@@ -9618,7 +9624,8 @@ class MultiTrader:
             # le premier tick de gain reel, vend TOUT (pas 75%), pas
             # d'attente de 10% (qui ratait des positions parties trop vite,
             # cf entree 0.230 pic 0.255 jamais vendu, retombee a 0.010).
-            if (pos.get("strat") == "twap_oracle_early" and not pos.get("_early_tp_done")
+            if (TWAP_ORACLE_EARLY_TP_ENABLED
+                    and pos.get("strat") == "twap_oracle_early" and not pos.get("_early_tp_done")
                     and entry <= TWAP_ORACLE_EARLY_FLIP_MAX_ENTRY):
                 _cb = self._get_bid(pos)
                 if _cb is not None and _cb > entry:
@@ -9659,7 +9666,7 @@ class MultiTrader:
             # premier gain reel constate, on securise une grosse partie des
             # parts en UNE fois, le reliquat continue jusqu'a resolution
             # (ou le verrou/paliers ci-dessous s'il grimpe encore).
-            if pos.get("strat") == "twap_oracle_early" and not pos.get("_early_tp_done"):
+            if TWAP_ORACLE_EARLY_TP_ENABLED and pos.get("strat") == "twap_oracle_early" and not pos.get("_early_tp_done"):
                 if peak >= TWAP_ORACLE_EARLY_TP_ARM_PCT:
                     _cb = self._get_bid(pos)
                     if _cb is not None and (_cb - entry) / entry >= TWAP_ORACLE_EARLY_TP_ARM_PCT:
