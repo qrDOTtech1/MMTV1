@@ -2070,10 +2070,13 @@ TWAP_ORACLE_PROB_THRESHOLD = 0.95
 # comparer les stats sans rien casser du mecanisme existant.
 TWAP_ORACLE_EARLY_ENABLED = True
 TWAP_ORACLE_EARLY_BET_USD = 5.0  # Steven 03/09 -- releve de 1$ a la demande, malgre l'echantillon encore petit (8 essais, pnl resolu legerement negatif a ce stade)
-# Steven 03/09 ("n'ajoute SURTOUT PAS de barriere ici") : demande explicite
-# et confirmee -- des qu'un pred brut apparait, achat IMMEDIAT au premier
-# prix disponible, sans aucun plafond/plancher de prix. Ne pas re-ajouter de
-# filtre de prix sur ce chemin sans consigne explicite contraire.
+# Steven 03/09 ("n'ajoute SURTOUT PAS de barriere ici") -> puis REVERSE le
+# meme jour ("faut empecher les early under 50c tout court") apres plusieurs
+# pertes reelles concentrees sur les entrees tres bon marche (0.01-0.34$,
+# le plus de variance = le plus de retournements brutaux avant qu'un TP
+# puisse s'executer). Plancher applique desormais a l'ACHAT lui-meme, pas
+# seulement au TP apres coup.
+TWAP_ORACLE_EARLY_MIN_PRICE = 0.50
 # TP DEDIE au pari precoce (Steven 03/09, "cette ligne aurait declenche TP
 # immediatement, laisser le reste courir") : ~81% de win rate seulement
 # (backteste) contre 99%+ pour le pari certain -- des le premier gain reel,
@@ -9332,7 +9335,15 @@ class MultiTrader:
                 if _early_open_key not in mk["open"]:
                     _etid = token_ids[outcomes.index(_early_side)]
                     _e_ask = quotes.get(_early_side, (None, None, None))[1]
-                    if _e_ask is not None and 0 < _e_ask < 1:
+                    if _e_ask is not None and 0 < _e_ask < TWAP_ORACLE_EARLY_MIN_PRICE:
+                        self._tlog(
+                            f"twap_early_toolow_{sym}",
+                            f"🧪 [TWAP-ORACLE-EARLY-DIAG] {sym} {slug} {_early_side} prix {_e_ask:.3f} "
+                            f"< plancher {TWAP_ORACLE_EARLY_MIN_PRICE} -> trop de variance, skip "
+                            f"(reessaie si le prix remonte)",
+                            every=5.0,
+                        )
+                    elif _e_ask is not None and _e_ask < 1:
                         _e_budget = round(min(TWAP_ORACLE_EARLY_BET_USD, self._investable()), 2)
                         if _e_budget < MIN_BUDGET_USD:
                             self._tlog(
