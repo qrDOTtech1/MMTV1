@@ -2047,7 +2047,7 @@ FAV_BUDGET_USD = 500.0         # Steven 19/08 -- borne de toute facon par invest
 # backtest (cotes 1-2c ou le marche n'a pas encore rattrape l'evidence).
 # HOLD TO RESOLUTION STRICT : strat="twap_oracle" volontairement absent de
 # la liste geree par _manage_pnl_tier_exits -> jamais de TP/SL dessus.
-TWAP_ORACLE_ENABLED = True
+TWAP_ORACLE_ENABLED = False  # Steven 03/09 -- pause pour se concentrer sur Steven Engine, remettre a True pour reactiver
 TWAP_ORACLE_BET_USD = 5.0      # Steven 02/09 -- plancher demande, "augmenter si ca tourne bien"
 TWAP_ORACLE_MIN_SECS_LEFT = 5
 TWAP_ORACLE_MAX_SECS_LEFT = 120  # Steven 02/09 -- releve 58->120, voir REGIME PROBABILISTE
