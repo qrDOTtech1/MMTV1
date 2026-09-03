@@ -4337,10 +4337,14 @@ class MultiTrader:
                 # DEJA entre. Un modele entraine la-dessus ne peut pas
                 # repondre a "faut-il entrer sur cette fenetre ?", puisqu'il
                 # n'a jamais vu une seule fenetre non prise.
-                try:
-                    self._collect_market_data()
-                except Exception as e:
-                    self._tlog("collect_market_err", f"💥 [COLLECTE] erreur: {e}")
+                # Steven 03/09 ("mets en pause la collecte qui bug et prend
+                # des ressources") : pilotable en live (etat, pas un
+                # redeploiement) pour pouvoir couper/reactiver instantanement.
+                if self.state.get("market_collect_enabled", True):
+                    try:
+                        self._collect_market_data()
+                    except Exception as e:
+                        self._tlog("collect_market_err", f"💥 [COLLECTE] erreur: {e}")
                 # PASSE 1 -- SL/TP EN PRIORITE ABSOLUE, TOUS SYMBOLES D'ABORD
                 # (Steven 02/09, enquete sur un SL declenche a -33% au lieu de
                 # -0.1%). Trouve : cette boucle traitait chaque symbole en
@@ -5869,7 +5873,7 @@ class MultiTrader:
                     if self._live is None:
                         # provoque l'initialisation du client (lecture seule)
                         self._read_cash(max_age=300)
-                    if self._live is not None:
+                    if self._live is not None and self.state.get("market_collect_enabled", True):
                         self._collect_market_data()
                 except Exception as e:
                     self._tlog("collecte_rech_err", f"⚠️ [COLLECTE] {str(e)[:160]}")

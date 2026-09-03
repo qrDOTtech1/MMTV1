@@ -159,6 +159,18 @@ def arb_budget():
     return jsonify(trader.set_arb_budget(d.get("arb_budget")))
 
 
+@app.route("/api/market-collect", methods=["GET", "POST"])
+def market_collect():
+    if request.method == "GET":
+        return jsonify({"enabled": trader.state.get("market_collect_enabled", True)})
+    d = request.get_json(force=True)
+    enabled = bool(d.get("enabled", True))
+    trader.state["market_collect_enabled"] = enabled
+    trader._save()
+    trader._log(f"⚙️ [COLLECTE] {'reactivee' if enabled else 'mise en pause'} (Steven 03/09)")
+    return jsonify({"ok": True, "enabled": enabled})
+
+
 @app.route("/api/marketmaker", methods=["POST"])
 def marketmaker():
     d = request.get_json(force=True)
