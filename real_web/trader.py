@@ -4997,6 +4997,18 @@ class MultiTrader:
                     for s in SYMBOLS
                     if _active_modes.get(s, "off") not in ("off",)
                 ]
+                # STEVEN ENGINE (Steven 03/09, "il doit overide les reglages
+                # generaux du bot") : a besoin des 6 marches pour evaluer le
+                # consensus, INDEPENDAMMENT du mode on/off par symbole utilise
+                # par les autres strategies -- sinon un symbole "off" n'est
+                # meme pas recupere ici, avant meme d'atteindre la logique du
+                # moteur. Ne force PAS le mode "real"/"paper" du symbole (ca
+                # resterait "off" partout ailleurs), juste la RECUPERATION du
+                # marche pour que le moteur puisse le lire.
+                if self.steven_config().get("enabled"):
+                    for _s in STEVEN_SYMBOLS:
+                        if _s.lower() not in _active_tags:
+                            _active_tags.append(_s.lower())
                 markets = find_active_markets(_active_tags if _active_tags else None)
                 by_sym = {}
                 _ws_tokens = []
@@ -9574,9 +9586,15 @@ class MultiTrader:
         # 73-85%), pas le prix du contrat de prediction". Le prix du contrat
         # (bande 0.47-0.62) n'intervient qu'a l'EXECUTION plus bas, jamais
         # dans la detection du traineur.
+        # Steven 03/09 ("il doit overide les reglages generaux du bot") : PAS
+        # de filtre sur self.state["modes"] ici -- ce moteur lit et trade les
+        # 6 marches independamment du on/off par symbole des autres
+        # strategies (le fetch en amont a deja ete etendu pour les 6, voir
+        # _loop()). Seul DISABLED_SYMBOLS (desactivation mesuree, pas un
+        # simple on/off manuel) reste respecte.
         moves = {}   # sym -> {"m","p","outcomes","token_ids","slug","movement"}
         for sym in STEVEN_SYMBOLS:
-            if self.state["modes"].get(sym, "off") not in ("real", "paper"):
+            if sym in DISABLED_SYMBOLS:
                 continue
             cands = [mp for mp in by_sym.get(sym, []) if mp[1]["end_ts"] > now]
             if not cands:
