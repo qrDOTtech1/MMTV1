@@ -4059,11 +4059,13 @@ class MultiTrader:
             # meilleur compromis volume/qualite que la valeur initiale.
             "move_epsilon": STEVEN_MOVE_EPSILON,
             # Steven 03/09 ("ca ne devrait pas arriver, enquete sur la
-            # solution" -- retournement juste apres l'entree) : exige que le
-            # signal (cote+traineur) tienne 30s avant d'executer. Backteste :
-            # win_rate 62.2%->67.3%, pnl/trade +1.56$->+2.42$, au prix du
-            # volume (127->52 signaux/24h). 0 = desactive (immediat).
-            "confirmation_secs": 30,
+            # solution" -- retournement juste apres l'entree) : exige que la
+            # DIRECTION tienne avant d'executer (voir plus bas : confirme
+            # desormais sur le sens, pas le traineur exact, qui change trop
+            # souvent). Backteste a 30s : win_rate 62.2%->67.3%,
+            # pnl/trade +1.56$->+2.42$. Reduit a 20s (Steven 03/09, "je
+            # voudrais qu'on le set a 20sec"). 0 = desactive (immediat).
+            "confirmation_secs": 20,
         }
         saved = self.state.get("steven_engine") or {}
         defaults.update({k: v for k, v in saved.items() if k in defaults})
@@ -9984,11 +9986,18 @@ class MultiTrader:
         # "partielle").
         _confirm_s = cfg.get("confirmation_secs", 0)
         if _confirm_s > 0:
+            # Steven 03/09 ("le compte se remet a 0 en plein milieu alors
+            # que ca va dans la meme direction") : confirme sur le TERRAIN,
+            # pas sur le traineur exact -- le traineur precis change souvent
+            # de symbole (SOL->BTC->BNB) meme quand le consensus Up/Down
+            # reste stable, ce qui reinitialisait le compteur a tort. On ne
+            # confirme desormais que la DIRECTION (majority_side) ; le
+            # traineur execute est celui detecte au moment ou la
+            # confirmation aboutit (le plus a jour), pas celui du premier
+            # instant.
             _pending = self.state.get("steven_pending_signal")
-            if not _pending or _pending.get("side") != majority_side or _pending.get("sym") != best_sym:
-                self.state["steven_pending_signal"] = {
-                    "side": majority_side, "sym": best_sym, "first_seen": now,
-                }
+            if not _pending or _pending.get("side") != majority_side:
+                self.state["steven_pending_signal"] = {"side": majority_side, "first_seen": now}
                 _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) detecte, "
                       f"en attente de confirmation ({_confirm_s:.0f}s)")
                 return
