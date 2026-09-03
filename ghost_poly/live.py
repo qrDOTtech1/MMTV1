@@ -484,7 +484,15 @@ class PolyLive:
                             "cur_value": cur_val,
                             "cash_pnl": float(p.get("cashPnl", 0) or 0),
                         }
-                    won = cur_price >= 0.5 or cur_val > 0.01
+                    # BUG CRITIQUE TROUVE (Steven 03/09, "double-win sur les 2
+                    # jambes du meme marche") : currentValue peut rester
+                    # perime (pas encore rafraichi a 0) sur la jambe PERDANTE
+                    # pendant que curPrice y est deja tombe pres de 0 -> le
+                    # "or cur_val > 0.01" la faisait quand meme compter comme
+                    # gagnee, en meme temps que l'autre jambe (curPrice pres
+                    # de 1). Des que `resolved` est vrai, curPrice EST deja
+                    # a l'extreme (0 ou 1) par construction -- s'y fier seul.
+                    won = cur_price >= 0.5
                     return {
                         "resolved": True,
                         "found": True,

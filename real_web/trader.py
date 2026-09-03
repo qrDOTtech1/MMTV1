@@ -4090,6 +4090,11 @@ class MultiTrader:
             # * min(size_scale_max, 1 + gap_ratio). False = mise fixe (avant).
             "size_scale_by_gap": True,
             "size_scale_max": 2.0,
+            # Veto si l'oracle (convergence TWAP, meme actif) est en
+            # desaccord avec le signal Steven Engine -- backteste : accord
+            # +0.30$/trade (n=152) vs desaccord -1.31$/trade (n=8), veto net
+            # +45.56$ contre +35.04$ sans filtre sur le meme echantillon.
+            "oracle_veto_enabled": True,
         }
         saved = self.state.get("steven_engine") or {}
         defaults.update({k: v for k, v in saved.items() if k in defaults})
@@ -4100,7 +4105,7 @@ class MultiTrader:
             return {"ok": False, "message": "payload invalide"}
         cfg = self.steven_config()
         for k, v in patch.items():
-            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled", "reverse_mode", "size_scale_by_gap"):
+            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled", "reverse_mode", "size_scale_by_gap", "oracle_veto_enabled"):
                 cfg[k] = bool(v)
                 continue
             if k == "excluded_symbols":
@@ -9773,6 +9778,42 @@ class MultiTrader:
                     f"-> verrouille @ {cur_bid:.3f} (entree {entry:.3f}) pnl={pnl:+.3f}$"
                 )
 
+    def _oracle_agrees(self, sym, p, side):
+        """Avis de l'oracle (regime dual, MEME logique que _try_twap_oracle)
+        sur `sym` a l'instant present, pour verifier l'accord avec le signal
+        Steven Engine -- lecture seule, ne pose AUCUN ordre, n'a pas besoin
+        que TWAP_ORACLE_ENABLED soit actif. Retourne True/False (avis donne,
+        d'accord ou pas) ou None (pas assez de donnees -> ne pas veto)."""
+        try:
+            now = synced_now()
+            secs_left = p.get("end_ts", now) - now
+            pair = p.get("pair")
+            if not pair or not hasattr(self, "_ws"):
+                return None
+            from core.btc_updown import _strike_at
+            strike = _strike_at(pair, p["start_ts"], slug=p.get("slug"))
+            if not strike:
+                return None
+            if secs_left > 60:
+                from core.btc_updown import probability_above_strike
+                spot = self._ws.spot_price(pair)
+                if not spot:
+                    return None
+                p_up = probability_above_strike(pair, spot, strike, secs_left)
+                if p_up is None:
+                    return None
+                pred = "Up" if p_up >= 0.5 else "Down"
+            else:
+                sig = self._ws.twap_oracle_signal(sym, strike, now, secs_left)
+                if not sig:
+                    return None
+                pred = sig.get("pred")
+                if not pred:
+                    return None
+            return pred == side
+        except Exception:
+            return None
+
     def _manage_steven_engine(self, by_sym):
         """Detection + gestion du 'Steven Engine' (voir STEVEN_* ci-dessus).
         Cross-symbole par construction : lit les 6 marches ensemble a CHAQUE
@@ -10071,6 +10112,22 @@ class MultiTrader:
 
         v = moves[best_sym]
         mk = self.state["markets"][best_sym]
+        # VETO ORACLE<->STEVEN ENGINE (Steven 03/09, "ca serait interessant
+        # qu'elles se coordonnent" + "continue, que manque-t-il pour devenir
+        # SOTA") : backteste sur 24h reelles (287 fenetres) -- quand l'oracle
+        # (convergence TWAP sur ce meme actif) est en DESACCORD avec le
+        # signal Steven Engine, ces trades sont NETS NEGATIFS (-1.31$/trade,
+        # n=8) alors que l'accord est positif (+0.30$/trade, n=152). Veto
+        # simple bat le "1/2 mise en desaccord" sur le meme echantillon
+        # (+45.56$ vs +40.30$ vs +35.04$ actuel). Ne se declenche QUE si
+        # l'oracle a un avis (avis absent = pas de veto, on garde le trade).
+        if cfg.get("oracle_veto_enabled", True):
+            _ov = self._oracle_agrees(best_sym, v["p"], majority_side)
+            if _ov is False:
+                _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) VETO : "
+                      f"oracle en desaccord sur ce meme actif -> skip")
+                self.state.pop("steven_pending_signal", None)
+                return
         # REVERSE ENGINE (Steven 03/09, "ca s'est passe toute la soiree, un
         # manque a gagner de 90e... un filtre post achat qui pose Down au
         # lieu de Up et inversement") : verifie sur 10 vrais trades recents
