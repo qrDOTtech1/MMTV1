@@ -2076,7 +2076,7 @@ TWAP_ORACLE_EARLY_BET_USD = 5.0  # Steven 03/09 -- releve de 1$ a la demande, ma
 # le plus de variance = le plus de retournements brutaux avant qu'un TP
 # puisse s'executer). Plancher applique desormais a l'ACHAT lui-meme, pas
 # seulement au TP apres coup.
-TWAP_ORACLE_EARLY_MIN_PRICE = 0.50
+TWAP_ORACLE_EARLY_MIN_PRICE = 0.75  # Steven 03/09 -- releve de 0.50 a 0.75
 # TP DEDIE au pari precoce (Steven 03/09, "cette ligne aurait declenche TP
 # immediatement, laisser le reste courir") : ~81% de win rate seulement
 # (backteste) contre 99%+ pour le pari certain -- des le premier gain reel,
