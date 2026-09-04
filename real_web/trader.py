@@ -4029,6 +4029,7 @@ class MultiTrader:
         "confirmation_secs": (0, 120),
         "size_scale_max": (1.0, 5.0),
         "multi_laggard_max": (1, 6),
+        "min_window_elapsed_secs": (0, 240),
     }
     STEVEN_DCA_MODES = ("standard", "off", "capped", "on_confirm")
     STEVEN_PRESETS = ("selective", "balanced", "aggressive")
@@ -4106,6 +4107,11 @@ class MultiTrader:
             # la traine plutot que de laisser passer le cycle.
             "multi_laggard_max": 3,
             "multi_laggard_fallback": True,
+            # Steven 04/09 ("un pote a remarque que le bot ouvre trop tot
+            # dans la fenetre") : n'accepte aucun signal sur un actif tant
+            # que ce nombre de secondes ne s'est pas ecoule depuis le DEBUT
+            # de sa fenetre de 5min -- backteste WR 61.5%->78.7%.
+            "min_window_elapsed_secs": 90,
         }
         saved = self.state.get("steven_engine") or {}
         defaults.update({k: v for k, v in saved.items() if k in defaults})
@@ -9870,6 +9876,14 @@ class MultiTrader:
             strike = _strike_at(pair, p["start_ts"], slug=m.get("slug"))
             spot = _binance_price(pair)
             if not strike or not spot:
+                continue
+            # FILTRE DEBUT DE FENETRE (Steven 04/09, retour d'un pote externe
+            # "le bot ouvre trop tot dans la fenetre") : backteste sur 24h
+            # Binance fraiches -- win rate 61.5% dans les 90 premieres
+            # secondes vs 78.7% apres 150s (n=585 vs n=169, echantillons
+            # solides). Le mouvement de prix n'a pas eu le temps de se
+            # distinguer du bruit par rapport au strike si trop tot.
+            if now - p["start_ts"] < cfg.get("min_window_elapsed_secs", 90):
                 continue
             moves[sym] = {
                 "m": m, "p": p, "outcomes": outcomes, "token_ids": token_ids,
