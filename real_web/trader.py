@@ -9917,11 +9917,23 @@ class MultiTrader:
                 # loss") : 0.0 = jamais de coupe, hold to resolution comme
                 # l'oracle sur cette position -- risque de -100% assume.
                 if cfg["stoploss_price"] > 0 and cur <= cfg["stoploss_price"]:
+                    # LIQUIDITE STOP-LOSS (Steven 04/09, "un SL qui n'arrive pas
+                    # a vendre reste expose au risque qu'il etait cense couper")
+                    # : passe une urgence CROISSANTE a chaque echec consecutif
+                    # sur cette position -- _prix_vente_absorbant() descend
+                    # alors plus loin dans le carnet plutot que de rester bloque
+                    # au meilleur bid perime. Reset des qu'une vente (meme
+                    # partielle) passe. Ne cree PAS de liquidite qui n'existe
+                    # pas (carnet vraiment vide = toujours 0), mais evite de
+                    # rester passif sur un carnet fin qui fuit.
+                    _sl_fails = pos.get("_sl_fails", 0)
                     sold = self._sell_orphan(
                         tid, shares, f" {sym} {pos['slug']} {pos['side']} STEVEN-SL",
                         entry_price=entry, symbol=sym, slug=pos.get("slug"), side=pos.get("side"),
+                        urgence=min(_sl_fails, 3),
                     )
                     if sold > 0:
+                        pos["_sl_fails"] = 0
                         realized = round(sold * (cur - entry), 3)
                         pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + realized, 3)
                         pos["filled_shares"] = round(shares - sold, 2)
@@ -9936,6 +9948,23 @@ class MultiTrader:
                             self._log(
                                 f"🛑 [STEVEN-SL] {sym} {pos['slug']} {pos['side']} "
                                 f"@ {cur:.3f} (entree {entry:.3f}) pnl={pnl:+.3f}$"
+                            )
+                    else:
+                        # VISIBILITE (Steven 04/09) : avant, un SL bloque par
+                        # manque de liquidite ne laissait qu'un "carnet vide"
+                        # generique dans _sell_orphan, noye dans le bruit des
+                        # autres strategies -- indistinguable d'un simple SL
+                        # normal qui n'a pas encore declenche. Marque la
+                        # position et remonte 1 ligne DEDIEE au 1er echec (pas
+                        # a chaque cycle, throttle deja gere par _tlog).
+                        pos["_sl_fails"] = _sl_fails + 1
+                        if _sl_fails == 0:
+                            self._tlog(
+                                f"steven_sl_stuck_{sym}_{pos['slug']}",
+                                f"🧊 [STEVEN-SL-BLOQUE] {sym} {pos['slug']} {pos['side']} "
+                                f"@ {cur:.3f} : SL declenche mais rien vendu (liquidite), "
+                                f"reessaie avec urgence croissante",
+                                every=30.0,
                             )
                     continue
                 # DCA (moyenne a la baisse) : comportement pilote par
@@ -10219,6 +10248,22 @@ class MultiTrader:
                 _diag(f"traineur {best_sym} {majority_side} @ {ask:.3f} valide mais budget insuffisant "
                       f"({budget:.2f}$ < {MIN_BUDGET_USD}$)")
                 continue
+            # PROFONDEUR DE CARNET (Steven 04/09, "on regarde comment ameliorer
+            # la liquidite d'execution" -- vu en prod : XRP a fui de 0.52 a
+            # 0.99+ en ~15s sur 4 tentatives, ETH s'est retrouve sans aucun bid
+            # a la sortie SL) : verifie AVANT d'envoyer l'ordre qu'il y a assez
+            # de taille jusqu'au cap qu'on va payer -- sinon on sait deja qu'on
+            # va chasser un prix qui fuit plutot que d'obtenir un fill propre,
+            # autant garder le cycle pour un traineur exploitable.
+            _cap_px = round(min(ask + 0.05, 0.99), 2)
+            _depth_info = self._ws.ask_depth_upto(tid, _cap_px) if hasattr(self, "_ws") else None
+            if _depth_info is not None:
+                _, _ask_depth, _ = _depth_info
+                _need_shares = budget / ask
+                if _ask_depth < _need_shares * 1.2:
+                    _diag(f"traineur {best_sym} {majority_side} @ {ask:.3f} valide mais carnet trop fin "
+                          f"({_ask_depth:.1f} parts dispo pour {_need_shares:.1f} requises) -> skip")
+                    continue
             with self._order_lock:
                 res = self._live.snipe_buy_market(tid, round(min(ask + 0.05, 0.99), 2), budget)
             filled = res.get("filled_shares", 0.0)
