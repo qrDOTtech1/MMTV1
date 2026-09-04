@@ -9967,7 +9967,19 @@ class MultiTrader:
             if not pair:
                 continue
             strike = _strike_at(pair, p["start_ts"], slug=m.get("slug"))
-            spot = _binance_price(pair)
+            # VITESSE (Steven 04/09, "on bosse en WS, le bot devrait voir la
+            # meme chose en direct que les logs, pas avoir de retard") : le
+            # carnet Polymarket est deja pousse en WS (instantane), mais le
+            # spot Binance ici passait par _binance_price() -- un appel REST
+            # (cache 1.5s seulement) refait a CHAQUE cycle pour CHAQUE
+            # symbole en boucle sequentielle = jusqu'a 6 aller-retours reseau
+            # par tour, le vrai goulot d'etranglement (pas le WS). self._ws
+            # a DEJA un flux Binance temps reel en memoire (utilise par
+            # l'oracle) -- on le prefere ici, REST en secours seulement si le
+            # flux WS est absent/perime.
+            spot = self._ws.spot_price(pair) if hasattr(self, "_ws") else None
+            if spot is None:
+                spot = _binance_price(pair)
             if not strike or not spot:
                 continue
             # FILTRE DEBUT DE FENETRE (Steven 04/09, retour d'un pote externe
