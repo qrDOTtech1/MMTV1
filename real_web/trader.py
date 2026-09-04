@@ -4030,6 +4030,9 @@ class MultiTrader:
         "size_scale_max": (1.0, 5.0),
         "multi_laggard_max": (1, 6),
         "min_window_elapsed_secs": (0, 240),
+        "stoploss_pct": (0.0, 0.95),
+        "high_price_threshold": (0.5, 0.99),
+        "high_price_min_scale": (0.1, 1.0),
     }
     STEVEN_DCA_MODES = ("standard", "off", "capped", "on_confirm")
     STEVEN_PRESETS = ("selective", "balanced", "aggressive")
@@ -4112,6 +4115,18 @@ class MultiTrader:
             # que ce nombre de secondes ne s'est pas ecoule depuis le DEBUT
             # de sa fenetre de 5min -- backteste WR 61.5%->78.7%.
             "min_window_elapsed_secs": 90,
+            # Steven 04/09 ("stop-loss relatif a l'entree") : coupe si le prix
+            # tombe sous CE pourcentage du prix d'achat, en plus (le plus
+            # strict des deux) du plancher absolu stoploss_price -- plafonne
+            # la perte a ~50% peu importe si l'entree etait a 0.72 ou 0.91.
+            # 0.0 = desactive ce mecanisme, ne garde que stoploss_price.
+            "stoploss_pct": 0.5,
+            # Steven 04/09 ("reduire la mise sur les achats chers") : un ask
+            # tres haut (pres de 1) laisse tres peu de marge de gain (+9-10%
+            # max) pour un risque quasi total si ca tourne mal -- asymetrique.
+            "high_price_reduce_enabled": True,
+            "high_price_threshold": 0.85,
+            "high_price_min_scale": 0.5,
         }
         saved = self.state.get("steven_engine") or {}
         defaults.update({k: v for k, v in saved.items() if k in defaults})
@@ -4122,7 +4137,7 @@ class MultiTrader:
             return {"ok": False, "message": "payload invalide"}
         cfg = self.steven_config()
         for k, v in patch.items():
-            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled", "reverse_mode", "size_scale_by_gap", "oracle_veto_enabled", "multi_laggard_fallback"):
+            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled", "reverse_mode", "size_scale_by_gap", "oracle_veto_enabled", "multi_laggard_fallback", "high_price_reduce_enabled"):
                 cfg[k] = bool(v)
                 continue
             if k == "excluded_symbols":
@@ -9950,7 +9965,20 @@ class MultiTrader:
                 # l'oracle). Desactivable (Steven 03/09, "faut couper le stop
                 # loss") : 0.0 = jamais de coupe, hold to resolution comme
                 # l'oracle sur cette position -- risque de -100% assume.
-                if cfg["stoploss_price"] > 0 and cur <= cfg["stoploss_price"]:
+                # STOP-LOSS RELATIF A L'ENTREE (Steven 04/09, analyse
+                # screenshots : bande d'achat 0.72-0.91 -> un seuil ABSOLU
+                # fixe (0.18) laissait une entree a 0.91 perdre ~80% avant de
+                # couper, contre ~75% pour une entree a 0.72 -- les grosses
+                # pertes observees (-5.60$ a -10.87$) venaient de la. Le seuil
+                # EFFECTIF est le plus haut des deux (coupe des que L'UN des
+                # deux est franchi) : entry*stoploss_pct plafonne la perte a
+                # ~50% peu importe le prix paye, stoploss_price reste un
+                # plancher absolu pour les entrees deja tres basses.
+                _sl_threshold = max(
+                    cfg["stoploss_price"],
+                    entry * cfg.get("stoploss_pct", 0.5) if cfg.get("stoploss_pct", 0.5) > 0 else 0.0,
+                )
+                if _sl_threshold > 0 and cur <= _sl_threshold:
                     # LIQUIDITE STOP-LOSS (Steven 04/09, "un SL qui n'arrive pas
                     # a vendre reste expose au risque qu'il etait cense couper")
                     # : passe une urgence CROISSANTE a chaque echec consecutif
@@ -10277,6 +10305,18 @@ class MultiTrader:
             if cfg.get("size_scale_by_gap", True):
                 _scale = min(cfg.get("size_scale_max", 2.0), 1 + best_gap)
                 _stake_usd = round(cfg["initial_buy_usd"] * _scale, 2)
+            # MISE REDUITE SUR LES ACHATS CHERS (Steven 04/09, screenshots :
+            # un ask pres de 1 laisse tres peu de marge de gain (+9-10% max)
+            # pour un risque de perte quasi totale si ca tourne mal --
+            # asymetrique. Reduit lineairement de x1 (au seuil) a
+            # high_price_min_scale (a ask=1.0), sans toucher au win rate
+            # (n'affecte QUE la taille, pas la decision d'entrer ou non).
+            if cfg.get("high_price_reduce_enabled", True):
+                _hp_thr = cfg.get("high_price_threshold", 0.85)
+                if ask > _hp_thr:
+                    _hp_min = cfg.get("high_price_min_scale", 0.5)
+                    _hp_scale = max(_hp_min, 1 - (ask - _hp_thr) / (1.0 - _hp_thr) * (1 - _hp_min))
+                    _stake_usd = round(_stake_usd * _hp_scale, 2)
             budget = round(min(_stake_usd, self._investable(), cfg["bankroll_usd"] - total_cost), 2)
             if budget < MIN_BUDGET_USD:
                 _diag(f"traineur {best_sym} {majority_side} @ {ask:.3f} valide mais budget insuffisant "
