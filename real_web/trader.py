@@ -4028,6 +4028,7 @@ class MultiTrader:
         "streak_reversal_n": (2, 30),
         "confirmation_secs": (0, 120),
         "size_scale_max": (1.0, 5.0),
+        "multi_laggard_max": (1, 6),
     }
     STEVEN_DCA_MODES = ("standard", "off", "capped", "on_confirm")
     STEVEN_PRESETS = ("selective", "balanced", "aggressive")
@@ -4095,6 +4096,16 @@ class MultiTrader:
             # +0.30$/trade (n=152) vs desaccord -1.31$/trade (n=8), veto net
             # +45.56$ contre +35.04$ sans filtre sur le meme echantillon.
             "oracle_veto_enabled": True,
+            # MULTI-TRAINEURS (Steven 03/09, "qu'il ne vise pas qu'un seul
+            # traineur, poste sur les 2-3-4 marches en meme temps selon
+            # bankroll dispo") : au lieu de n'ouvrir QUE le meilleur gap, on
+            # ouvre jusqu'a multi_laggard_max marches par cycle (bornes par
+            # max_concurrent et la bankroll restante comme toujours). Si
+            # aucun traineur ne franchit laggard_gap mais que le consensus
+            # tient, multi_laggard_fallback parie quand meme sur les plus a
+            # la traine plutot que de laisser passer le cycle.
+            "multi_laggard_max": 3,
+            "multi_laggard_fallback": True,
         }
         saved = self.state.get("steven_engine") or {}
         defaults.update({k: v for k, v in saved.items() if k in defaults})
@@ -4105,7 +4116,7 @@ class MultiTrader:
             return {"ok": False, "message": "payload invalide"}
         cfg = self.steven_config()
         for k, v in patch.items():
-            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled", "reverse_mode", "size_scale_by_gap", "oracle_veto_enabled"):
+            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled", "reverse_mode", "size_scale_by_gap", "oracle_veto_enabled", "multi_laggard_fallback"):
                 cfg[k] = bool(v)
                 continue
             if k == "excluded_symbols":
@@ -10050,32 +10061,41 @@ class MultiTrader:
         # "agreeing"), celui qui a le plus de retard EN PROPORTION du
         # mouvement moyen du groupe (gap_ratio=1 -> n'a pas bouge du tout,
         # gap_ratio=0 -> a deja suivi autant que la moyenne).
-        best_sym, best_gap = None, 0.0
-        _all_gaps = {}
+        # SELECTION MULTI-TRAINEURS (Steven 03/09, "qu'il ne vise pas qu'un
+        # seul traineur, poster sur les 2-3-4 marches en meme temps selon
+        # bankroll dispo") : au lieu de n'executer QUE sur le meilleur gap,
+        # on prend jusqu'a multi_laggard_max traineurs (les plus en retard
+        # d'abord). Si AUCUN ne franchit le seuil laggard_gap mais que le
+        # consensus tient quand meme (avg_move>0 deja verifie ci-dessus), on
+        # parie en fallback sur les plus a la traine (gap>0, meme sous le
+        # seuil) plutot que de laisser passer le cycle sans rien faire.
         _excluded = set(cfg.get("excluded_symbols") or [])
+        _check_side = majority_side
+        if cfg.get("reverse_mode"):
+            _check_side = "Down" if majority_side == "Up" else "Up"
+        _all_gaps = {}
         for s, v in moves.items():
             if s in _excluded:
                 continue
-            m_ = signed_move(v)
-            gap_ratio = (avg_move - m_) / avg_move
-            _all_gaps[s] = gap_ratio
-            if gap_ratio >= cfg["laggard_gap"] and gap_ratio > best_gap:
-                # verifie le cote REELLEMENT parie (apres reverse eventuel),
-                # sinon le dedoublonnage checke le mauvais cote en mode reverse.
-                _check_side = majority_side
-                if cfg.get("reverse_mode"):
-                    _check_side = "Down" if majority_side == "Up" else "Up"
-                key_check = f"{v['slug']}|{_check_side}"
-                mk_s = self.state["markets"].get(s)
-                if mk_s and key_check in mk_s["open"]:
-                    continue
-                best_sym, best_gap = s, gap_ratio
-        if best_sym is None:
-            _gap_str = " ".join(f"{s}={g:.2f}" for s, g in sorted(_all_gaps.items(), key=lambda kv: -kv[1]))
+            # verifie le cote REELLEMENT parie (apres reverse eventuel),
+            # sinon le dedoublonnage checke le mauvais cote en mode reverse.
+            key_check = f"{v['slug']}|{_check_side}"
+            mk_s = self.state["markets"].get(s)
+            if mk_s and key_check in mk_s["open"]:
+                continue
+            _all_gaps[s] = (avg_move - signed_move(v)) / avg_move
+        _sorted_gaps = sorted(_all_gaps.items(), key=lambda kv: -kv[1])
+        _max_n = max(1, int(cfg.get("multi_laggard_max", 3)))
+        selected = [s for s, g in _sorted_gaps if g >= cfg["laggard_gap"]][:_max_n]
+        if not selected and cfg.get("multi_laggard_fallback", True):
+            selected = [s for s, g in _sorted_gaps if g > 0][:_max_n]
+        if not selected:
+            _gap_str = " ".join(f"{s}={g:.2f}" for s, g in _sorted_gaps)
             _diag(f"consensus {majority_side} ({len(agreeing)} actifs, avg_move={avg_move:+.3%}) "
-                  f"mais aucun traineur >= gap {cfg['laggard_gap']:.2f} : {_gap_str}")
+                  f"mais aucun traineur exploitable : {_gap_str}")
             self.state.pop("steven_pending_signal", None)
             return
+        best_sym, best_gap = selected[0], _all_gaps[selected[0]]
 
         # CONFIRMATION (Steven 03/09, "ca ne devrait pas arriver, enquete
         # sur la solution" -- un retournement juste apres l'entree) :
@@ -10110,102 +10130,115 @@ class MultiTrader:
             # confirme -- efface l'etat en attente, on execute ci-dessous
             self.state.pop("steven_pending_signal", None)
 
-        v = moves[best_sym]
-        mk = self.state["markets"][best_sym]
-        # VETO ORACLE<->STEVEN ENGINE (Steven 03/09, "ca serait interessant
-        # qu'elles se coordonnent" + "continue, que manque-t-il pour devenir
-        # SOTA") : backteste sur 24h reelles (287 fenetres) -- quand l'oracle
-        # (convergence TWAP sur ce meme actif) est en DESACCORD avec le
-        # signal Steven Engine, ces trades sont NETS NEGATIFS (-1.31$/trade,
-        # n=8) alors que l'accord est positif (+0.30$/trade, n=152). Veto
-        # simple bat le "1/2 mise en desaccord" sur le meme echantillon
-        # (+45.56$ vs +40.30$ vs +35.04$ actuel). Ne se declenche QUE si
-        # l'oracle a un avis (avis absent = pas de veto, on garde le trade).
-        if cfg.get("oracle_veto_enabled", True):
-            _ov = self._oracle_agrees(best_sym, v["p"], majority_side)
-            if _ov is False:
-                _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) VETO : "
-                      f"oracle en desaccord sur ce meme actif -> skip")
-                self.state.pop("steven_pending_signal", None)
-                return
-        # REVERSE ENGINE (Steven 03/09, "ca s'est passe toute la soiree, un
-        # manque a gagner de 90e... un filtre post achat qui pose Down au
-        # lieu de Up et inversement") : verifie sur 10 vrais trades recents
-        # (verite Binance independante) -- pnl reel -14.40$ vs +16.95$ si
-        # inverse, meme mise, meme prix. Toute la logique de DETECTION
-        # (consensus, traineur, gap, confirmation) reste INCHANGEE ; seul le
-        # cote EXECUTE a l'achat est flip. Togglable (reverse_mode=False
-        # coupe instantanement, revient au comportement normal).
-        _exec_side = majority_side
-        if cfg.get("reverse_mode"):
-            _exec_side = "Down" if majority_side == "Up" else "Up"
-        tid = v["token_ids"][v["outcomes"].index(_exec_side)]
-        _, ask, _ = self._book_quote(tid)
-        if ask is None or ask <= 0 or ask >= 1:
-            _diag(f"traineur {best_sym} {majority_side}{'->reverse '+_exec_side if cfg.get('reverse_mode') else ''} "
-                  f"(gap={best_gap:.2f}) trouve mais ask indisponible -> skip")
-            return
-        # BANDE D'ACHAT (filtre d'EXECUTION du traineur DEJA identifie par le
-        # mouvement de prix ci-dessus, PAS le signal lui-meme) : n'achete que
-        # si son propre marche de prediction n'est pas deja extreme -- payer
-        # 90c laisse trop peu de marge de gain, un prix a 5c signifie que le
-        # marche lui-meme ne croit pas du tout au rattrapage.
-        if not (cfg["buy_min_price"] <= ask <= cfg["buy_max_price"]):
-            _diag(f"traineur {best_sym} {majority_side}{'->reverse '+_exec_side if cfg.get('reverse_mode') else ''} "
-                  f"(gap={best_gap:.2f}) trouve mais prix {ask:.3f} "
-                  f"hors bande [{cfg['buy_min_price']:.2f}, {cfg['buy_max_price']:.2f}] -> skip")
-            return
-        # BANDE A EVITER (optionnelle) : meme si dans la bande d'achat
-        # normale, un sous-intervalle peut etre exclu explicitement.
-        _avoid_max = cfg.get("avoid_max_price", 0.0)
-        if _avoid_max > 0 and cfg.get("avoid_min_price", 0.0) <= ask <= _avoid_max:
-            _diag(f"traineur {best_sym} {majority_side} @ {ask:.3f} tombe dans la bande a eviter "
-                  f"[{cfg.get('avoid_min_price', 0.0):.2f}, {_avoid_max:.2f}] -> skip")
-            return
-        # MISE PROPORTIONNELLE AU GAP (Steven 03/09, "optimiser d'avantage")
-        # : plus le traineur a de retard sur la moyenne du groupe, plus le
-        # signal historique est fort -- on scale la mise de base en
-        # consequence (borne a size_scale_max pour limiter le risque).
-        _stake_usd = cfg["initial_buy_usd"]
-        if cfg.get("size_scale_by_gap", True):
-            _scale = min(cfg.get("size_scale_max", 2.0), 1 + best_gap)
-            _stake_usd = round(cfg["initial_buy_usd"] * _scale, 2)
-        budget = round(min(_stake_usd, self._investable(), cfg["bankroll_usd"] - total_cost), 2)
-        if budget < MIN_BUDGET_USD:
-            _diag(f"traineur {best_sym} {majority_side} @ {ask:.3f} valide mais budget insuffisant "
-                  f"({budget:.2f}$ < {MIN_BUDGET_USD}$)")
-            return
-        with self._order_lock:
-            res = self._live.snipe_buy_market(tid, round(min(ask + 0.05, 0.99), 2), budget)
-        filled = res.get("filled_shares", 0.0)
-        if filled <= 0:
-            self._log(f"⚠️ [STEVEN-ENGINE] {best_sym} {v['slug']} {_exec_side} non rempli (err={res.get('error', '')})")
-            return
-        avg = res.get("avg_cost") or ask
-        self._add_slug_spent(mk, v["slug"], round(filled * avg, 2))
-        key = f"{v['slug']}|{_exec_side}"
-        mk["open"][key] = {
-            "symbol": best_sym, "slug": v["slug"], "side": _exec_side, "mode": "real",
-            "strat": "steven_engine", "token_id": tid, "entry_price": avg,
-            "filled_shares": filled, "cost": round(filled * avg, 2),
-            "start_ts": v["p"]["start_ts"], "pair": v["p"].get("pair"), "end_ts": v["p"]["end_ts"],
-            "opened_ts": time.time(), "buffer": 0.0, "dca_stage": 0,
-        }
-        _hist = self.state.setdefault("steven_side_history", [])
-        _hist.append(_exec_side)  # traque le cote REELLEMENT parie (pour l'inversion sur serie)
-        del _hist[:-50]  # ne garde que les 50 derniers, largement assez pour streak_reversal_n<=30
-        # DETAIL DU CONSENSUS (Steven 03/09, "on voit pas de ligne qui dit
-        # clairement qu'il y a eu un consensus") : meme richesse que la
-        # ligne "pas de consensus" (mouvement de CHAQUE actif), pas juste le
-        # compte agrege -- pour voir d'un coup d'oeil qui a vote quoi.
-        _mv_detail = " ".join(f"{s}={v2['movement']:+.3%}" for s, v2 in sorted(moves.items()))
-        _rev_note = f" [REVERSE : signal={majority_side} -> parie {_exec_side}]" if cfg.get("reverse_mode") else ""
-        self._log(
-            f"🌟 [STEVEN-ENGINE] {best_sym} {v['slug']} {_exec_side} "
-            f"{filled} parts @ {avg:.3f} ({round(filled * avg, 2)}$) "
-            f"gap_ratio={best_gap:.2f} consensus={len(agreeing)}/{len(moves)} avg_move={avg_move:+.4%} "
-            f"| {_mv_detail}{_rev_note} -> ouverte, hold to resolution"
-        )
+        # EXECUTION SUR CHAQUE TRAINEUR SELECTIONNE (jusqu'a multi_laggard_max
+        # marches simultanes, 1 seul appel _live.snipe_buy_market par
+        # traineur -- chacun a son propre budget/bande/veto, et total_cost/
+        # n_open sont mis a jour a CHAQUE achat pour ne jamais depasser la
+        # bankroll ni max_concurrent en cours de boucle).
+        for best_sym in selected:
+            if n_open >= cfg["max_concurrent"]:
+                _diag(f"multi-traineur : max_concurrent ({cfg['max_concurrent']:.0f}) atteint, "
+                      f"{len(selected) - selected.index(best_sym)} traineur(s) restants ignores ce cycle")
+                break
+            best_gap = _all_gaps[best_sym]
+            v = moves[best_sym]
+            mk = self.state["markets"][best_sym]
+            # VETO ORACLE<->STEVEN ENGINE (Steven 03/09, "ca serait interessant
+            # qu'elles se coordonnent" + "continue, que manque-t-il pour devenir
+            # SOTA") : backteste sur 24h reelles (287 fenetres) -- quand l'oracle
+            # (convergence TWAP sur ce meme actif) est en DESACCORD avec le
+            # signal Steven Engine, ces trades sont NETS NEGATIFS (-1.31$/trade,
+            # n=8) alors que l'accord est positif (+0.30$/trade, n=152). Veto
+            # simple bat le "1/2 mise en desaccord" sur le meme echantillon
+            # (+45.56$ vs +40.30$ vs +35.04$ actuel). Ne se declenche QUE si
+            # l'oracle a un avis (avis absent = pas de veto, on garde le trade).
+            if cfg.get("oracle_veto_enabled", True):
+                _ov = self._oracle_agrees(best_sym, v["p"], majority_side)
+                if _ov is False:
+                    _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) VETO : "
+                          f"oracle en desaccord sur ce meme actif -> skip")
+                    continue
+            # REVERSE ENGINE (Steven 03/09, "ca s'est passe toute la soiree, un
+            # manque a gagner de 90e... un filtre post achat qui pose Down au
+            # lieu de Up et inversement") : verifie sur 10 vrais trades recents
+            # (verite Binance independante) -- pnl reel -14.40$ vs +16.95$ si
+            # inverse, meme mise, meme prix. Toute la logique de DETECTION
+            # (consensus, traineur, gap, confirmation) reste INCHANGEE ; seul le
+            # cote EXECUTE a l'achat est flip. Togglable (reverse_mode=False
+            # coupe instantanement, revient au comportement normal).
+            _exec_side = majority_side
+            if cfg.get("reverse_mode"):
+                _exec_side = "Down" if majority_side == "Up" else "Up"
+            tid = v["token_ids"][v["outcomes"].index(_exec_side)]
+            _, ask, _ = self._book_quote(tid)
+            if ask is None or ask <= 0 or ask >= 1:
+                _diag(f"traineur {best_sym} {majority_side}{'->reverse '+_exec_side if cfg.get('reverse_mode') else ''} "
+                      f"(gap={best_gap:.2f}) trouve mais ask indisponible -> skip")
+                continue
+            # BANDE D'ACHAT (filtre d'EXECUTION du traineur DEJA identifie par le
+            # mouvement de prix ci-dessus, PAS le signal lui-meme) : n'achete que
+            # si son propre marche de prediction n'est pas deja extreme -- payer
+            # 90c laisse trop peu de marge de gain, un prix a 5c signifie que le
+            # marche lui-meme ne croit pas du tout au rattrapage.
+            if not (cfg["buy_min_price"] <= ask <= cfg["buy_max_price"]):
+                _diag(f"traineur {best_sym} {majority_side}{'->reverse '+_exec_side if cfg.get('reverse_mode') else ''} "
+                      f"(gap={best_gap:.2f}) trouve mais prix {ask:.3f} "
+                      f"hors bande [{cfg['buy_min_price']:.2f}, {cfg['buy_max_price']:.2f}] -> skip")
+                continue
+            # BANDE A EVITER (optionnelle) : meme si dans la bande d'achat
+            # normale, un sous-intervalle peut etre exclu explicitement.
+            _avoid_max = cfg.get("avoid_max_price", 0.0)
+            if _avoid_max > 0 and cfg.get("avoid_min_price", 0.0) <= ask <= _avoid_max:
+                _diag(f"traineur {best_sym} {majority_side} @ {ask:.3f} tombe dans la bande a eviter "
+                      f"[{cfg.get('avoid_min_price', 0.0):.2f}, {_avoid_max:.2f}] -> skip")
+                continue
+            # MISE PROPORTIONNELLE AU GAP (Steven 03/09, "optimiser d'avantage")
+            # : plus le traineur a de retard sur la moyenne du groupe, plus le
+            # signal historique est fort -- on scale la mise de base en
+            # consequence (borne a size_scale_max pour limiter le risque).
+            _stake_usd = cfg["initial_buy_usd"]
+            if cfg.get("size_scale_by_gap", True):
+                _scale = min(cfg.get("size_scale_max", 2.0), 1 + best_gap)
+                _stake_usd = round(cfg["initial_buy_usd"] * _scale, 2)
+            budget = round(min(_stake_usd, self._investable(), cfg["bankroll_usd"] - total_cost), 2)
+            if budget < MIN_BUDGET_USD:
+                _diag(f"traineur {best_sym} {majority_side} @ {ask:.3f} valide mais budget insuffisant "
+                      f"({budget:.2f}$ < {MIN_BUDGET_USD}$)")
+                continue
+            with self._order_lock:
+                res = self._live.snipe_buy_market(tid, round(min(ask + 0.05, 0.99), 2), budget)
+            filled = res.get("filled_shares", 0.0)
+            if filled <= 0:
+                self._log(f"⚠️ [STEVEN-ENGINE] {best_sym} {v['slug']} {_exec_side} non rempli (err={res.get('error', '')})")
+                continue
+            avg = res.get("avg_cost") or ask
+            self._add_slug_spent(mk, v["slug"], round(filled * avg, 2))
+            key = f"{v['slug']}|{_exec_side}"
+            mk["open"][key] = {
+                "symbol": best_sym, "slug": v["slug"], "side": _exec_side, "mode": "real",
+                "strat": "steven_engine", "token_id": tid, "entry_price": avg,
+                "filled_shares": filled, "cost": round(filled * avg, 2),
+                "start_ts": v["p"]["start_ts"], "pair": v["p"].get("pair"), "end_ts": v["p"]["end_ts"],
+                "opened_ts": time.time(), "buffer": 0.0, "dca_stage": 0,
+            }
+            n_open += 1
+            total_cost += round(filled * avg, 2)
+            _hist = self.state.setdefault("steven_side_history", [])
+            _hist.append(_exec_side)  # traque le cote REELLEMENT parie (pour l'inversion sur serie)
+            del _hist[:-50]  # ne garde que les 50 derniers, largement assez pour streak_reversal_n<=30
+            # DETAIL DU CONSENSUS (Steven 03/09, "on voit pas de ligne qui dit
+            # clairement qu'il y a eu un consensus") : meme richesse que la
+            # ligne "pas de consensus" (mouvement de CHAQUE actif), pas juste le
+            # compte agrege -- pour voir d'un coup d'oeil qui a vote quoi.
+            _mv_detail = " ".join(f"{s}={v2['movement']:+.3%}" for s, v2 in sorted(moves.items()))
+            _rev_note = f" [REVERSE : signal={majority_side} -> parie {_exec_side}]" if cfg.get("reverse_mode") else ""
+            _multi_note = f" [multi {selected.index(best_sym)+1}/{len(selected)}]" if len(selected) > 1 else ""
+            self._log(
+                f"🌟 [STEVEN-ENGINE] {best_sym} {v['slug']} {_exec_side} "
+                f"{filled} parts @ {avg:.3f} ({round(filled * avg, 2)}$) "
+                f"gap_ratio={best_gap:.2f} consensus={len(agreeing)}/{len(moves)} avg_move={avg_move:+.4%} "
+                f"| {_mv_detail}{_rev_note}{_multi_note} -> ouverte, hold to resolution"
+            )
 
     def _try_favorite(self, sym, m, p, quotes, outcomes, token_ids, mode, mk, slug):
         """PARI DIRECTIONNEL SUR LE FAVORI (Steven 05/08, demande explicite).
