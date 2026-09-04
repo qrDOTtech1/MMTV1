@@ -9890,6 +9890,50 @@ class MultiTrader:
         if not cfg["enabled"]:
             return
         now = synced_now()
+
+        # ── 0) SUIVI DES ORDRES PASSIFS EN ATTENTE (Steven 04/09, "ca le fait
+        # souvent (meme dans le passe)" -- 17 echecs BNB / 11 ETH mesures en
+        # quelques heures, carnet Polymarket REELLEMENT vide au moment du
+        # signal, confirme via get_book_sync -- pas un bug de cache. Meme
+        # mecanisme que l'oracle (twap_oracle_pending) : un LIMIT GTC pose en
+        # secours au lieu d'exiger un ask deja present, verifie/finalise ICI
+        # a CHAQUE cycle, AVANT toute nouvelle detection. DOIT passer avant
+        # tout gate "enabled"-like plus bas.
+        for _sym_p in STEVEN_SYMBOLS:
+            _mk_p = self.state["markets"].get(_sym_p)
+            if not _mk_p:
+                continue
+            _pend_p = _mk_p.setdefault("steven_pending", {})
+            for _pkey in list(_pend_p.keys()):
+                _pend = _pend_p[_pkey]
+                _held = self._live.position_size(_pend["token_id"]) if self._live else -1.0
+                if _held and _held > 0.01:
+                    _filled = round(_held, 2)
+                    _avg = _pend["price"]
+                    self._add_slug_spent(_mk_p, _pend["slug"], round(_filled * _avg, 2))
+                    _mk_p["open"][_pkey] = {
+                        "symbol": _sym_p, "slug": _pend["slug"], "side": _pend["side"], "mode": "real",
+                        "strat": "steven_engine", "token_id": _pend["token_id"], "entry_price": _avg,
+                        "filled_shares": _filled, "cost": round(_filled * _avg, 2),
+                        "start_ts": _pend.get("start_ts", now), "pair": None, "end_ts": _pend["end_ts"],
+                        "opened_ts": time.time(), "buffer": 0.0, "dca_stage": 0,
+                    }
+                    del _pend_p[_pkey]
+                    self._log(
+                        f"✅ [STEVEN-ENGINE] {_sym_p} {_pend['slug']} {_pend['side']} {_filled} parts "
+                        f"@ {_avg:.3f} (ordre passif rempli) -> ouverte, hold to resolution"
+                    )
+                elif now >= _pend["end_ts"] - 3:
+                    try:
+                        self._live.cancel_order(_pend["order_id"])
+                    except Exception:
+                        pass
+                    del _pend_p[_pkey]
+                    self._log(
+                        f"🌟 [STEVEN-ENGINE] {_sym_p} {_pend['slug']} {_pend['side']} ordre passif "
+                        f"jamais rempli -> annule (fin de fenetre)"
+                    )
+
         from core.btc_updown import _binance_price, _strike_at
 
         # ── 1) lit le MOUVEMENT DE PRIX REEL (Binance, spot vs strike du
@@ -10277,8 +10321,49 @@ class MultiTrader:
             tid = v["token_ids"][v["outcomes"].index(_exec_side)]
             _, ask, _ = self._book_quote(tid)
             if ask is None or ask <= 0 or ask >= 1:
-                _diag(f"traineur {best_sym} {majority_side}{'->reverse '+_exec_side if cfg.get('reverse_mode') else ''} "
-                      f"(gap={best_gap:.2f}) trouve mais ask indisponible -> skip")
+                # ORDRE PASSIF EN SECOURS (Steven 04/09, "ca le fait souvent
+                # (meme dans le passe)... go implemente l'ordre limite
+                # passif") : le carnet est REELLEMENT vide a cet instant
+                # (confirme via get_book_sync en amont dans _book_quote, pas
+                # un bug de cache) -- au lieu d'abandonner le signal, pose un
+                # LIMIT GTC au prix plafond de la bande et le laisse vivre le
+                # reste de la fenetre (suivi/finalise en (0) en haut de
+                # fonction). Meme mecanisme que l'oracle (twap_oracle_pending).
+                _pkey = f"{v['slug']}|{_exec_side}"
+                if _pkey in mk.setdefault("steven_pending", {}):
+                    _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) ordre passif "
+                          f"deja en attente sur ce marche -> pas de doublon")
+                    continue
+                _stake_p = cfg["initial_buy_usd"]
+                if cfg.get("size_scale_by_gap", True):
+                    _stake_p = round(cfg["initial_buy_usd"] * min(cfg.get("size_scale_max", 2.0), 1 + best_gap), 2)
+                _passive_price = cfg["buy_max_price"]
+                if cfg.get("high_price_reduce_enabled", True) and _passive_price > cfg.get("high_price_threshold", 0.85):
+                    _hp_thr = cfg.get("high_price_threshold", 0.85)
+                    _hp_min = cfg.get("high_price_min_scale", 0.5)
+                    _hp_scale = max(_hp_min, 1 - (_passive_price - _hp_thr) / (1.0 - _hp_thr) * (1 - _hp_min))
+                    _stake_p = round(_stake_p * _hp_scale, 2)
+                _passive_budget = round(min(_stake_p, self._investable(), cfg["bankroll_usd"] - total_cost), 2)
+                if _passive_budget < MIN_BUDGET_USD:
+                    _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) aucun ask, "
+                          f"budget insuffisant pour un ordre passif -> skip")
+                    continue
+                _passive_shares = round(_passive_budget / _passive_price, 2)
+                res_p = self._live.post_limit_buy(tid, _passive_price, _passive_shares)
+                if res_p.get("success") and res_p.get("order_id"):
+                    mk["steven_pending"][_pkey] = {
+                        "side": _exec_side, "token_id": tid, "order_id": res_p["order_id"],
+                        "price": _passive_price, "posted_ts": time.time(),
+                        "end_ts": v["p"]["end_ts"], "start_ts": v["p"]["start_ts"], "slug": v["slug"],
+                    }
+                    self._log(
+                        f"🌟 [STEVEN-ENGINE] {best_sym} {v['slug']} {_exec_side} aucun ask -> ordre "
+                        f"PASSIF pose @ {_passive_price:.2f} ({_passive_shares} parts, "
+                        f"{_passive_budget:.2f}$), gap={best_gap:.2f}"
+                    )
+                else:
+                    _diag(f"traineur {best_sym} {majority_side} (gap={best_gap:.2f}) aucun ask, ordre "
+                          f"passif a echoue aussi (err={res_p.get('error', '')}) -> skip")
                 continue
             # BANDE D'ACHAT (filtre d'EXECUTION du traineur DEJA identifie par le
             # mouvement de prix ci-dessus, PAS le signal lui-meme) : n'achete que
