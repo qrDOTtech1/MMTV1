@@ -51,6 +51,9 @@ PAIRS = {
     "BNB": "bnbusdt",
 }
 STALE_S = 3.0  # au-dela, une valeur est jugee perimee -> l'appelant fallback REST
+STUCK_MAX_S = 8.0  # au-dela sans le MOINDRE changement de bid/ask (BTCUSDT
+# est parmi les paires les plus liquides au monde, un vrai flux ne rejoue
+# jamais le meme prix 8s+) -> traite comme perime, force le fallback REST
 TWAP_STALE_S = 10.0  # cadence de publication Chainlink non documentee precisement
 # -> tolerance plus large que le spot Binance pour ne pas rejeter une TWAP
 # valide juste parce qu'elle publie un peu moins souvent qu'un bookTicker.
@@ -63,6 +66,16 @@ class WSFeed:
         self._lock = threading.Lock()
         # Binance : sym -> (bid, ask, ts)
         self._spot = {}
+        # GARDE ANTI-FIGE (Steven 05/09, "le marche bouge bien mais le bot
+        # dit 0" -- BTC/BNB retrouves fixes a la MEME valeur exacte de bid/ask
+        # pendant 9-19s d'affilee dans les logs reels, alors que d'autres
+        # paires bougeaient normalement sur la meme connexion). STALE_S ne
+        # regarde QUE l'age du dernier MESSAGE recu -- si le flux continue de
+        # recevoir des messages (timestamp qui avance) mais renvoie
+        # exactement le meme prix (deja vu une fois : Steven 03/09, meme
+        # symptome sur l'oracle), le check de fraicheur normal ne detecte
+        # rien. sym -> (last_mid, unchanged_since_ts).
+        self._spot_stuck = {}
         # RTDS Chainlink TWAP : sym -> (value, ts), un dict par fenetre
         self._twap30 = {}
         self._twap60 = {}
@@ -200,11 +213,19 @@ class WSFeed:
 
     # ── lecture (ce que le trader appelle) ──
     def spot(self, pair_or_sym):
-        """(bid, ask, mid) spot Binance temps reel, ou None si absent/stale."""
+        """(bid, ask, mid) spot Binance temps reel, ou None si absent/stale.
+        GARDE ANTI-FIGE (Steven 05/09) : au-dela de STUCK_MAX_S sans le
+        MOINDRE changement de prix (pas juste sans message), traite comme
+        perime aussi -- un flux qui rejoue le meme snapshot reste "frais" au
+        sens de STALE_S (le timestamp avance) sans etre une vraie donnee
+        vivante."""
         sym = pair_or_sym.replace("USDT", "") if "USDT" in pair_or_sym else pair_or_sym
         with self._lock:
             v = self._spot.get(sym)
+            stuck = self._spot_stuck.get(sym)
         if not v or time.time() - v[2] > STALE_S:
+            return None
+        if stuck and time.time() - stuck[1] > STUCK_MAX_S:
             return None
         bid, ask, _ = v
         return bid, ask, round((bid + ask) / 2, 6)
@@ -423,6 +444,11 @@ class WSFeed:
                                 float(d["a"]),
                                 now,
                             )
+                            _prev_mid, _since = self._spot_stuck.get(sym, (None, now))
+                            if _prev_mid is None or mid != _prev_mid:
+                                self._spot_stuck[sym] = (mid, now)
+                            # sinon (prix identique) : garde le meme _since,
+                            # ne fait rien -> le compteur d'immobilite continue.
                             dq = self._oracle_ticks[sym]
                             dq.append((now, mid))
                             while dq and now - dq[0][0] > 90:
