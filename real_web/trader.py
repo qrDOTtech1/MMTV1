@@ -6018,11 +6018,45 @@ class MultiTrader:
                                         continue
                                     if now_r - pos.get("opened_ts", now_r) < 45:
                                         continue
+                                    # ENREGISTRE avant nettoyage (Steven 04/09,
+                                    # "il ya eu plein de vrais gains Polymarket
+                                    # jamais comptes cote nous") : cette boucle
+                                    # (60s) tourne plus vite que le polling
+                                    # normal de _resolve_market (backoff
+                                    # 180-600s) -- des qu'une position gagnante
+                                    # est auto-redeemee par redeem_resolved()
+                                    # ci-dessus, elle disparait du solde reel
+                                    # AVANT que _resolve_market ait la main, et
+                                    # cette boucle se contentait de l'effacer de
+                                    # l'etat SANS JAMAIS l'ecrire dans
+                                    # mk['trades'] -- des dizaines de vrais
+                                    # gains jamais comptabilises dans win_rate/
+                                    # pnl. Meme heuristique price_log que
+                                    # _resolve_market (25/07) quand la
+                                    # resolution officielle n'est pas dispo ici.
+                                    shares = pos.get("filled_shares", 0)
+                                    cost = pos.get("cost", round(shares * pos.get("entry_price", 0), 2))
+                                    _hist = pos.get("price_log") or []
+                                    _last_px = _hist[-1]["price"] if _hist else None
+                                    won = (_last_px >= 0.5) if _last_px is not None else None
+                                    if won is None:
+                                        self._tlog(
+                                            f"reconcil_ghost_{tid[:8]}",
+                                            f"👻 [RECONCILIATION] {sym} {key} position trackee mais absente "
+                                            f"on-chain (token {tid[:12]}...) et aucun historique de prix -- "
+                                            f"nettoyage sans pouvoir determiner le resultat",
+                                        )
+                                        open_r.pop(key, None)
+                                        continue
+                                    pnl = round((shares - cost) if won else -cost, 3)
+                                    pos.update(win=won, pnl=pnl, resolved_by="reconciliation", exit_price=_last_px)
+                                    mk_r.setdefault("trades", []).append(pos)
+                                    self._record_trade_pnl(sym, pnl)
                                     self._tlog(
                                         f"reconcil_ghost_{tid[:8]}",
-                                        f"👻 [RECONCILIATION] {sym} {key} position trackee mais absente "
-                                        f"on-chain (token {tid[:12]}...) -- probablement deja resolue/vendue, "
-                                        f"nettoyage de l'etat interne",
+                                        f"👻 [RECONCILIATION] {sym} {key} absente on-chain (probablement "
+                                        f"resolue+redeemee) -> enregistree {'GAGNEE' if won else 'PERDUE'} "
+                                        f"(price_log) pnl={pnl:+.3f}$",
                                     )
                                     open_r.pop(key, None)
                             self._save()
