@@ -5163,10 +5163,16 @@ class MultiTrader:
                 # cross-symbole, tourne UNE fois par cycle complet (pas par
                 # symbole comme le reste) puisqu'il a besoin de voir les 6
                 # marches ensemble pour detecter un "traineur".
-                try:
-                    self._manage_steven_engine(by_sym)
-                except Exception as e:
-                    self._log(f"💥 [STEVEN-ENGINE] erreur: {e}")
+                # VITESSE (Steven 04/09, "creuse le vrai goulot d'etranglement")
+                # : tournait ICI, en SEQUENTIEL, AVANT le dispatch parallele des
+                # 15 marches -- tout appel reseau bloquant a l'interieur (carnet
+                # REST en secours, veto oracle, POST de l'ordre passif) ajoutait
+                # son temps EN PLUS de celui des 15 autres marches au lieu d'etre
+                # absorbe dedans. Soumis desormais au MEME pool que les autres
+                # marches, en PARALLELE (le lock self._order_lock deja existant
+                # protege deja les soumissions d'ordres concurrentes -- seul le
+                # sequencement temporel change, pas la surface de risque).
+                _steven_future = self._pool.submit(self._manage_steven_engine, by_sym)
 
                 # workflow d'UN marche (detection + gestion + resolution). Chaque
                 # marche ne touche QUE son propre sous-etat mk -> pas de conflit
@@ -5252,6 +5258,10 @@ class MultiTrader:
                 # la detection/resolution des autres. On attend la fin du tick avant
                 # de sauver (une seule ecriture d'etat, pas de concurrence sur le fichier).
                 futures = [self._pool.submit(_process, sym) for sym in SYMBOLS]
+                try:
+                    _steven_future.result()
+                except Exception as e:
+                    self._log(f"💥 [STEVEN-ENGINE] erreur: {e}")
                 for f in futures:
                     try:
                         f.result()
