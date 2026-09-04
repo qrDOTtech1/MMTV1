@@ -5122,7 +5122,9 @@ class MultiTrader:
                     for _s in STEVEN_SYMBOLS:
                         if _s.lower() not in _active_tags:
                             _active_tags.append(_s.lower())
+                _t_markets0 = time.time()
                 markets = find_active_markets(_active_tags if _active_tags else None)
+                _t_markets1 = time.time()
                 by_sym = {}
                 _ws_tokens = []
                 for m in markets:
@@ -5257,16 +5259,34 @@ class MultiTrader:
                 # TOUS les marches en parallele -> un fill reel long ne bloque plus
                 # la detection/resolution des autres. On attend la fin du tick avant
                 # de sauver (une seule ecriture d'etat, pas de concurrence sur le fichier).
+                _t_dispatch0 = time.time()
                 futures = [self._pool.submit(_process, sym) for sym in SYMBOLS]
+                _t_dispatch1 = time.time()
                 try:
                     _steven_future.result()
                 except Exception as e:
                     self._log(f"💥 [STEVEN-ENGINE] erreur: {e}")
+                _t_steven_done = time.time()
                 for f in futures:
                     try:
                         f.result()
                     except Exception as e:
                         self._log(f"💥 erreur marche: {e}")
+                _t_symbols_done = time.time()
+                # CHRONOMETRAGE PAR ETAPE (Steven 04/09, "creuse le vrai
+                # goulot d'etranglement" -- 2 fixes deja tentes (WS Binance,
+                # parallelisation Steven Engine) sans effet mesurable, temps
+                # de rendre le vrai temps VISIBLE au lieu de deviner encore).
+                # Throttle a 1 ligne/3s pour rester lisible sans noyer le log.
+                self._tlog(
+                    "chrono_boucle",
+                    f"⏱️ [CHRONO-BOUCLE] markets={round(_t_markets1-_t_markets0,2)}s "
+                    f"dispatch={round(_t_dispatch1-_t_dispatch0,3)}s "
+                    f"steven_wait={round(_t_steven_done-_t_dispatch1,2)}s "
+                    f"symbols_wait={round(_t_symbols_done-_t_steven_done,2)}s "
+                    f"total_ici={round(_t_symbols_done-tick_t0,2)}s",
+                    every=3.0,
+                )
                 # ── MM : resolution des positions archivees par un roulement de
                 # fenetre, HORS thread par-symbole (pending est partage) ──
                 if self.state.get("mm", {}).get("enabled"):
