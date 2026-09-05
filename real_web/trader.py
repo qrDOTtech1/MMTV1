@@ -10158,8 +10158,11 @@ class MultiTrader:
                     # d'immobilite (plancher a 10% pour ne pas vendre sur le
                     # moindre bruit).
                     _stagnant_s = now - pos.get("_trail_peak_ts", now)
-                    if _stagnant_s > 30:
-                        _giveback *= max(0.3, 1 - (_stagnant_s - 30) / 90)
+                    if _stagnant_s > 1.5:
+                        # Steven 05/09 ("30s c'est trop long, le prix ne
+                        # stagnera JAMAIS pendant 30s, max 1-2s") : resserre
+                        # quasi immediatement des que le pic n'avance plus.
+                        _giveback *= max(0.3, 1 - (_stagnant_s - 1.5) / 10)
                     _giveback = max(0.10, _giveback)
                     if _cur_pct <= _peak * (1 - _giveback):
                         _sold_t = self._sell_orphan(
