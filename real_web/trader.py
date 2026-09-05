@@ -10659,6 +10659,30 @@ class MultiTrader:
                 self._log(f"⚠️ [STEVEN-ENGINE] {best_sym} {v['slug']} {_exec_side} non rempli (err={res.get('error', '')})")
                 continue
             avg = res.get("avg_cost") or ask
+            # GARDE POST-REMPLISSAGE (Steven 05/09, "ce trade n'aurait jamais
+            # du arriver" -- incident reel : bande verifiee a l'ask [0.75,
+            # 0.91], mais le marche s'est effondre PENDANT l'execution de
+            # snipe_buy_market() -> rempli a 0.450, tres en dessous du
+            # plancher. snipe_buy_market() ne plafonne QUE le prix MAX paye,
+            # jamais de MINIMUM -- un effondrement pendant l'ordre n'est donc
+            # jamais bloque cote achat. Un prix obtenu bien plus bas que prevu
+            # au moment precis de l'achat n'est pas une aubaine : c'est le
+            # signe que le marche vient de retourner. Si le prix reel obtenu
+            # est sous le plancher voulu, on desengage IMMEDIATEMENT (urgence
+            # max) au lieu de garder une position dont le vrai contexte
+            # d'entree n'est plus celui qui l'a justifiee.
+            if avg < cfg["buy_min_price"]:
+                self._log(
+                    f"🚨 [STEVEN-ENGINE] {best_sym} {v['slug']} {_exec_side} rempli @ {avg:.3f} "
+                    f"(sous le plancher {cfg['buy_min_price']:.2f} -- le marche a chute PENDANT "
+                    f"l'achat) -> desengagement immediat, ce fill ne reflete plus le signal"
+                )
+                self._sell_orphan(
+                    tid, filled, f" {best_sym} {v['slug']} {_exec_side} STEVEN-ABORT-FILL",
+                    entry_price=avg, symbol=best_sym, slug=v["slug"], side=_exec_side,
+                    urgence=3,
+                )
+                continue
             self._add_slug_spent(mk, v["slug"], round(filled * avg, 2))
             key = f"{v['slug']}|{_exec_side}"
             mk["open"][key] = {
