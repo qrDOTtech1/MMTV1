@@ -10139,8 +10139,28 @@ class MultiTrader:
                 _cur_pct = (cur - entry) / entry
                 if _cur_pct > _peak:
                     pos["_trail_peak"] = _peak = _cur_pct
+                    pos["_trail_peak_ts"] = now
                 if cfg.get("trail_enabled", True) and _peak >= cfg.get("trail_arm_pct", 0.05):
-                    _giveback = cfg.get("trail_giveback_pct", 0.35)
+                    # RISQUE PROPORTIONNEL A L'EXPOSITION (Steven 05/09,
+                    # "reduire le risque proportionnellement a l'exposition
+                    # plutot que le meme seuil pour tout le monde") : une mise
+                    # doublee par size_scale_by_gap a 2x plus d'argent en jeu
+                    # -- verrouille plus vite/plus serre sur les grosses
+                    # positions, plutot que le meme % de redonne pour tous.
+                    _size_ratio = max(1.0, pos.get("cost", 0.0) / max(cfg.get("initial_buy_usd", 5.0), 0.01))
+                    _giveback = cfg.get("trail_giveback_pct", 0.35) / _size_ratio
+                    # RESSERRE SI STAGNATION (Steven 05/09, "tp qui se resserre
+                    # si le prix stagne et cesse de monter") : un pic qui ne
+                    # progresse plus depuis un moment est un signal que le
+                    # mouvement s'essouffle -- moins de raison d'attendre
+                    # patiemment un retournement complet de X%, on resserre
+                    # progressivement la tolerance de redonne avec le temps
+                    # d'immobilite (plancher a 10% pour ne pas vendre sur le
+                    # moindre bruit).
+                    _stagnant_s = now - pos.get("_trail_peak_ts", now)
+                    if _stagnant_s > 30:
+                        _giveback *= max(0.3, 1 - (_stagnant_s - 30) / 90)
+                    _giveback = max(0.10, _giveback)
                     if _cur_pct <= _peak * (1 - _giveback):
                         _sold_t = self._sell_orphan(
                             tid, shares, f" {sym} {pos['slug']} {pos['side']} STEVEN-TRAIL",
