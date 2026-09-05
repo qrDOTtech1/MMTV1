@@ -10205,7 +10205,18 @@ class MultiTrader:
                         # quasi immediatement des que le pic n'avance plus.
                         _giveback *= max(0.3, 1 - (_stagnant_s - 1.5) / 10)
                     _giveback = max(0.10, _giveback)
-                    if _cur_pct <= _peak * (1 - _giveback):
+                    # GARDE ANTI-SLIP (Steven 05/09, "il voulait TP et ca a
+                    # slip en meme temps" -- vu en reel : pic+24%, mais entre
+                    # la lecture de `cur` et l'execution FAK reelle, le
+                    # marche a continue de chuter et la vente s'est faite
+                    # SOUS l'entree (perte deguisee en 'TP'). `_sell_orphan`
+                    # priorise le remplissage garanti (bon pour un stop-loss)
+                    # mais peut absorber plusieurs niveaux de carnet en
+                    # dessous du prix lu ici. Ne tente le verrou que si `cur`
+                    # est ENCORE au-dessus de l'entree au moment de la
+                    # decision -- sinon on laisse tomber ce cycle plutot que
+                    # de forcer une vente qui n'est deja plus un vrai gain.
+                    if _cur_pct <= _peak * (1 - _giveback) and _cur_pct > 0:
                         _sold_t = self._sell_orphan(
                             tid, shares, f" {sym} {pos['slug']} {pos['side']} STEVEN-TRAIL",
                             entry_price=entry, symbol=sym, slug=pos.get("slug"), side=pos.get("side"),
