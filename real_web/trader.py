@@ -6044,14 +6044,55 @@ class MultiTrader:
                                     if tid:
                                         tracked_tids.add(str(tid))
                             # position reelle avec de la valeur, jamais trackee par le bot
+                            _sym_kw = {
+                                "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL",
+                                "xrp": "XRP", "dogecoin": "DOGE", "bnb": "BNB",
+                            }
                             for asset, p in real_by_asset.items():
                                 if asset not in tracked_tids and (p.get("currentValue") or 0) > 0.05:
+                                    # RETRACK AUTO (Steven 05/09, "sol up a bien
+                                    # ete rempli mais pas tracke" -- 2e cas du
+                                    # meme bug apres l'ETH plus tot -- cette
+                                    # branche ne faisait QUE loguer un
+                                    # avertissement "verifier manuellement",
+                                    # jamais retracker la position, la
+                                    # laissant orpheline (jamais geree par
+                                    # SL/trail/resolution) jusqu'a ce qu'un
+                                    # humain la retrouve sur l'app Polymarket.
+                                    # Meme pattern que _reconcile_global_missing
+                                    # (strat="orphan", geree par les mecanismes
+                                    # generiques -- pas de logique Steven
+                                    # Engine specifique requise cote sortie).
+                                    _title = (p.get("title") or "").lower()
+                                    _sym = next((s for kw, s in _sym_kw.items() if kw in _title), None)
+                                    _side = p.get("outcome")
+                                    _size = float(p.get("size") or 0)
+                                    if _sym and _side in ("Up", "Down") and _size > 0.01:
+                                        _px = float(p.get("avgPrice") or p.get("curPrice") or 0.5)
+                                        _slug = p.get("slug") or p.get("eventSlug") or f"{_sym.lower()}-updown-5m-retrack"
+                                        _now_r2 = time.time()
+                                        _mk_r2 = self.state["markets"].setdefault(_sym, {}).setdefault("open", {})
+                                        _rkey = f"{_slug}|{_side}|retrack"
+                                        if _rkey not in _mk_r2:
+                                            _mk_r2[_rkey] = {
+                                                "symbol": _sym, "slug": _slug, "side": _side, "mode": "real",
+                                                "strat": "orphan", "token_id": asset, "entry_price": round(_px, 3),
+                                                "filled_shares": round(_size, 2), "cost": round(_size * _px, 2),
+                                                "start_ts": _now_r2, "pair": None,
+                                                "end_ts": _now_r2 + 300, "opened_ts": _now_r2, "buffer": 0.0,
+                                            }
+                                            self._log(
+                                                f"🔎 [RECONCILIATION] position reelle NON TRACKEE retrackee : "
+                                                f"{_sym} {_side} {_size:.2f} parts @ {_px:.3f} "
+                                                f"(valeur={p.get('currentValue', 0):.2f}$) -> geree normalement des maintenant"
+                                            )
+                                        continue
                                     self._tlog(
                                         f"reconcil_untracked_{asset[:8]}",
                                         f"🚨 [RECONCILIATION] position reelle NON TRACKEE : "
                                         f"{p.get('title', '?')} {p.get('outcome', '?')} "
                                         f"{p.get('size', 0):.2f} parts valeur={p.get('currentValue', 0):.2f}$ "
-                                        f"-- verifier manuellement",
+                                        f"-- symbole/cote non reconnu, verifier manuellement",
                                     )
                             # position trackee par le bot mais qui n'existe plus reellement
                             # (Steven 02/09, trouve en audit : 3 positions detectees "fantomes"
