@@ -3555,11 +3555,20 @@ class MultiTrader:
 
     def _investable(self):
         """Capital reellement engageable = cash - plancher. Base de tous les
-        plafonds proportionnels (Steven 06/08)."""
+        plafonds proportionnels (Steven 06/08).
+        RESERVE FRAIS (Steven 05/09, "il ya bien du solde, il a essaye de
+        placer un maximum sans laisser 10% du capital libre" -- FLOOR_USD=0.0
+        par defaut signifie que budget pouvait viser jusqu'au dernier centime
+        du cash, laissant rien pour l'estimation de frais du CLOB -> echecs
+        repetes "not enough balance / allowance ... cover the fee estimate"
+        vus en reel, qui bloquaient aussi la boucle plusieurs secondes par
+        tentative ratee. Reserve desormais AU MOINS 10% du cash en plus du
+        plancher configurable, pour toujours laisser de la marge aux frais."""
         cash, _ = self._read_cash()
         if cash is None:
             return 0.0
-        return max(0.0, cash - self.floor())
+        _reserve = max(self.floor(), round(cash * 0.10, 2))
+        return max(0.0, cash - _reserve)
 
     def _partitioned_investable(self):
         """Partitionnement du capital entre marches actifs (Steven 19/08,
