@@ -10217,8 +10217,42 @@ class MultiTrader:
                     # decision -- sinon on laisse tomber ce cycle plutot que
                     # de forcer une vente qui n'est deja plus un vrai gain.
                     if _cur_pct <= _peak * (1 - _giveback) and _cur_pct > 0:
+                        # CAP AU CARNET (Steven 05/09, "il voulait TP et ca a
+                        # slip en meme temps" -- vu en reel : BNB achete a
+                        # 0.923, vendu a 0.814 (perte reelle) malgre un `cur`
+                        # au-dessus de l'entree au moment de la decision.
+                        # _sell_orphan garantit le remplissage COMPLET en
+                        # descendant autant de niveaux de carnet que
+                        # necessaire -- bon pour un stop-loss (sortir a tout
+                        # prix), mauvais pour un TP (mieux vaut vendre MOINS
+                        # mais au-dessus de l'entree que tout vendre en
+                        # dessous). Plafonne donc la taille vendue a ce que
+                        # le carnet peut absorber SANS descendre sous
+                        # l'entree ; le reliquat est reevalue au cycle
+                        # suivant plutot que force maintenant.
+                        _sell_shares = shares
+                        try:
+                            _book_t = self._live.get_book_sync(tid)
+                            _bids_t = (_book_t or {}).get("bids") or []
+                            _cum_t, _cap_t = 0.0, 0.0
+                            for _lvl in sorted(_bids_t, key=lambda l: -float(l[0])):
+                                _px_t, _sz_t = float(_lvl[0]), float(_lvl[1])
+                                if _px_t < entry:
+                                    break
+                                _cum_t += _sz_t
+                                _cap_t = _cum_t
+                            _sell_shares = min(shares, _cap_t)
+                        except Exception:
+                            _sell_shares = 0.0
+                        if _sell_shares < MIN_SELL_SHARES:
+                            _diag_msg = (
+                                f"traineur {sym} {pos['side']} : trail arme (pic={_peak:+.0%}) mais "
+                                f"carnet trop fin au-dessus de l'entree {entry:.3f} -> verrouillage differe"
+                            )
+                            self._tlog(f"steven_trail_thin_{sym}_{pos['slug']}", f"🔒 [STEVEN-TRAIL] {_diag_msg}", every=10.0)
+                            continue
                         _sold_t = self._sell_orphan(
-                            tid, shares, f" {sym} {pos['slug']} {pos['side']} STEVEN-TRAIL",
+                            tid, _sell_shares, f" {sym} {pos['slug']} {pos['side']} STEVEN-TRAIL",
                             entry_price=entry, symbol=sym, slug=pos.get("slug"), side=pos.get("side"),
                         )
                         if _sold_t > 0:
