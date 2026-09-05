@@ -10106,6 +10106,53 @@ class MultiTrader:
                 shares = pos.get("filled_shares", 0)
                 if entry <= 0 or shares <= 0:
                     continue
+                # SUIVI DE LA LIMITE TRAIL EN ATTENTE (Steven 05/09, "go
+                # implemente" -- remplace le FAK agressif par un vrai ordre
+                # LIMITE au plancher = prix d'entree. Un LIMIT ne peut, par
+                # construction, jamais s'executer sous son prix -- contraste
+                # avec le FAK qui garantissait le volume au prix d'accepter
+                # de descendre le carnet (cause du slip reel observe : achat
+                # 0.923, vente forcee a 0.814). Ici, soit ca se remplit a
+                # l'entree ou mieux, soit ca ne se remplit pas du tout -- verifie
+                # le remplissage ICI, avant toute nouvelle decision SL/trail.
+                _pend_tl = pos.get("_trail_limit")
+                if _pend_tl:
+                    _held_tl = self._live.position_size(tid) if self._live else -1.0
+                    _before_tl = _pend_tl.get("shares_before", shares)
+                    _sold_tl = round(max(0.0, _before_tl - _held_tl), 2) if _held_tl is not None and _held_tl >= 0 else 0.0
+                    if _sold_tl >= MIN_SELL_SHARES:
+                        _realized_tl = round(_sold_tl * (_pend_tl["price"] - entry), 3)
+                        pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + _realized_tl, 3)
+                        pos["filled_shares"] = shares = round(shares - _sold_tl, 2)
+                        pos.pop("_trail_limit", None)
+                        self._log(
+                            f"🔒 [STEVEN-TRAIL] {sym} {pos['slug']} {pos['side']} limite remplie "
+                            f"{_sold_tl} @ {_pend_tl['price']:.3f} (entree {entry:.3f}) "
+                            f"realise={_realized_tl:+.3f}$ reste={shares}"
+                        )
+                        if shares < MIN_SELL_SHARES:
+                            pnl = pos["realized_pnl"]
+                            pos.update(win=pnl > 0, pnl=pnl, resolved_by="steven_trail", exit_price=round(_pend_tl["price"], 3))
+                            mk["trades"].append(pos)
+                            del mk["open"][key]
+                            self._record_trade_pnl(sym, pnl)
+                            n_open -= 1
+                            total_cost -= pos.get("cost", 0.0)
+                        continue
+                    if now - _pend_tl.get("posted_ts", now) > 20:
+                        try:
+                            self._live.cancel_order(_pend_tl.get("order_id"))
+                        except Exception:
+                            pass
+                        pos.pop("_trail_limit", None)
+                        self._tlog(
+                            f"steven_trail_cancel_{sym}_{pos['slug']}",
+                            f"🔓 [STEVEN-TRAIL] {sym} {pos['slug']} limite jamais remplie (20s) -> "
+                            f"annulee, reevalue au prochain cycle",
+                            every=20.0,
+                        )
+                        continue
+                    continue  # ordre encore en vie, laisse-le respirer ce cycle
                 # STOP-LOSS ABSOLU (Steven engine a un vrai SL, contrairement a
                 # l'oracle). Desactivable (Steven 03/09, "faut couper le stop
                 # loss") : 0.0 = jamais de coupe, hold to resolution comme
@@ -10226,61 +10273,35 @@ class MultiTrader:
                     # decision -- sinon on laisse tomber ce cycle plutot que
                     # de forcer une vente qui n'est deja plus un vrai gain.
                     if _cur_pct <= _peak * (1 - _giveback) and _cur_pct > 0:
-                        # CAP AU CARNET (Steven 05/09, "il voulait TP et ca a
-                        # slip en meme temps" -- vu en reel : BNB achete a
-                        # 0.923, vendu a 0.814 (perte reelle) malgre un `cur`
-                        # au-dessus de l'entree au moment de la decision.
-                        # _sell_orphan garantit le remplissage COMPLET en
-                        # descendant autant de niveaux de carnet que
-                        # necessaire -- bon pour un stop-loss (sortir a tout
-                        # prix), mauvais pour un TP (mieux vaut vendre MOINS
-                        # mais au-dessus de l'entree que tout vendre en
-                        # dessous). Plafonne donc la taille vendue a ce que
-                        # le carnet peut absorber SANS descendre sous
-                        # l'entree ; le reliquat est reevalue au cycle
-                        # suivant plutot que force maintenant.
-                        _sell_shares = shares
-                        try:
-                            _book_t = self._live.get_book_sync(tid)
-                            _bids_t = (_book_t or {}).get("bids") or []
-                            _cum_t, _cap_t = 0.0, 0.0
-                            for _lvl in sorted(_bids_t, key=lambda l: -float(l[0])):
-                                _px_t, _sz_t = float(_lvl[0]), float(_lvl[1])
-                                if _px_t < entry:
-                                    break
-                                _cum_t += _sz_t
-                                _cap_t = _cum_t
-                            _sell_shares = min(shares, _cap_t)
-                        except Exception:
-                            _sell_shares = 0.0
-                        if _sell_shares < MIN_SELL_SHARES:
-                            _diag_msg = (
-                                f"traineur {sym} {pos['side']} : trail arme (pic={_peak:+.0%}) mais "
-                                f"carnet trop fin au-dessus de l'entree {entry:.3f} -> verrouillage differe"
+                        # LIMITE AU PLANCHER = ENTREE (Steven 05/09, "go
+                        # implemente" -- remplace le FAK agressif + le cap de
+                        # carnet (approximatif, base sur un snapshot deja
+                        # potentiellement perime) par un vrai ordre LIMITE.
+                        # Un LIMIT ne peut structurellement PAS s'executer en
+                        # dessous de son prix -- soit il se remplit a
+                        # l'entree ou mieux, soit il reste tel quel en
+                        # attendant (suivi au prochain cycle, voir plus haut).
+                        # Plus de risque de "photo perimee" : le prix plancher
+                        # est garanti par le mecanisme d'ordre lui-meme, pas
+                        # par une verification a un instant T.
+                        _res_tl = self._live.post_limit_sell(tid, entry, shares)
+                        if _res_tl.get("success") and _res_tl.get("order_id"):
+                            pos["_trail_limit"] = {
+                                "order_id": _res_tl["order_id"], "price": entry,
+                                "posted_ts": now, "shares_before": shares,
+                            }
+                            self._log(
+                                f"🔒 [STEVEN-TRAIL] {sym} {pos['slug']} {pos['side']} pic={_peak:+.0%} "
+                                f"-> LIMITE posee @ {entry:.3f} (plancher=entree, jamais de vente en dessous)"
                             )
-                            self._tlog(f"steven_trail_thin_{sym}_{pos['slug']}", f"🔒 [STEVEN-TRAIL] {_diag_msg}", every=10.0)
-                            continue
-                        _sold_t = self._sell_orphan(
-                            tid, _sell_shares, f" {sym} {pos['slug']} {pos['side']} STEVEN-TRAIL",
-                            entry_price=entry, symbol=sym, slug=pos.get("slug"), side=pos.get("side"),
-                        )
-                        if _sold_t > 0:
-                            _realized_t = round(_sold_t * (cur - entry), 3)
-                            pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + _realized_t, 3)
-                            pos["filled_shares"] = round(shares - _sold_t, 2)
-                            if pos["filled_shares"] < MIN_SELL_SHARES:
-                                pnl = pos["realized_pnl"]
-                                pos.update(win=pnl > 0, pnl=pnl, resolved_by="steven_trail", exit_price=round(cur, 3))
-                                mk["trades"].append(pos)
-                                del mk["open"][key]
-                                self._record_trade_pnl(sym, pnl)
-                                n_open -= 1
-                                total_cost -= pos.get("cost", 0.0)
-                                self._log(
-                                    f"🔒 [STEVEN-TRAIL] {sym} {pos['slug']} {pos['side']} pic={_peak:+.0%} "
-                                    f"-> verrouille @ {cur:.3f} (entree {entry:.3f}) pnl={pnl:+.3f}$"
-                                )
-                            continue
+                        else:
+                            self._tlog(
+                                f"steven_trail_limit_fail_{sym}_{pos['slug']}",
+                                f"⚠️ [STEVEN-TRAIL] {sym} {pos['slug']} echec pose de la limite "
+                                f"(err={_res_tl.get('error', '')})",
+                                every=10.0,
+                            )
+                        continue
                 # DCA (moyenne a la baisse) : comportement pilote par
                 # dca_mode -- "off" = jamais, "capped" = 1 seul palier,
                 # "on_confirm" = ne renforce que si le consensus tient
