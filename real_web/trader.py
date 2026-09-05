@@ -4033,6 +4033,8 @@ class MultiTrader:
         "stoploss_pct": (0.0, 0.95),
         "high_price_threshold": (0.5, 0.99),
         "high_price_min_scale": (0.1, 1.0),
+        "trail_arm_pct": (0.005, 0.3),
+        "trail_giveback_pct": (0.05, 0.9),
     }
     STEVEN_DCA_MODES = ("standard", "off", "capped", "on_confirm")
     STEVEN_PRESETS = ("selective", "balanced", "aggressive")
@@ -4127,6 +4129,13 @@ class MultiTrader:
             "high_price_reduce_enabled": True,
             "high_price_threshold": 0.85,
             "high_price_min_scale": 0.5,
+            # Steven 05/09 ("il aurait pu TP avant que ca recrash") : trailing
+            # take-profit -- s'arme des +5% de gain reel, vend TOUT le
+            # reliquat si le prix redonne 35% de son pic. Adapte a la bande
+            # 0.72-0.91 (marge de gain etroite, contrairement a l'oracle).
+            "trail_enabled": True,
+            "trail_arm_pct": 0.05,
+            "trail_giveback_pct": 0.35,
         }
         saved = self.state.get("steven_engine") or {}
         defaults.update({k: v for k, v in saved.items() if k in defaults})
@@ -4137,7 +4146,7 @@ class MultiTrader:
             return {"ok": False, "message": "payload invalide"}
         cfg = self.steven_config()
         for k, v in patch.items():
-            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled", "reverse_mode", "size_scale_by_gap", "oracle_veto_enabled", "multi_laggard_fallback", "high_price_reduce_enabled"):
+            if k in ("enabled", "allow_up", "allow_down", "streak_reversal_enabled", "reverse_mode", "size_scale_by_gap", "oracle_veto_enabled", "multi_laggard_fallback", "high_price_reduce_enabled", "trail_enabled"):
                 cfg[k] = bool(v)
                 continue
             if k == "excluded_symbols":
@@ -10115,6 +10124,45 @@ class MultiTrader:
                                 every=30.0,
                             )
                     continue
+                # TRAILING TAKE-PROFIT (Steven 05/09, "perte vraiment bete, il
+                # a achete trop tot, il aurait pu TP avant que ca recrash" --
+                # jusqu'ici Steven Engine n'avait AUCUNE prise de profit,
+                # seulement entree + stop-loss + hold-to-resolution, meme
+                # mecanisme que l'oracle (_manage_oracle_trailing) mais avec
+                # des seuils adaptes a la bande d'achat 0.72-0.91 (marge de
+                # gain bien plus etroite que l'oracle qui achete parfois sous
+                # 0.05$). S'arme des un gain reel constate, vend TOUT le
+                # reliquat des que le prix redonne une fraction de son pic --
+                # verrouille un gain plutot que de risquer de tout perdre au
+                # stop-loss si ca retombe.
+                _peak = pos.get("_trail_peak", 0.0)
+                _cur_pct = (cur - entry) / entry
+                if _cur_pct > _peak:
+                    pos["_trail_peak"] = _peak = _cur_pct
+                if cfg.get("trail_enabled", True) and _peak >= cfg.get("trail_arm_pct", 0.05):
+                    _giveback = cfg.get("trail_giveback_pct", 0.35)
+                    if _cur_pct <= _peak * (1 - _giveback):
+                        _sold_t = self._sell_orphan(
+                            tid, shares, f" {sym} {pos['slug']} {pos['side']} STEVEN-TRAIL",
+                            entry_price=entry, symbol=sym, slug=pos.get("slug"), side=pos.get("side"),
+                        )
+                        if _sold_t > 0:
+                            _realized_t = round(_sold_t * (cur - entry), 3)
+                            pos["realized_pnl"] = round(pos.get("realized_pnl", 0.0) + _realized_t, 3)
+                            pos["filled_shares"] = round(shares - _sold_t, 2)
+                            if pos["filled_shares"] < MIN_SELL_SHARES:
+                                pnl = pos["realized_pnl"]
+                                pos.update(win=pnl > 0, pnl=pnl, resolved_by="steven_trail", exit_price=round(cur, 3))
+                                mk["trades"].append(pos)
+                                del mk["open"][key]
+                                self._record_trade_pnl(sym, pnl)
+                                n_open -= 1
+                                total_cost -= pos.get("cost", 0.0)
+                                self._log(
+                                    f"🔒 [STEVEN-TRAIL] {sym} {pos['slug']} {pos['side']} pic={_peak:+.0%} "
+                                    f"-> verrouille @ {cur:.3f} (entree {entry:.3f}) pnl={pnl:+.3f}$"
+                                )
+                            continue
                 # DCA (moyenne a la baisse) : comportement pilote par
                 # dca_mode -- "off" = jamais, "capped" = 1 seul palier,
                 # "on_confirm" = ne renforce que si le consensus tient
